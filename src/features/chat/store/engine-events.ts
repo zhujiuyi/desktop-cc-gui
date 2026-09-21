@@ -623,7 +623,7 @@ export function settleOrphanedRuns(
       // (background work outlives its spawner's reply), so the task settle
       // decides on its own whether this session needs a write.
       const unsettled = cur.tasks.some((t) => t.runId === runId && t.status === "running");
-      if (!cur.streaming && !cur.retry && !unsettled) continue;
+      if (!cur.streaming && !cur.retry && !unsettled && !cur.awaitingTasks) continue;
       if (bySession === s.bySession) bySession = { ...s.bySession };
       bySession[key] = withTaskDerived({
         ...cur,
@@ -631,6 +631,8 @@ export function settleOrphanedRuns(
         turnStartedAt: null,
         retry: null,
         compaction: null,
+        // The reaped run's completion turn is never coming.
+        awaitingTasks: false,
         ...(unsettled ? { tasks: settleRunTasks(cur.tasks, runId, "interrupted") } : {}),
       });
     }
@@ -776,6 +778,9 @@ function onError(
           streaming: false,
           turnStartedAt: null,
           turnUsage: null,
+          // A dead run can never produce the completion turn that would clear
+          // this: the background phase ends here.
+          awaitingTasks: false,
           settledRunIds: rememberSettledRun(cur, event.runId),
           // The run is dead: nothing will ever notify these tasks.
           tasks: settleRunTasks(cur.tasks ?? EMPTY_TASKS, event.runId, "interrupted"),
@@ -1179,6 +1184,16 @@ function onDone(event: EngineEventPayload, key: string, deps: EngineEventDeps) {
     const durationMs = turnStart ? Math.max(0, Date.now() - turnStart) : null;
     const model = stampedModel(deps, event.engine, key);
     const effort = stampedEffort(deps, event.engine, key);
+    // A done with nothing left running ends the run: nothing will ever notify
+    // its tasks again, so a row still running means the process died or the
+    // notification got lost — interrupted, not left spinning forever. (An
+    // ambient housekeeping task can be marked while it still works; accepted,
+    // housekeeping never drives the indicator.) A background-phase done keeps
+    // the rows untouched: those tasks are exactly what the turn waits for.
+    const tasks =
+      backgroundTasks > 0
+        ? cur.tasks
+        : settleRunTasks(cur.tasks ?? EMPTY_TASKS, event.runId, "interrupted");
     // Stamp usage, durationMs, effort, and model onto the turn's last assistant message.
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i].role === "assistant") {
@@ -1199,7 +1214,7 @@ function onDone(event: EngineEventPayload, key: string, deps: EngineEventDeps) {
     return {
       bySession: {
         ...s.bySession,
-        [key]: {
+        [key]: withTaskDerived({
           ...cur,
           messages,
           error: null,
@@ -1212,7 +1227,8 @@ function onDone(event: EngineEventPayload, key: string, deps: EngineEventDeps) {
           // Keep this run alive for its background tasks; only a done with
           // nothing running is the run's terminal event.
           settledRunIds: backgroundTasks > 0 ? cur.settledRunIds : rememberSettledRun(cur, event.runId),
-        },
+          tasks,
+        }),
       },
       streamingByKey: setStreamingFlag(s.streamingByKey, key, false),
       retryingByKey: setRetryingFlag(s.retryingByKey, key, false),
@@ -1285,6 +1301,16 @@ function adoptObservedRun(
     settleOrphanedRuns(deps.set, routeRun(event.runId, key));
   }
   const cur = deps.get().bySession[key];
+  const taskFrame =
+    event.kind === "task_started" ||
+    event.kind === "task_progress" ||
+    event.kind === "task_notification" ||
+    event.kind === "tasks";
+  // A run waiting on background work must ignore its own task frames here:
+  // they are not the completion turn, so they must not clear awaitingTasks,
+  // restart the segment timer, or make the session read as streaming again
+  // (the composer would start queueing while the user should be able to send).
+  if (cur?.awaitingTasks && taskFrame) return;
   if (!cur?.streaming) {
     // A completion turn reopens the run after its background phase: its text
     // is a fresh segment, so the elapsed timer restarts and the background
