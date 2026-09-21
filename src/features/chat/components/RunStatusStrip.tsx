@@ -837,12 +837,18 @@ export const RunStatusStrip = memo(function RunStatusStrip({
   const tasks = useChatStore((s) =>
     sessionKey ? (s.bySession[sessionKey]?.tasks ?? EMPTY_TASKS) : EMPTY_TASKS,
   );
+  // The run the session's live turn belongs to: the pill's task subset follows
+  // it (see stepsFromTasks) so it counts this turn's subagents, not every row
+  // the session ever reported.
+  const currentRunId = useChatStore((s) =>
+    sessionKey ? (s.bySession[sessionKey]?.currentRunId ?? null) : null,
+  );
   const steps = useMemo(
     () =>
       engine === "claude" && tasks.length > 0
-        ? stepsFromTasks(tasks)
+        ? stepsFromTasks(tasks, currentRunId)
         : deriveAgentTaskSteps(allHistory, streaming, engine),
-    [tasks, allHistory, streaming, engine],
+    [tasks, currentRunId, allHistory, streaming, engine],
   );
   const files = useMemo(() => deriveEditedFiles(messages), [messages]);
   const todos = useMemo(() => deriveTodoList(allHistory), [allHistory]);

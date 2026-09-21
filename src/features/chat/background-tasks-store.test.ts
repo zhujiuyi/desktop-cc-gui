@@ -71,6 +71,23 @@ describe("background task store", () => {
     expect(s.backgroundActive).toBe(true);
   });
 
+  // The Rust side counts only the tasks a run waits for (it filters ambient
+  // ones out of `pending_tasks`), so the frontend's turn-level derivations have
+  // to agree — otherwise one ambient monitor makes the session read as
+  // "background running" for its whole life. The panel still shows the row.
+  it("does not read as background-active for an ambient-only task", () => {
+    handleEngineEvents(
+      [ev("tasks", 2, {
+        tasks: [{ taskId: "mon", taskType: "local_agent", description: "monitor", ambient: true }],
+      })],
+      deps(),
+    );
+    const s = useChatStore.getState().bySession[KEY]!;
+    expect(s.tasks).toHaveLength(1);
+    expect(s.tasks[0].ambient).toBe(true);
+    expect(s.backgroundActive).toBe(false);
+  });
+
   it("patches live progress onto the running task", () => {
     handleEngineEvents(
       [

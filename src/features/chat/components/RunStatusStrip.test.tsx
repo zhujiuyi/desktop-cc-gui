@@ -50,6 +50,7 @@ function seedTasks(
   tasks: BackgroundTask[],
   messages: Message[] = [msg(1, "user", "跑一下")],
   streaming = false,
+  currentRunId: string | null = null,
 ) {
   useChatStore.setState({
     bySession: {
@@ -57,7 +58,8 @@ function seedTasks(
         messages,
         streaming,
         tasks,
-        backgroundActive: tasks.some((t) => t.status === "running"),
+        currentRunId,
+        backgroundActive: tasks.some((t) => t.status === "running" && !t.ambient),
       } as never,
     },
   });
@@ -496,6 +498,29 @@ describe("RunStatusStrip", () => {
     expect(panel).toContain("运行中");
     expect(panel).toContain("已完成");
     expect(panel).toContain("失败");
+  });
+
+  /** Turn-level surface: ambient housekeeping never belongs to the pill, and
+   *  once a run is claimed only its own tasks tell the turn's story. */
+  it("keeps ambient tasks and other runs' settled tasks out of the subagent pill", async () => {
+    seedTasks(
+      [
+        task({ id: "mon", ambient: true, description: "夜间巡检" }),
+        task({ id: "old", runId: "old-run", status: "completed", description: "旧回合" }),
+        task({ id: "now", runId: "now-run" }),
+      ],
+      TURN,
+      false,
+      "now-run",
+    );
+    await renderStrip("claude");
+
+    expect(pill("子代理").textContent).toContain("0/1");
+    await click(pill("子代理"));
+    const panel = container.querySelector("[data-testid='run-status-subagents']")?.textContent;
+    expect(panel).toContain("运行中");
+    expect(panel).not.toContain("夜间巡检");
+    expect(panel).not.toContain("旧回合");
   });
 
   it("renders a failed task in the error palette without a breathing dot", async () => {

@@ -2,8 +2,19 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/lib/i18n";
-import { EMPTY_SESSION, type BackgroundTask, type SessionState } from "../store/stream";
+import type { EngineEventPayload } from "@/lib/events";
+import { sessionKey, useChatStore } from "../store";
+import { handleEngineEvents, type EngineEventDeps } from "../store/engine-events";
+import { EMPTY_SESSION, runRouting, type BackgroundTask, type SessionState } from "../store/stream";
 import { MessageTimeline } from "./MessageTimeline";
+
+vi.mock("@/lib/ipc", () => ({
+  ipc: { rescanSessions: vi.fn(async () => {}), usageRecord: vi.fn(async () => {}) },
+}));
+vi.mock("@/lib/events", () => ({
+  listenEngineEvents: vi.fn(async () => () => {}),
+  listenSessionsChanged: vi.fn(async () => () => {}),
+}));
 
 // React's act() environment flag — same boundary as RunStatusStrip.test.tsx.
 const actEnvironment = globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean };
@@ -35,6 +46,7 @@ const realOffsetHeight = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 
 const realOffsetWidth = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "offsetWidth");
 
 const WS = "/ws";
+const KEY = sessionKey("claude", "s-1", WS);
 
 function task(over: Partial<BackgroundTask>): BackgroundTask {
   return {
@@ -129,6 +141,32 @@ describe("turn-tail background indicator", () => {
     // Same tail slot, marker above the thinking row.
     const text = container.textContent ?? "";
     expect(text.indexOf("后台任务运行中")).toBeLessThan(text.indexOf("响应中"));
+  });
+
+  /** End to end through the store: an ambient (session-scoped) task is listed
+   *  in the panel but never drives the tail indicator — it never finishes
+   *  inside a turn, so the line would stay up for the session's whole life. */
+  it("stays off for an ambient-only background task", async () => {
+    runRouting.clear();
+    useChatStore.setState({
+      bySession: { [KEY]: { ...EMPTY_SESSION, awaitingTasks: true } },
+    });
+    const event = {
+      runId: "run-ambient", sessionId: "s-1", engine: "claude", seq: 1,
+      kind: "tasks" as EngineEventPayload["kind"],
+      data: { tasks: [{ taskId: "mon", taskType: "local_agent", description: "monitor", ambient: true }] },
+    };
+    const deps: EngineEventDeps = {
+      set: useChatStore.setState, get: useChatStore.getState,
+      drainQueue: () => {}, markUnseenIfBackground: () => {}, upsertSessionMeta: () => {},
+    };
+    handleEngineEvents([event], deps);
+
+    const session = useChatStore.getState().bySession[KEY]!;
+    expect(session.tasks.map((t) => t.id)).toEqual(["mon"]);
+    expect(session.backgroundActive).toBe(false);
+    await renderTimeline(session);
+    expect(container.textContent).not.toContain("后台任务运行中");
   });
 
   it("renders no background line without a running task", async () => {

@@ -50,6 +50,13 @@ export interface SessionState {
    * indicator's elapsed timer so it survives the indicator's unmount/remount
    * cycle (idle ↔ growing) instead of restarting from 0 every pause. */
   turnStartedAt: number | null;
+  /** The run that owns the live turn of this session. Two runs of ONE session
+   * can overlap — a reply settles with background tasks still running and the
+   * user sends the next message before the CLI's completion turn arrives — and
+   * the settling run must not write the session's turn-level state under the
+   * newer run's feet. `null` = no claim: nothing is being attributed to a run
+   * (idle, or a turn this client did not mark), so any run may own it. */
+  currentRunId: string | null;
   activeModel?: string | null;
   activeEffort?: string | null;
   /** In-app channel this session runs; spawn injects its env. */
@@ -97,6 +104,7 @@ export const EMPTY_SESSION: SessionState = {
   loading: false,
   streaming: false,
   turnStartedAt: null,
+  currentRunId: null,
   activeModel: null,
   activeEffort: null,
   activeProvider: null,

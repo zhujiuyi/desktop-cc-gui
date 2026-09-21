@@ -211,6 +211,11 @@ export function createMessagingActions(
         rememberProviderForRun(key, provider);
       }
     }
+    // The run id exists before the optimistic write: the turn claims the
+    // session for it (currentRunId), so an older run of this session that is
+    // still streaming its completion turn cannot settle this turn's state
+    // under it (see ownsTurn / isForeignContent).
+    const requestedRunId = `run-${newId()}`;
     // Optimistic user message.
     set((s) => ({
       streamingByKey: setStreamingFlag(s.streamingByKey, key, true),
@@ -231,6 +236,7 @@ export function createMessagingActions(
         error: null,
         interrupted: false,
         turnStartedAt: Date.now(),
+        currentRunId: requestedRunId,
         activeModel: model,
         activeEffort: effort,
         activeProvider: provider,
@@ -244,7 +250,6 @@ export function createMessagingActions(
     );
     // Refresh independently: a slow history read must not delay sending or Stop.
     void get().refreshSessionUsage(key);
-    const requestedRunId = `run-${newId()}`;
     settleOrphanedRuns(set, routeRun(requestedRunId, key));
     if (agentResolveError) {
       patchSession(set, key, { error: agentResolveError });
@@ -277,6 +282,17 @@ export function createMessagingActions(
       if (result.runId !== requestedRunId) {
         runRouting.delete(requestedRunId);
         untrackRun(requestedRunId);
+        // The session's claim was written for the provisional id: re-point it
+        // at the run the backend actually started (and whose routing the
+        // adopt path will use), so its frames are not read as a foreign run's.
+        for (const candidate of [
+          key,
+          sessionKey(engine, result.sessionId ?? tab.sessionId, tab.workspacePath),
+        ]) {
+          if (get().bySession[candidate]?.currentRunId === requestedRunId) {
+            patchSession(set, candidate, { currentRunId: result.runId });
+          }
+        }
       }
       // A whole turn can finish while invoke is still pending. Its session
       // event has then moved the state and done has removed the routing entry.
@@ -411,6 +427,8 @@ export function createMessagingActions(
         error: String(error),
         streaming: false,
         turnStartedAt: null,
+        // The send never became a turn: drop the claim it wrote.
+        currentRunId: null,
       });
       // The send never became a turn, so no engine event will report one:
       // without this the rest of the queue waits for a settle that is not
@@ -693,6 +711,9 @@ export function createMessagingActions(
               interrupted: true,
               turnStartedAt: null,
               retry: null,
+              // The stopped runs are settled: the session is unclaimed again,
+              // so their late frames cannot read as a newer run's turn.
+              currentRunId: null,
               // The wait ends with the work it waited for: without this the
               // tail indicator keeps claiming a task is running and the pill
               // keeps breathing over rows the user just stopped.

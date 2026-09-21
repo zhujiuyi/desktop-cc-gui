@@ -21,16 +21,43 @@ describe("background task helpers", () => {
     expect(runningTaskCount([task({}), task({ id: "x", status: "completed" })])).toBe(1);
   });
 
+  /** Ambient tasks are session-scoped housekeeping: they run for the life of
+   *  the session, so counting them would pin the tail indicator on "running"
+   *  forever. The panel still lists them. */
+  it("keeps ambient tasks out of the running count", () => {
+    expect(
+      runningTaskCount([
+        task({ id: "t", ambient: true }),
+        task({ id: "x", status: "completed" }),
+      ]),
+    ).toBe(0);
+    expect(runningTaskCount([task({ id: "t", ambient: true }), task({ id: "r" })])).toBe(1);
+  });
+
   it("maps tasks onto the subagent pill steps", () => {
     const steps = stepsFromTasks([
       task({ id: "w", taskType: "local_workflow", workflowName: "ccgui-full-parse" }),
       task({ id: "a", status: "completed", subagentType: "general-purpose", description: "读文档" }),
       task({ id: "f", status: "failed", description: "挂了" }),
-    ]);
+    ], null);
     expect(steps).toEqual([
       { key: "w", label: "ccgui-full-parse", state: "active" },
       { key: "a", label: "general-purpose", state: "complete" },
       { key: "f", label: "挂了", state: "failed" },
     ]);
+  });
+
+  /** The pill is a turn-level surface: ambient housekeeping never belongs to
+   *  it, and with a live run only that run's tasks (plus anything still
+   *  running) are the turn's story. */
+  it("scopes the pill steps to the current run and never to ambient tasks", () => {
+    const steps = stepsFromTasks([
+      task({ id: "old-done", runId: "old", status: "completed" }),
+      task({ id: "old-running", runId: "old" }),
+      task({ id: "ambient", runId: "old", ambient: true }),
+      task({ id: "now-done", runId: "now", status: "completed" }),
+      task({ id: "now-run", runId: "now" }),
+    ], "now");
+    expect(steps.map((s) => s.key)).toEqual(["old-running", "now-done", "now-run"]);
   });
 });
