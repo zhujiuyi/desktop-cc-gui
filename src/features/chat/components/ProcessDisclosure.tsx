@@ -184,7 +184,10 @@ function liveThinkingWindow(text: string): { body: string; truncated: boolean } 
  * reference chat UI. Plain pre-wrapped text — never markdown-reparsed per
  * delta. The live view is windowed to the last 2000 chars; the cut lands on
  * a line boundary and the top edge fades out, so overflow leaves as whole
- * dissolving rows rather than a hard char-by-char wipe. */
+ * dissolving rows rather than a hard char-by-char wipe. Titled sections
+ * (mixed bodies) fold individually from their own header — live growth must
+ * not re-open a section the user folded; the lone-thinking variant has no
+ * inner header and leaves folding to the row header. */
 function ThinkingSurface({
   text,
   title,
@@ -195,22 +198,41 @@ function ThinkingSurface({
   live?: boolean;
 }) {
   const { body, truncated } = live ? liveThinkingWindow(text) : { body: text, truncated: false };
+  const [open, setOpen] = useState(true);
   return (
     <div className="flex flex-col gap-1">
       {title && (
-        <div className="flex items-center gap-1.5 text-body-regular text-text-tertiary">
+        <button
+          type="button"
+          aria-expanded={open}
+          onClick={() => setOpen((v) => !v)}
+          className="flex w-fit cursor-pointer items-center gap-1.5 text-body-regular text-text-tertiary transition-colors hover:text-text-secondary"
+        >
           <Brain className="size-3.5" aria-hidden />
           <span>{title}</span>
-        </div>
+          <ChevronRight
+            className={cx("size-3 transition-transform duration-150", open && "rotate-90")}
+            aria-hidden
+          />
+        </button>
       )}
       <div
         className={cx(
-          "ml-2 whitespace-pre-wrap break-words border-l border-foreground-icon-quaternary pl-4 text-[12px] leading-[1.65] text-text-tertiary",
-          truncated &&
-            "[mask-image:linear-gradient(to_bottom,transparent_0,#000_36px)] [-webkit-mask-image:linear-gradient(to_bottom,transparent_0,#000_36px)]",
+          "grid transition-[grid-template-rows] duration-300 ease-out motion-reduce:transition-none",
+          open ? "grid-rows-[1fr]" : "grid-rows-[0fr]",
         )}
       >
-        {body}
+        <div className="min-h-0 overflow-hidden">
+          <div
+            className={cx(
+              "ml-2 whitespace-pre-wrap break-words border-l border-foreground-icon-quaternary pl-4 text-[12px] leading-[1.65] text-text-tertiary",
+              truncated &&
+                "[mask-image:linear-gradient(to_bottom,transparent_0,#000_36px)] [-webkit-mask-image:linear-gradient(to_bottom,transparent_0,#000_36px)]",
+            )}
+          >
+            {body}
+          </div>
+        </div>
       </div>
     </div>
   );

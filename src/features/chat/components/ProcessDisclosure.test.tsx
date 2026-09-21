@@ -144,6 +144,55 @@ describe("ProcessDisclosure tool args", () => {
   });
 });
 
+describe("ProcessDisclosure inner thinking sections", () => {
+  const sectionHeaders = () =>
+    [...container.querySelectorAll("button")].filter((el) =>
+      el.textContent?.includes("思考过程"),
+    );
+
+  it("lets each thinking section inside a mixed body fold independently", async () => {
+    await render([
+      { type: "thinking", text: "先读文件" },
+      { type: "tool", text: "Read", path: "src/a.ts" },
+      { type: "thinking", text: "再检查依赖" },
+    ]);
+    // Two titled thinking sections, both expanded by default.
+    expect(sectionHeaders()).toHaveLength(2);
+    expect(sectionHeaders()[0].getAttribute("aria-expanded")).toBe("true");
+    expect(sectionHeaders()[1].getAttribute("aria-expanded")).toBe("true");
+
+    await act(async () => {
+      sectionHeaders()[0].dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    // Only the first section folds; the second and the tool row stay.
+    expect(sectionHeaders()[0].getAttribute("aria-expanded")).toBe("false");
+    expect(sectionHeaders()[1].getAttribute("aria-expanded")).toBe("true");
+    expect(container.textContent).toContain("再检查依赖");
+    expect(container.textContent).toContain("Read");
+  });
+
+  it("keeps a folded inner thinking section folded as live thinking grows", async () => {
+    await render([
+      { type: "thinking", text: "第一段" },
+      { type: "tool", text: "Read", path: "src/a.ts" },
+      { type: "thinking", text: "第二段", live: true },
+    ]);
+    expect(sectionHeaders()).toHaveLength(2);
+
+    await act(async () => {
+      sectionHeaders()[1].dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(sectionHeaders()[1].getAttribute("aria-expanded")).toBe("false");
+
+    await render([
+      { type: "thinking", text: "第一段" },
+      { type: "tool", text: "Read", path: "src/a.ts" },
+      { type: "thinking", text: "第二段，继续增长", live: true },
+    ]);
+    expect(sectionHeaders()[1].getAttribute("aria-expanded")).toBe("false");
+  });
+});
+
 describe("ProcessDisclosure thinking expansion", () => {
   it("folds thinking when the stream settles by default", async () => {
     await render([{ type: "thinking", text: "先分析需求", live: true }], { turnLive: true });
@@ -187,6 +236,25 @@ describe("ProcessDisclosure thinking expansion", () => {
     expect(panel!.className).not.toMatch(/opacity-0/);
     expect(panel!.style.transform).toBe("");
     expect(container.textContent).toContain("先分析需求");
+  });
+
+  it("keeps live thinking folded after the user folds it mid-stream", async () => {
+    await render([{ type: "thinking", text: "先分析", live: true }], { turnLive: true });
+    expect(headerExpanded()).toBe(true);
+
+    const header = container.querySelector("button[aria-expanded]");
+    await act(async () => {
+      header!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(headerExpanded()).toBe(false);
+
+    // A stream flush grows the same live thinking row; the fold must stick.
+    await render([{ type: "thinking", text: "先分析，再深入", live: true }], { turnLive: true });
+    expect(headerExpanded()).toBe(false);
+
+    // Thinking settles mid-turn; the fold still sticks.
+    await render([{ type: "thinking", text: "先分析，再深入" }], { turnLive: true });
+    expect(headerExpanded()).toBe(false);
   });
 
   it("still lets the user collapse thinking after it settles", async () => {
