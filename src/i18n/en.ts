@@ -326,6 +326,12 @@ export const en: Messages = {
         stopped: "Stopped",
         interrupted: "Interrupted",
       },
+      type: {
+        local_bash: "Background command",
+        local_agent: "Subagent",
+        local_workflow: "Workflow",
+        other: "Other",
+      },
     },
   },
   settings: {

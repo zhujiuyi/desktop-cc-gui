@@ -530,7 +530,17 @@ function SubagentDetail({ step, onBack }: { step: AgentTaskStep; onBack: () => v
               {step.subagentType}
             </span>
           )}
-          <span className="truncate text-caption-1-medium text-text-primary">{step.label}</span>
+          <span
+            className={cx(
+              "truncate text-caption-1-medium",
+              // Same tone rule as the list row this overlay was opened from:
+              // a failed (or finished) step steps down so its name does not
+              // fight the red status beside it.
+              failed || complete ? "text-text-secondary" : "text-text-primary",
+            )}
+          >
+            {step.label}
+          </span>
         </div>
         <span
           className={cx(

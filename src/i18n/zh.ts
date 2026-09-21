@@ -317,6 +317,12 @@ export const zh = {
         stopped: "已停止",
         interrupted: "已中断",
       },
+      type: {
+        local_bash: "后台命令",
+        local_agent: "子代理",
+        local_workflow: "工作流",
+        other: "其他",
+      },
     },
   },
   settings: {

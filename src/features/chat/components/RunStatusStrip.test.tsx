@@ -552,6 +552,28 @@ describe("RunStatusStrip", () => {
     expect(pill("子代理").textContent).toContain("0/1");
   });
 
+  /** 详情覆盖层沿用列表行的色调规则：failed 步的名字降为次级色，不与旁边
+   *  红色「失败」抢焦点。 */
+  it("steps a failed subagent's name down inside the detail overlay", async () => {
+    seedTasks([
+      task({ id: "a", status: "failed", subagentType: "code-reviewer", description: "审查" }),
+    ]);
+    await renderStrip("claude");
+
+    await click(pill("子代理"));
+    const row = container.querySelector<HTMLButtonElement>("[data-agent-step-key]")!;
+    await click(row);
+
+    const overlay = container.querySelector("[data-testid='subagent-detail-overlay']");
+    expect(overlay).not.toBeNull();
+    // The step's label is its subagentType (the chain prefers it over the
+    // description); the row that opened this overlay read the same text.
+    const label = overlay!.querySelector(".text-caption-1-medium");
+    expect(label?.textContent).toContain("code-reviewer");
+    expect(label?.className).toContain("text-text-secondary");
+    expect(label?.className).not.toContain("text-text-primary");
+  });
+
   it("correctly maps TaskCreate and subsequent TaskUpdate by taskId to complete status", async () => {
     const taskTurn: Message[] = [
       msg(1, "user", "create and complete task"),

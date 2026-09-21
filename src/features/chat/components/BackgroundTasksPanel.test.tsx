@@ -90,6 +90,51 @@ describe("BackgroundTasksPanel", () => {
     expect(container.textContent).toContain("暂无后台任务");
   });
 
+  /** 规格验收的「耗时」：运行行按 now - startedAt 走表（面板内有运行任务时 1s
+   *  一跳），结算行按 updatedAt - startedAt 定格。 */
+  it("shows each row's elapsed time and ticks it while a task runs", async () => {
+    vi.useFakeTimers();
+    try {
+      const now = new Date("2026-09-21T10:00:00Z").getTime();
+      vi.setSystemTime(now);
+      seed([
+        task({ id: "run", startedAt: now - 5_000, updatedAt: now - 5_000 }),
+        task({ id: "settled", status: "completed", startedAt: now - 125_000, updatedAt: now - 65_000 }),
+      ]);
+      await renderPanel();
+      expect(container.textContent).toContain("5.0s");
+      expect(container.textContent).toContain("1m");
+
+      // The running row's clock advances with the panel's tick.
+      await act(async () => {
+        vi.advanceTimersByTime(1_000);
+      });
+      expect(container.textContent).toContain("6.0s");
+      // The settled row's elapsed time is frozen at its own last update.
+      expect(container.textContent).toContain("1m");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /** 类型名走 i18n：CLI 没有给出描述/子代理类型时不再把 local_bash 这类原始
+   *  类型串摆在界面上；未知类型仍回落原文。 */
+  it("names a descriptionless task's type from i18n", async () => {
+    seed([
+      task({ id: "bash", taskType: "local_bash", description: "" }),
+      task({ id: "agent", taskType: "local_agent", description: "" }),
+      task({ id: "wf", taskType: "local_workflow", description: "" }),
+      task({ id: "odd", taskType: "local_mystery", description: "" }),
+    ]);
+    await renderPanel();
+    const text = container.textContent ?? "";
+    expect(text).toContain("后台命令");
+    expect(text).toContain("子代理");
+    expect(text).toContain("工作流");
+    expect(text).toContain("local_mystery");
+    expect(text).not.toContain("local_bash");
+  });
+
   it("BackgroundTasksLine names the running task count", async () => {
     await act(async () => {
       root.render(<BackgroundTasksLine count={2} />);

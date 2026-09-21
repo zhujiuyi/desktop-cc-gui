@@ -278,21 +278,13 @@ export function createMessagingActions(
         providerId: provider,
         computerUse: options?.computerUse === true,
       });
-      // Older backends choose their own id. Retire the provisional route.
+      // Older backends choose their own id. Retire the provisional route —
+      // and with it the provisional claim: a claim whose run is no longer
+      // routed to this session reads as no claim (see turnOwner), so the run
+      // the backend actually started can still own and settle the turn.
       if (result.runId !== requestedRunId) {
         runRouting.delete(requestedRunId);
         untrackRun(requestedRunId);
-        // The session's claim was written for the provisional id: re-point it
-        // at the run the backend actually started (and whose routing the
-        // adopt path will use), so its frames are not read as a foreign run's.
-        for (const candidate of [
-          key,
-          sessionKey(engine, result.sessionId ?? tab.sessionId, tab.workspacePath),
-        ]) {
-          if (get().bySession[candidate]?.currentRunId === requestedRunId) {
-            patchSession(set, candidate, { currentRunId: result.runId });
-          }
-        }
       }
       // A whole turn can finish while invoke is still pending. Its session
       // event has then moved the state and done has removed the routing entry.
