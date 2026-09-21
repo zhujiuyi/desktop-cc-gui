@@ -674,6 +674,8 @@ export function createMessagingActions(
         // stop just killed; a plain streaming turn has nothing to settle.
         // `stopped`, not `interrupted`: the user asked for this stop, and the
         // store reserves 已中断 for a run that died without a notification.
+        // Runs whose routing entry is already gone are out of this scope:
+        // the orphan sweep settles whatever they left running.
         const stoppingTasks = cur.awaitingTasks || cur.backgroundActive;
         const tasks = stoppingTasks
           ? stoppedRunIds.reduce(
@@ -701,6 +703,17 @@ export function createMessagingActions(
                     backgroundActive: tasks.some((t) => t.status === "running"),
                   }
                 : {}),
+              // Mark the runs dead in this same write. The kill IPCs below can
+              // take a while, and the last task frames of the dying process
+              // arrive inside that window — still routed, with no done that
+              // ever marked them settled. Without this the cleared wait above
+              // would no longer shield them: adoptObservedRun would reopen the
+              // turn (streaming true, composer queueing) for a process that is
+              // already gone. Idempotent with the loop at the end of the stop.
+              settledRunIds: stoppedRunIds.reduce(
+                (acc, runId) => rememberSettledRun({ settledRunIds: acc }, runId),
+                cur.settledRunIds ?? [],
+              ),
             },
           },
           streamingByKey: setStreamingFlag(s.streamingByKey, key, false),

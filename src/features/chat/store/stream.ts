@@ -190,7 +190,12 @@ export type SetFn<T extends BySessionSlice> = (fn: (s: T) => Partial<T>) => void
  * monotonically over the app's lifetime. */
 export const runRouting = new Map<string, string>();
 
-export function rememberSettledRun(session: SessionState | undefined, runId: string): string[] {
+/** Append a terminal run identity. Takes just the field it reads so a caller
+ *  can fold a list of runs before it has a session to write them to. */
+export function rememberSettledRun(
+  session: Pick<SessionState, "settledRunIds"> | undefined,
+  runId: string,
+): string[] {
   return [...(session?.settledRunIds ?? []).filter((id) => id !== runId), runId].slice(-32);
 }
 /** runId -> last activity (stamped at routing, refreshed on each routed

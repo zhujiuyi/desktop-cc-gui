@@ -512,6 +512,10 @@ describe("RunStatusStrip", () => {
     expect(row?.textContent).toContain("失败");
     expect(row?.querySelector(".animate-ping")).toBeNull();
     expect(row?.querySelector(".text-text-error-primary")).not.toBeNull();
+    // The name steps down to the settled tone instead of fighting the red.
+    expect(row?.querySelector(".text-caption-1-medium")?.className).toContain(
+      "text-text-secondary",
+    );
   });
 
   it("keeps the message-derived steps for engines that report no task frames", async () => {

@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { EngineEventPayload } from "@/lib/events";
+import { ipc } from "@/lib/ipc";
 import { useChatStore } from "./store";
 import {
   handleEngineEvents,
@@ -231,6 +232,43 @@ describe("background turn lifecycle", () => {
     expect(s.awaitingTasks).toBe(false);
     // A reported outcome is not rewritten by the stop that follows it.
     expect(s.tasks[0].status).toBe("failed");
+  });
+
+  it("drops the task frames a killed run emits while the stop IPC is in flight", async () => {
+    handleEngineEvents([
+      ev("task_started", 1, { taskId: "w1", taskType: "local_workflow", description: "wf" }),
+      ev("done", 2, { usage: null, backgroundTasks: 1 }),
+    ], deps());
+    useChatStore.setState({
+      active: { engine: "claude", sessionId: "s-1", workspacePath: "/tmp/ws" },
+    });
+    // The kill IPC has not returned yet. The dying process is exactly what
+    // emits its last task frames in this window, when the run is still routed
+    // and no done has ever marked it settled.
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    vi.mocked(ipc.interruptSession).mockImplementationOnce(async () => {
+      await gate;
+      return true;
+    });
+
+    const stopping = useChatStore.getState().interrupt();
+    handleEngineEvents([
+      ev("task_progress", 3, { taskId: "w1", description: "阶段" }),
+      ev("task_notification", 4, { taskId: "w1", status: "completed" }),
+      ev("task_started", 5, { taskId: "w1", taskType: "local_workflow", description: "wf" }),
+      ev("delta", 6, "还在说话"),
+    ], deps());
+
+    const mid = useChatStore.getState().bySession[KEY]!;
+    expect(mid.streaming).toBe(false);
+    expect(mid.turnStartedAt).toBeNull();
+    expect(mid.tasks[0].status).toBe("stopped");
+    expect(mid.backgroundActive).toBe(false);
+    expect(useChatStore.getState().streamingByKey[KEY]).not.toBe(true);
+
+    release();
+    await stopping;
   });
 
   it("a stop during a plain streaming turn leaves the task state untouched", async () => {

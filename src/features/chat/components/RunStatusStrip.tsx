@@ -616,7 +616,9 @@ function SubagentRows({ steps }: { steps: AgentTaskStep[] }) {
                   <span
                     className={cx(
                       "truncate text-caption-1-medium",
-                      complete ? "text-text-secondary" : "text-text-primary",
+                      // A failed step is as settled as a finished one: the
+                      // brightest text would fight the red status beside it.
+                      complete || failed ? "text-text-secondary" : "text-text-primary",
                     )}
                   >
                     {step.label}
