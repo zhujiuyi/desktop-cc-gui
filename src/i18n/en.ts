@@ -314,6 +314,19 @@ export const en: Messages = {
     metaDuration: "Duration {{duration}}",
     metaModel: "Model {{model}}",
     metaEffort: "Effort {{effort}}",
+    tasks: {
+      tab: "Background tasks",
+      empty: "No background tasks",
+      turnAt: "Turn {{time}}",
+      runningIndicator: "Background tasks running · {{count}}",
+      status: {
+        running: "Running",
+        completed: "Completed",
+        failed: "Failed",
+        stopped: "Stopped",
+        interrupted: "Interrupted",
+      },
+    },
   },
   settings: {
     title: "Settings",

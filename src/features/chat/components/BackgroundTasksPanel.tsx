@@ -1,0 +1,94 @@
+import { useTranslation } from "react-i18next";
+import Activity from "lucide-react/dist/esm/icons/activity";
+import Bot from "lucide-react/dist/esm/icons/bot";
+import TerminalSquare from "lucide-react/dist/esm/icons/terminal-square";
+import Workflow from "lucide-react/dist/esm/icons/workflow";
+import { cx } from "@/utils/cx";
+import { groupTasksByRun } from "../background-tasks";
+import { sessionKey, useChatStore } from "../store";
+import { EMPTY_TASKS, type BackgroundTask } from "../store/stream";
+
+const TYPE_ICON: Record<string, typeof Activity> = {
+  local_workflow: Workflow,
+  local_agent: Bot,
+  local_bash: TerminalSquare,
+};
+
+function StatusBadge({ status }: { status: BackgroundTask["status"] }) {
+  const { t } = useTranslation();
+  return (
+    <span
+      className={cx(
+        "shrink-0 rounded-full px-1.5 py-0.5 text-[10px]",
+        status === "running" && "bg-accent-500/15 text-accent-600",
+        status === "completed" && "bg-green-500/15 text-green-600",
+        (status === "failed" || status === "interrupted") && "bg-red-500/15 text-red-600",
+        status === "stopped" && "bg-foreground-icon-tertiary/15 text-foreground-icon-tertiary",
+      )}
+    >
+      {t(`chat.tasks.status.${status}`)}
+    </span>
+  );
+}
+
+function TaskRow({ task }: { task: BackgroundTask }) {
+  const Icon = TYPE_ICON[task.taskType] ?? Activity;
+  return (
+    <div className="flex flex-col gap-0.5 rounded-[6px] px-2 py-1.5 hover:bg-background-tertiary-default/50">
+      <div className="flex min-w-0 items-center gap-2">
+        <Icon className="size-3.5 shrink-0 text-foreground-icon-secondary" />
+        <span className="min-w-0 flex-1 truncate text-xs text-text-primary">
+          {task.workflowName || task.subagentType || task.description || task.taskType}
+        </span>
+        <StatusBadge status={task.status} />
+      </div>
+      {(task.progress || task.lastTool) && (
+        <div className="truncate pl-5 text-[11px] text-foreground-icon-tertiary">
+          {task.progress || task.lastTool}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Right-panel tab: background tasks of this session, grouped by turn. */
+export function BackgroundTasksPanel({ workspacePath }: { workspacePath: string }) {
+  // The tab registry hands every panel the active workspace, but tasks belong
+  // to a *session*: two tabs can share one workspace, so the active tab (the
+  // same store selector QuestionDock/GrantCard use) is what identifies them.
+  void workspacePath;
+  const { t } = useTranslation();
+  const active = useChatStore((s) => s.active);
+  const tasks = useChatStore((s) => {
+    if (!active) return EMPTY_TASKS;
+    const key = sessionKey(active.engine, active.sessionId, active.workspacePath);
+    return s.bySession[key]?.tasks ?? EMPTY_TASKS;
+  });
+  const groups = groupTasksByRun(tasks);
+  if (groups.length === 0) {
+    return <div className="p-3 text-xs text-foreground-icon-tertiary">{t("chat.tasks.empty")}</div>;
+  }
+  return (
+    <div className="flex h-full flex-col overflow-y-auto p-1.5">
+      {groups.map((group) => (
+        <div key={group.runId} className="mb-1.5">
+          <div className="px-2 py-1 text-[11px] text-foreground-icon-tertiary">
+            {t("chat.tasks.turnAt", { time: new Date(group.startedAt).toLocaleTimeString() })}
+          </div>
+          {group.tasks.map((task) => <TaskRow key={task.id} task={task} />)}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** One-line background marker for the timeline tail (Task 6 uses it). */
+export function BackgroundTasksLine({ count }: { count: number }) {
+  const { t } = useTranslation();
+  return (
+    <div className="flex items-center gap-2 py-2 text-xs text-foreground-icon-secondary">
+      <span className="size-1.5 animate-pulse rounded-full bg-accent-500" />
+      {t("chat.tasks.runningIndicator", { count })}
+    </div>
+  );
+}

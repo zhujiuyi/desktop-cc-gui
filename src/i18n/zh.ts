@@ -305,6 +305,19 @@ export const zh = {
     metaDuration: "耗时 {{duration}}",
     metaModel: "模型 {{model}}",
     metaEffort: "推理档位 {{effort}}",
+    tasks: {
+      tab: "后台任务",
+      empty: "暂无后台任务",
+      turnAt: "回合 {{time}}",
+      runningIndicator: "后台任务运行中 · {{count}} 个",
+      status: {
+        running: "运行中",
+        completed: "已完成",
+        failed: "失败",
+        stopped: "已停止",
+        interrupted: "已中断",
+      },
+    },
   },
   settings: {
     title: "设置",
