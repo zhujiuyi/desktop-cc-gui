@@ -1139,6 +1139,13 @@ function onDone(event: EngineEventPayload, key: string, deps: EngineEventDeps) {
   if (deps.get().bySession[key]?.compaction) patchSession(deps.set, key, { compaction: null });
   const prev = deps.get().bySession[key] ?? EMPTY_SESSION;
   const data = event.data as { usage: unknown };
+  // A done whose turn still has background tasks running is not the run's
+  // terminal event: keep the run routed so task frames keep flowing and the
+  // CLI's completion turn can reopen it.
+  const backgroundTasks =
+    typeof (event.data as { backgroundTasks?: unknown } | null)?.backgroundTasks === "number"
+      ? (event.data as { backgroundTasks: number }).backgroundTasks
+      : 0;
   // Occupancy for the context meter: the newest single report (claude's one
   // payload already carries the turn's totals).
   const turnTotals = turnUsageTotals.get(event.runId);
@@ -1201,13 +1208,26 @@ function onDone(event: EngineEventPayload, key: string, deps: EngineEventDeps) {
           usage: settledUsage,
           turnUsage: null,
           interrupted: false,
-          settledRunIds: rememberSettledRun(cur, event.runId),
+          awaitingTasks: backgroundTasks > 0,
+          // Keep this run alive for its background tasks; only a done with
+          // nothing running is the run's terminal event.
+          settledRunIds: backgroundTasks > 0 ? cur.settledRunIds : rememberSettledRun(cur, event.runId),
         },
       },
       streamingByKey: setStreamingFlag(s.streamingByKey, key, false),
       retryingByKey: setRetryingFlag(s.retryingByKey, key, false),
     };
   });
+  if (backgroundTasks > 0) {
+    // The reply's own segment is over, but the run is not terminal: routing
+    // and runActivity stay (task frames and the completion turn still come
+    // back here); the queue drains as usual so typing is never locked; the
+    // usage ledger waits for the final done.
+    void ipc.rescanSessions().catch(() => {});
+    deps.markUnseenIfBackground(key);
+    if (!prev.interrupted) deps.drainQueue(key);
+    return;
+  }
   // The run is over: drop its routing entry so the map cannot grow forever.
   runRouting.delete(event.runId);
   untrackRun(event.runId);
@@ -1266,9 +1286,14 @@ function adoptObservedRun(
   }
   const cur = deps.get().bySession[key];
   if (!cur?.streaming) {
+    // A completion turn reopens the run after its background phase: its text
+    // is a fresh segment, so the elapsed timer restarts and the background
+    // marker clears.
+    const reopen = cur?.awaitingTasks === true;
     patchSession(deps.set, key, {
       streaming: true,
-      turnStartedAt: cur?.turnStartedAt ?? Date.now(),
+      turnStartedAt: reopen ? Date.now() : (cur?.turnStartedAt ?? Date.now()),
+      ...(reopen ? { awaitingTasks: false } : {}),
     });
   }
   if (!deps.get().streamingByKey[key]) {
@@ -1344,9 +1369,15 @@ export function handleEngineEvents(
     }
     if (!key) continue;
     if (event.kind === "done" || event.kind === "error") {
-      settledRuns.set(event.runId, event.kind);
-      if (settledRuns.size > MAX_SETTLED_RUNS) {
-        settledRuns.delete(settledRuns.keys().next().value!);
+      const bg =
+        event.kind === "done" &&
+        typeof (event.data as { backgroundTasks?: unknown } | null)?.backgroundTasks === "number" &&
+        (event.data as { backgroundTasks: number }).backgroundTasks > 0;
+      if (!bg) {
+        settledRuns.set(event.runId, event.kind);
+        if (settledRuns.size > MAX_SETTLED_RUNS) {
+          settledRuns.delete(settledRuns.keys().next().value!);
+        }
       }
       // Every turn funnels through here: drop the computer-use global
       // Esc-to-stop so a system-wide hotkey never outlives its run. Arming
