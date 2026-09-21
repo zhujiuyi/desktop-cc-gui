@@ -11,7 +11,13 @@ import { sessionKey } from "./store/persistence";
 import { EMPTY_SESSION, flushPendingStreams, runRouting } from "./store/stream";
 
 vi.mock("@/lib/ipc", () => ({
-  ipc: { rescanSessions: vi.fn(async () => {}), usageRecord: vi.fn(async () => {}) },
+  ipc: {
+    rescanSessions: vi.fn(async () => {}),
+    usageRecord: vi.fn(async () => {}),
+    // Only the interrupt path reaches these two.
+    interruptSession: vi.fn(async () => true),
+    loadSessionPage: vi.fn(async () => ({ messages: [], nextBefore: null })),
+  },
 }));
 vi.mock("@/lib/events", () => ({
   listenEngineEvents: vi.fn(async () => () => {}),
@@ -183,6 +189,62 @@ describe("background turn lifecycle", () => {
     expect(s.awaitingTasks).toBe(false);
     expect(s.tasks[0].status).toBe("interrupted");
     expect(s.backgroundActive).toBe(false);
+  });
+
+  it("stopping a session settles its running tasks as stopped", async () => {
+    handleEngineEvents([
+      ev("task_started", 1, { taskId: "w1", taskType: "local_workflow", description: "wf" }),
+      ev("done", 2, { usage: null, backgroundTasks: 1 }),
+    ], deps());
+    expect(runRouting.get(runId)).toBe(KEY);
+    useChatStore.setState({
+      active: { engine: "claude", sessionId: "s-1", workspacePath: "/tmp/ws" },
+    });
+
+    await useChatStore.getState().interrupt();
+
+    const s = useChatStore.getState().bySession[KEY]!;
+    expect(s.interrupted).toBe(true);
+    expect(s.streaming).toBe(false);
+    // The turn is no longer waiting on anything, and the tail indicator must
+    // stop claiming a task is running.
+    expect(s.awaitingTasks).toBe(false);
+    expect(s.backgroundActive).toBe(false);
+    // The user asked for the stop, so this is 已停止 — not the 已中断 the store
+    // reserves for a run that died without a terminal notification.
+    expect(s.tasks[0].status).toBe("stopped");
+  });
+
+  it("a stop leaves tasks that already settled alone", async () => {
+    handleEngineEvents([
+      ev("task_started", 1, { taskId: "w1", taskType: "local_workflow", description: "wf" }),
+      ev("task_notification", 2, { taskId: "w1", status: "failed" }),
+      ev("done", 3, { usage: null, backgroundTasks: 1 }),
+    ], deps());
+    useChatStore.setState({
+      active: { engine: "claude", sessionId: "s-1", workspacePath: "/tmp/ws" },
+    });
+
+    await useChatStore.getState().interrupt();
+
+    const s = useChatStore.getState().bySession[KEY]!;
+    expect(s.awaitingTasks).toBe(false);
+    // A reported outcome is not rewritten by the stop that follows it.
+    expect(s.tasks[0].status).toBe("failed");
+  });
+
+  it("a stop during a plain streaming turn leaves the task state untouched", async () => {
+    useChatStore.setState({
+      active: { engine: "claude", sessionId: "s-1", workspacePath: "/tmp/ws" },
+    });
+
+    await useChatStore.getState().interrupt();
+
+    const s = useChatStore.getState().bySession[KEY]!;
+    expect(s.streaming).toBe(false);
+    expect(s.interrupted).toBe(true);
+    expect(s.tasks).toHaveLength(0);
+    expect(s.awaitingTasks).toBe(false);
   });
 
   it("clears awaiting tasks when the orphan sweep reaps the run", () => {

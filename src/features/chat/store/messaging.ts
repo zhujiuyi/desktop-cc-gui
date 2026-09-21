@@ -36,6 +36,7 @@ import {
   patchQuestionByRequestId,
   rememberProviderForRun,
   settleOrphanedRuns,
+  settleRunTasks,
   upsertSessionMetaInto,
 } from "./engine-events";
 import { ASK_OTHER_OPTION, askLoops, beginAskSubmit, revertAskSubmit } from "./ask-loop";
@@ -650,6 +651,13 @@ export function createMessagingActions(
         active.sessionId,
         active.workspacePath,
       );
+      // This session's current runs: the ones Stop is about to kill, so no
+      // task frame will ever report a terminal status for what they left
+      // running. Read here — before the awaits below — because the settle
+      // that follows must not catch a run started while Stop was in flight.
+      const stoppedRunIds = [...runRouting]
+        .filter(([, routed]) => routed === key)
+        .map(([runId]) => runId);
       // Settle locally FIRST: the killed run's done event can arrive while
       // the kill IPCs below are still in flight, and onDone drains the queue
       // whenever interrupted is still false — that would fire the next
@@ -662,6 +670,17 @@ export function createMessagingActions(
             ? applyStreamParts(cur.messages, pending.parts, pending.model)
             : cur.messages,
         );
+        // A session that is (or was) waiting on background work has rows the
+        // stop just killed; a plain streaming turn has nothing to settle.
+        // `stopped`, not `interrupted`: the user asked for this stop, and the
+        // store reserves 已中断 for a run that died without a notification.
+        const stoppingTasks = cur.awaitingTasks || cur.backgroundActive;
+        const tasks = stoppingTasks
+          ? stoppedRunIds.reduce(
+              (acc, runId) => settleRunTasks(acc, runId, "stopped"),
+              cur.tasks,
+            )
+          : cur.tasks;
         return {
           bySession: {
             ...s.bySession,
@@ -672,6 +691,16 @@ export function createMessagingActions(
               interrupted: true,
               turnStartedAt: null,
               retry: null,
+              // The wait ends with the work it waited for: without this the
+              // tail indicator keeps claiming a task is running and the pill
+              // keeps breathing over rows the user just stopped.
+              ...(stoppingTasks
+                ? {
+                    tasks,
+                    awaitingTasks: false,
+                    backgroundActive: tasks.some((t) => t.status === "running"),
+                  }
+                : {}),
             },
           },
           streamingByKey: setStreamingFlag(s.streamingByKey, key, false),

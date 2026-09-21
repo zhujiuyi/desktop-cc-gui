@@ -5,11 +5,14 @@ import { cx } from "@/utils/cx";
 import { useGitStore } from "@/features/git/store";
 import type { GitStatus, Message, TodoItem } from "@/lib/ipc";
 import { useChatStore } from "../store";
+import { EMPTY_TASKS } from "../store/stream";
+import { stepsFromTasks } from "../background-tasks";
 import {
   deriveAgentTaskSteps,
   deriveEditedFiles,
   deriveTodoList,
   type AgentTaskStep,
+  type AgentTaskStepState,
 } from "./agent-task-steps";
 import { createEditLineStatsBuilder, type EditLineStat } from "./edit-line-stats";
 import { RollingStat } from "./RollingStat";
@@ -492,11 +495,18 @@ function TodoRows({ items, live }: { items: TodoItem[]; live: boolean }) {
   );
 }
 
+/** One step's status text. `failed` reuses the background-task status key so
+ *  the report panel and the pill panel name the same state the same way. */
+function agentStatusText(t: TFunction, state: AgentTaskStepState): string {
+  if (state === "failed") return t("chat.tasks.status.failed");
+  return state === "complete" ? t("chat.agentStatusDone") : t("chat.agentStatusRunning");
+}
 /** One agent's full assignment, overlaid on the list inside the same panel:
  *  task briefs run long, and leaving the strip to read one loses the panel. */
 function SubagentDetail({ step, onBack }: { step: AgentTaskStep; onBack: () => void }) {
   const { t } = useTranslation();
   const complete = step.state === "complete";
+  const failed = step.state === "failed";
   // The row that opened this overlay unmounted with the list; move focus
   // into the overlay instead of dropping it on document.body.
   const backRef = useRef<HTMLButtonElement>(null);
@@ -525,10 +535,14 @@ function SubagentDetail({ step, onBack }: { step: AgentTaskStep; onBack: () => v
         <span
           className={cx(
             "ml-auto shrink-0 text-caption-2-medium",
-            complete ? "text-[var(--color-status-unseen)]" : "font-medium text-blue-500",
+            failed
+              ? "font-medium text-text-error-primary"
+              : complete
+                ? "text-[var(--color-status-unseen)]"
+                : "font-medium text-blue-500",
           )}
         >
-          {complete ? t("chat.agentStatusDone") : t("chat.agentStatusRunning")}
+          {agentStatusText(t, step.state)}
         </span>
       </div>
       <pre className="max-h-52 overflow-y-auto rounded bg-background-secondary-default px-2 py-1.5 text-caption-1-medium break-words whitespace-pre-wrap text-text-secondary">
@@ -572,6 +586,7 @@ function SubagentRows({ steps }: { steps: AgentTaskStep[] }) {
       <ul className="flex flex-col gap-0.5 p-1">
         {steps.map((step) => {
           const complete = step.state === "complete";
+          const failed = step.state === "failed";
           return (
             <li key={step.key}>
               <button
@@ -582,7 +597,15 @@ function SubagentRows({ steps }: { steps: AgentTaskStep[] }) {
                 className="grid w-full cursor-pointer grid-cols-[14px_minmax(0,1fr)_auto] items-center gap-2 rounded px-2 py-1.5 text-left transition-colors hover:bg-background-tertiary-default/50"
               >
                 <div className="flex items-center justify-center">
-                  <BreathingDot active={!complete} />
+                  {/* A dead task gets the same static error dot the blocked
+                      todo row uses: breathing means "still working". */}
+                  {failed ? (
+                    <span className="grid size-3.5 place-items-center">
+                      <span className="size-1.5 rounded-full bg-text-error-primary" />
+                    </span>
+                  ) : (
+                    <BreathingDot active={!complete} />
+                  )}
                 </div>
                 <div className="flex min-w-0 items-center gap-1.5">
                   {step.subagentType && (
@@ -602,12 +625,14 @@ function SubagentRows({ steps }: { steps: AgentTaskStep[] }) {
                 <span
                   className={cx(
                     "text-caption-2-medium flex shrink-0 items-center gap-1",
-                    complete
-                      ? "text-[var(--color-status-unseen)]"
-                      : "font-medium text-blue-500",
+                    failed
+                      ? "font-medium text-text-error-primary"
+                      : complete
+                        ? "text-[var(--color-status-unseen)]"
+                        : "font-medium text-blue-500",
                   )}
                 >
-                  {complete ? t("chat.agentStatusDone") : t("chat.agentStatusRunning")}
+                  {agentStatusText(t, step.state)}
                 </span>
               </button>
             </li>
@@ -722,7 +747,10 @@ function RunStatusPills({
 }) {
   const { t } = useTranslation();
   const completedCount = steps.filter((step) => step.state === "complete").length;
-  const anyRunning = streaming && completedCount < steps.length;
+  // A failed step is settled, not running. For message-derived steps the
+  // derivation settles them when streaming ends; task-backed Claude steps may
+  // remain active while their background work outlives the text stream.
+  const anyRunning = steps.some((step) => step.state === "active");
   const todosDone = todos.filter((item) => item.status === "complete").length;
   const todosRunning = streaming && todos.some((item) => item.status === "active");
   return (
@@ -800,9 +828,19 @@ export const RunStatusStrip = memo(function RunStatusStrip({
     () => (subagentHistory.length ? [...subagentHistory, ...messages] : messages),
     [subagentHistory, messages],
   );
+  // Claude reports its subagents as background tasks, so that table is the
+  // real data for its pill — a task that failed says so, which the message
+  // fold cannot tell. Keep the baseline's combined history for other engines
+  // and todo extraction (including separately paged subagent history).
+  const tasks = useChatStore((s) =>
+    sessionKey ? (s.bySession[sessionKey]?.tasks ?? EMPTY_TASKS) : EMPTY_TASKS,
+  );
   const steps = useMemo(
-    () => deriveAgentTaskSteps(allHistory, streaming, engine),
-    [allHistory, streaming, engine],
+    () =>
+      engine === "claude" && tasks.length > 0
+        ? stepsFromTasks(tasks)
+        : deriveAgentTaskSteps(allHistory, streaming, engine),
+    [tasks, allHistory, streaming, engine],
   );
   const files = useMemo(() => deriveEditedFiles(messages), [messages]);
   const todos = useMemo(() => deriveTodoList(allHistory), [allHistory]);

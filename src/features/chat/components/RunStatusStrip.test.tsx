@@ -7,6 +7,7 @@ import { useGitStore } from "@/features/git/store";
 import { RunStatusStrip } from "./RunStatusStrip";
 import { deriveTodoList } from "./agent-task-steps";
 import { ipc } from "@/lib/ipc";
+import { type BackgroundTask } from "../store/stream";
 import type { Message, TodosPayload } from "@/lib/ipc";
 
 // React's act() environment flag — a well-known global the runtime can't
@@ -34,6 +35,31 @@ const TURN: Message[] = [
 function seed(messages: Message[], streaming: boolean) {
   useChatStore.setState({
     bySession: { [KEY]: { messages, streaming } as never },
+  });
+}
+
+function task(over: Partial<BackgroundTask>): BackgroundTask {
+  return {
+    id: "t", runId: "r1", taskType: "local_agent", description: "d",
+    status: "running", startedAt: 1, updatedAt: 1, ...over,
+  };
+}
+
+/** Claude reports its subagents as background tasks; this seeds that table. */
+function seedTasks(
+  tasks: BackgroundTask[],
+  messages: Message[] = [msg(1, "user", "跑一下")],
+  streaming = false,
+) {
+  useChatStore.setState({
+    bySession: {
+      [KEY]: {
+        messages,
+        streaming,
+        tasks,
+        backgroundActive: tasks.some((t) => t.status === "running"),
+      } as never,
+    },
   });
 }
 
@@ -67,9 +93,9 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
-async function renderStrip() {
+async function renderStrip(engine = "pi") {
   await act(async () => {
-    root.render(<RunStatusStrip sessionKey={KEY} engine="pi" workspacePath={WS} />);
+    root.render(<RunStatusStrip sessionKey={KEY} engine={engine} workspacePath={WS} />);
   });
 }
 
@@ -446,6 +472,55 @@ describe("RunStatusStrip", () => {
     expect(panel).toContain("code-reviewer");
     expect(panel).toContain("检查代码安全漏洞");
     expect(panel).toContain("已完成");
+  });
+
+  it("reads the claude subagent steps from the session's task table", async () => {
+    // TURN carries a message-derived subagent row of its own: the task table
+    // is the real data and must win over the message fold.
+    seedTasks(
+      [
+        task({ id: "a", subagentType: "general-purpose", description: "读文档" }),
+        task({ id: "b", status: "completed", workflowName: "ccgui-full-parse" }),
+        task({ id: "c", status: "failed", description: "坏掉的子代理" }),
+      ],
+      TURN,
+    );
+    await renderStrip("claude");
+
+    expect(pill("子代理").textContent).toContain("1/3");
+    await click(pill("子代理"));
+    const panel = container.querySelector("[data-testid='run-status-subagents']")?.textContent;
+    expect(panel).toContain("general-purpose");
+    expect(panel).toContain("ccgui-full-parse");
+    expect(panel).toContain("坏掉的子代理");
+    expect(panel).toContain("运行中");
+    expect(panel).toContain("已完成");
+    expect(panel).toContain("失败");
+  });
+
+  it("renders a failed task in the error palette without a breathing dot", async () => {
+    seedTasks([
+      task({ id: "a", status: "failed", subagentType: "code-reviewer", description: "审查" }),
+    ]);
+    await renderStrip("claude");
+    // The only task is dead: the pill must not claim something is running.
+    expect(pill("子代理").textContent).toContain("0/1");
+    expect(container.querySelector(".animate-ping")).toBeNull();
+
+    await click(pill("子代理"));
+    const row = container.querySelector<HTMLButtonElement>("[data-agent-step-key]");
+    expect(row?.textContent).toContain("失败");
+    expect(row?.querySelector(".animate-ping")).toBeNull();
+    expect(row?.querySelector(".text-text-error-primary")).not.toBeNull();
+  });
+
+  it("keeps the message-derived steps for engines that report no task frames", async () => {
+    seedTasks([task({ id: "a" }), task({ id: "b", status: "completed" })], TURN, true);
+    await renderStrip("pi");
+
+    // pi has no task table: the pill still follows the message stream (one
+    // active subagent in TURN), not the claude-only task rows.
+    expect(pill("子代理").textContent).toContain("0/1");
   });
 
   it("correctly maps TaskCreate and subsequent TaskUpdate by taskId to complete status", async () => {
