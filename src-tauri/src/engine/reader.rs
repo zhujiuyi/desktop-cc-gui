@@ -37,9 +37,13 @@ pub(crate) const POST_EXIT_DRAIN: std::time::Duration = std::time::Duration::fro
 /// CLI answers a finished background task with one more turn (its completion
 /// note), and EOF-ing stdin first truncates that turn mid-generation.
 const BACKGROUND_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
-/// Backstop while background tasks are still live but have gone silent. ccgui
-/// no longer lets the CLI's own wind-down sweep them (stdin stays open while
-/// tasks run), so this is the only bound on a wedged task pinning the process.
+/// Silence bound while background tasks are still live but have gone quiet.
+/// The read loop re-arms it from NOW on every task frame, so it bounds how
+/// long the run may sit with no task activity — not how long the process may
+/// live: a task that keeps reporting (or the completion turn it triggers)
+/// extends the run past this. ccgui no longer lets the CLI's own wind-down
+/// sweep live tasks (stdin stays open while they run), so this is the only
+/// lever left on a task that wedges without ever emitting a final frame.
 const BACKGROUND_STALL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 /// Hard cap on one NDJSON line from an engine. Real events are kilobytes;
 /// `BufReader::lines` has no limit, so a runaway engine writing without
@@ -164,6 +168,9 @@ pub(crate) struct TurnState {
     /// Live background tasks of this run (claude task frames). While non-empty
     /// after a `done`, the reader keeps the CLI's stdin open so its wind-down
     /// cannot sweep them, and lets the follow-up completion turn through.
+    /// Holds only the tasks this run waits for: ambient (session-scoped) ones
+    /// arrive in the same frames but never finish inside a turn, so counting
+    /// them would hold stdin open on every turn end of a session that has one.
     pub(crate) pending_tasks: std::collections::HashMap<String, TaskSummary>,
     /// A `done` arrived while background tasks were still running: the reply
     /// has settled but the run is not terminal until they finish and the CLI's
@@ -337,8 +344,9 @@ fn suppressed_after_terminal(state: &TurnState, event: &EngineEvent) -> bool {
 }
 
 /// Next stdin-close deadline for the current background state: 30s once
-/// nothing is running (leave room for the completion turn), a 30-minute stall
-/// backstop while tasks are live, `None` when not awaiting.
+/// nothing is running (leave room for the completion turn), a 30-minute
+/// silence bound while tasks are live (re-armed by every task frame), and
+/// `None` when not awaiting.
 fn next_close_deadline(
     pending: usize,
     awaiting: bool,
@@ -767,7 +775,20 @@ impl TurnCore {
                 );
             }
             EngineEvent::TasksChanged { tasks } => {
-                state.pending_tasks = tasks.iter().map(|t| (t.id.clone(), t.clone())).collect();
+                // The level signal carries every task the CLI knows about,
+                // including its ambient (session-scoped monitor/dream) ones.
+                // Only the tasks this run actually waits for may hold the run
+                // open: an ambient task never finishes inside a turn, so
+                // counting it would keep stdin open to the stall bound at
+                // every turn end of a session that has one — and would inflate
+                // done's backgroundTasks above 0, stranding the UI's turn on a
+                // background segment that never resolves. The frame itself is
+                // forwarded whole: the panel shows ambient tasks too.
+                state.pending_tasks = tasks
+                    .iter()
+                    .filter(|t| !t.ambient)
+                    .map(|t| (t.id.clone(), t.clone()))
+                    .collect();
                 state.close_deadline = next_close_deadline(
                     state.pending_tasks.len(),
                     state.awaiting_tasks,
@@ -1755,6 +1776,26 @@ mod terminal_event_tests {
             &state,
             &EngineEvent::TaskNotification { id: "t".into(), status: "completed".into() }
         ));
+        // All four task variants must pass the terminal gate, not just the
+        // two that arrive after done in the common case: a background task
+        // started by the follow-up turn (or the level frame that closes it
+        // out) lands after a done too.
+        assert!(!suppressed_after_terminal(
+            &state,
+            &EngineEvent::TaskStarted {
+                id: "t".into(),
+                task_type: "local_bash".into(),
+                description: "ping".into(),
+                subagent_type: None,
+                is_backgrounded: None,
+                spawn_depth: None,
+                workflow_name: None,
+            }
+        ));
+        assert!(!suppressed_after_terminal(
+            &state,
+            &EngineEvent::TasksChanged { tasks: Vec::new() }
+        ));
     }
 
     #[test]
@@ -1779,5 +1820,101 @@ mod terminal_event_tests {
         assert_eq!(next_close_deadline(0, false, now), None);
         assert_eq!(next_close_deadline(0, true, now), Some(now + BACKGROUND_GRACE));
         assert_eq!(next_close_deadline(3, true, now), Some(now + BACKGROUND_STALL));
+    }
+
+    /// The core of the stdin policy: a done with a live task must NOT EOF the
+    /// CLI's stdin (that EOF is what makes the CLI sweep its own background
+    /// tasks), and the reported count is what tells the frontend the turn
+    /// keeps going in the background.
+    #[tokio::test]
+    async fn done_with_pending_task_keeps_stdin_open_and_reports_count() {
+        let collector = Arc::new(Collector::default());
+        let core = TurnCore {
+            sink: event_sink::EventSink::new(collector.clone()),
+            // close_stdin is a no-op for a key with no registered entry, so
+            // this run id needs no registry fixture.
+            registry: Arc::new(ProcessRegistry::default()),
+            engine_id: "claude".into(),
+            run_id: "done-with-task".into(),
+        };
+        let mut state = TurnState::new(None);
+        state.pending_tasks.insert(
+            "task-1".into(),
+            TaskSummary {
+                id: "task-1".into(),
+                task_type: "local_bash".into(),
+                description: "sleep 60".into(),
+                ambient: false,
+            },
+        );
+        core.dispatch_event(&mut state, EngineEvent::Done { session_id: None, usage: None });
+        core.sink.flush();
+        assert!(state.awaiting_tasks, "a live task must leave the run awaiting its completion turn");
+        assert!(state.close_deadline.is_some(), "an awaiting run must arm a stdin-close deadline");
+        let events = collector.0.lock().unwrap();
+        let done = events
+            .iter()
+            .find(|event| event["kind"] == "done")
+            .expect("done event was not pushed");
+        assert_eq!(done["data"]["backgroundTasks"], 1);
+    }
+
+    /// Ambient tasks (session-scoped monitors/dream) ride along in the level
+    /// signal but must never hold the run open: they do not finish inside a
+    /// turn, so counting them would keep stdin open to the stall bound at
+    /// every turn end and would report a nonzero background count in done.
+    #[tokio::test]
+    async fn ambient_tasks_never_hold_the_run_open() {
+        let collector = Arc::new(Collector::default());
+        let core = TurnCore {
+            sink: event_sink::EventSink::new(collector.clone()),
+            registry: Arc::new(ProcessRegistry::default()),
+            engine_id: "claude".into(),
+            run_id: "ambient-tasks".into(),
+        };
+        let mut state = TurnState::new(None);
+        let ambient = |id: &str| TaskSummary {
+            id: id.to_string(),
+            task_type: "local_agent".into(),
+            description: "monitor".into(),
+            ambient: true,
+        };
+        core.dispatch_event(
+            &mut state,
+            EngineEvent::TasksChanged {
+                tasks: vec![
+                    ambient("task-monitor"),
+                    TaskSummary {
+                        id: "task-real".into(),
+                        task_type: "local_bash".into(),
+                        description: "pnpm test".into(),
+                        ambient: false,
+                    },
+                ],
+            },
+        );
+        assert_eq!(state.pending_tasks.len(), 1, "ambient task entered pending_tasks");
+        assert!(state.pending_tasks.contains_key("task-real"));
+
+        core.dispatch_event(
+            &mut state,
+            EngineEvent::TasksChanged { tasks: vec![ambient("task-monitor")] },
+        );
+        assert!(
+            state.pending_tasks.is_empty(),
+            "a frame carrying only ambient tasks must leave nothing pending"
+        );
+
+        // The frame itself still reaches the panel whole: filtering decides
+        // what holds the run open, not what the background task list shows.
+        core.sink.flush();
+        let events = collector.0.lock().unwrap();
+        let last = events
+            .iter()
+            .filter(|event| event["kind"] == "tasks")
+            .last()
+            .expect("tasks event was not pushed");
+        assert_eq!(last["data"]["tasks"][0]["taskId"], "task-monitor");
+        assert_eq!(last["data"]["tasks"][0]["ambient"], true);
     }
 }
