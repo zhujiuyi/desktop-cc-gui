@@ -4,6 +4,8 @@ import { errorText } from "@/lib/errors";
 import { dedupeTabs, persistTabs, sessionKey } from "./persistence";
 import {
   EMPTY_SESSION,
+  EMPTY_TASKS,
+  appendToolMessage,
   appendToolMessages,
   applyStreamParts,
   bufferStreamPart,
@@ -25,6 +27,8 @@ import {
   untrackRun,
   updatePendingStreamModel,
   type ToolMessageInput,
+  type BackgroundTask,
+  type SessionState,
 } from "./stream";
 import type { ChatStore } from "../store";
 import {
@@ -475,6 +479,107 @@ function onSession(
   );
 }
 
+/** Background tasks are panel state, not turn content: bounded per session,
+ *  running tasks always kept. */
+const TASK_LIMIT = 32;
+
+/** Re-derive the fields the task list owns from the list itself, then trim it
+ *  back to TASK_LIMIT: a running task must never be dropped by retention, so
+ *  the settled ones are the ones that go. */
+function withTaskDerived(cur: SessionState): SessionState {
+  const backgroundActive = cur.tasks.some((t) => t.status === "running");
+  let tasks = cur.tasks;
+  if (tasks.length > TASK_LIMIT) {
+    const running = tasks.filter((t) => t.status === "running");
+    const settled = tasks.filter((t) => t.status !== "running").slice(-(TASK_LIMIT - running.length));
+    tasks = [...settled, ...running].sort((a, b) => a.startedAt - b.startedAt);
+  }
+  return { ...cur, tasks, backgroundActive };
+}
+
+/** Settle the tasks a dead or errored run left running. */
+export function settleRunTasks(
+  tasks: BackgroundTask[],
+  runId: string,
+  status: "interrupted" | "stopped",
+): BackgroundTask[] {
+  const now = Date.now();
+  return tasks.map((t) => (t.runId === runId && t.status === "running" ? { ...t, status, updatedAt: now } : t));
+}
+
+/** Fold one claude task frame into the session's task list. Every frame is an
+ *  upsert by taskId: the CLI may report a task this client never saw start
+ *  (an observer joining mid-run), and a re-reported start has to refresh the
+ *  same row instead of duplicating it. */
+function applyTaskEvent(event: EngineEventPayload, key: string, deps: EngineEventDeps) {
+  const data = (event.data ?? {}) as Record<string, unknown>;
+  deps.set((s) => {
+    const cur = s.bySession[key] ?? EMPTY_SESSION;
+    let tasks = cur.tasks;
+    const now = Date.now();
+    const upsert = (id: string, patch: Partial<BackgroundTask>, base?: Partial<BackgroundTask>) => {
+      const idx = tasks.findIndex((t) => t.id === id);
+      if (idx >= 0) {
+        tasks = tasks.map((t, i) => (i === idx ? { ...t, ...patch, updatedAt: now } : t));
+      } else {
+        tasks = [
+          ...tasks,
+          {
+            id, runId: event.runId, taskType: "other", description: "",
+            status: "running", startedAt: now, updatedAt: now, ...base, ...patch,
+          } as BackgroundTask,
+        ];
+      }
+    };
+    switch (event.kind) {
+      case "task_started":
+        upsert(String(data.taskId), {
+          taskType: String(data.taskType ?? "other"),
+          description: String(data.description ?? ""),
+          ...(typeof data.subagentType === "string" ? { subagentType: data.subagentType } : {}),
+          ...(typeof data.workflowName === "string" ? { workflowName: data.workflowName } : {}),
+          ...(typeof data.isBackgrounded === "boolean" ? { isBackgrounded: data.isBackgrounded } : {}),
+          ...(typeof data.spawnDepth === "number" ? { spawnDepth: data.spawnDepth } : {}),
+          status: "running",
+        });
+        break;
+      case "task_progress":
+        upsert(String(data.taskId), {
+          ...(typeof data.description === "string" ? { progress: data.description } : {}),
+          ...(typeof data.lastTool === "string" ? { lastTool: data.lastTool } : {}),
+          ...(data.usage != null ? { usage: data.usage } : {}),
+        });
+        break;
+      case "task_notification": {
+        const raw = String(data.status ?? "stopped");
+        const status = raw === "completed" || raw === "failed" || raw === "stopped" ? raw : "stopped";
+        upsert(String(data.taskId), { status });
+        break;
+      }
+      case "tasks": {
+        const listed = (data.tasks as Record<string, unknown>[] | undefined) ?? [];
+        const live = new Set(listed.map((t) => String(t.taskId)));
+        // REPLACE semantics: the payload is the authoritative live set, so a
+        // running task missing from it is gone without a terminal notification.
+        tasks = tasks.map((t) =>
+          t.status === "running" && t.runId === event.runId && !live.has(t.id)
+            ? { ...t, status: "stopped" as const, updatedAt: now }
+            : t,
+        );
+        for (const t of listed) {
+          upsert(String(t.taskId), {
+            taskType: String(t.taskType ?? "other"),
+            description: String(t.description ?? ""),
+            ...(typeof t.ambient === "boolean" ? { ambient: t.ambient } : {}),
+          }, { status: "running" });
+        }
+        break;
+      }
+    }
+    return { bySession: { ...s.bySession, [key]: withTaskDerived({ ...cur, tasks }) } };
+  });
+}
+
 /** Runs whose turn already wrote ledger rows report by report. Every report
  *  is one model response, so each lands in the ledger the moment it arrives —
  *  a codex turn that chats for an hour has to show up while it runs, not when
@@ -506,14 +611,25 @@ export function settleOrphanedRuns(
     let streamingByKey = s.streamingByKey;
     let retryingByKey = s.retryingByKey;
     let bySession = s.bySession;
-    for (const [, key] of orphaned) {
+    for (const [runId, key] of orphaned) {
       streamingByKey = setStreamingFlag(streamingByKey, key, false);
       retryingByKey = setRetryingFlag(retryingByKey, key, false);
       const cur = bySession[key];
-      if (cur?.streaming || cur?.retry) {
-        if (bySession === s.bySession) bySession = { ...s.bySession };
-        bySession[key] = { ...cur, streaming: false, turnStartedAt: null, retry: null, compaction: null };
-      }
+      if (!cur) continue;
+      // A reaped run can leave tasks running with the turn already settled
+      // (background work outlives its spawner's reply), so the task settle
+      // decides on its own whether this session needs a write.
+      const unsettled = cur.tasks.some((t) => t.runId === runId && t.status === "running");
+      if (!cur.streaming && !cur.retry && !unsettled) continue;
+      if (bySession === s.bySession) bySession = { ...s.bySession };
+      bySession[key] = withTaskDerived({
+        ...cur,
+        streaming: false,
+        turnStartedAt: null,
+        retry: null,
+        compaction: null,
+        ...(unsettled ? { tasks: settleRunTasks(cur.tasks, runId, "interrupted") } : {}),
+      });
     }
     return { bySession, streamingByKey, retryingByKey };
   });
@@ -650,7 +766,7 @@ function onError(
     return {
       bySession: {
         ...s.bySession,
-        [key]: {
+        [key]: withTaskDerived({
           ...cur,
           messages,
           error: event.data as string,
@@ -658,7 +774,9 @@ function onError(
           turnStartedAt: null,
           turnUsage: null,
           settledRunIds: rememberSettledRun(cur, event.runId),
-        },
+          // The run is dead: nothing will ever notify these tasks.
+          tasks: settleRunTasks(cur.tasks ?? EMPTY_TASKS, event.runId, "interrupted"),
+        }),
       },
       streamingByKey: setStreamingFlag(s.streamingByKey, key, false),
       retryingByKey: setRetryingFlag(s.retryingByKey, key, false),
@@ -1312,6 +1430,12 @@ export function handleEngineEvents(
         break;
       case "effort":
         onEffort(event, key, deps);
+        break;
+      case "task_started":
+      case "task_progress":
+      case "task_notification":
+      case "tasks":
+        applyTaskEvent(event, key, deps);
         break;
     }
   }

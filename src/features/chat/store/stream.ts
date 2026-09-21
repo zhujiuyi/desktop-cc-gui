@@ -16,6 +16,29 @@ export interface QueuedMessage {
   computerUse?: boolean;
 }
 
+/** One background task of a run (claude task frames): a Workflow, a Task-tool
+ *  subagent, or a background shell. `runId` groups tasks under their turn. */
+export interface BackgroundTask {
+  id: string;
+  runId: string;
+  taskType: string;
+  description: string;
+  subagentType?: string;
+  workflowName?: string;
+  isBackgrounded?: boolean;
+  spawnDepth?: number;
+  ambient?: boolean;
+  /** `interrupted` = its run died without a terminal notification. */
+  status: "running" | "completed" | "failed" | "stopped" | "interrupted";
+  /** Live activity line ("<phase>: <agent>" / "Running Wait 590 seconds"). */
+  progress?: string;
+  lastTool?: string;
+  usage?: unknown;
+  startedAt: number;
+  updatedAt: number;
+}
+export const EMPTY_TASKS: BackgroundTask[] = [];
+
 export interface SessionState {
   messages: Message[];
   /** Older delegation metadata kept outside the paginated message window. */
@@ -56,6 +79,15 @@ export interface SessionState {
   /** Set by interrupt(): the next "done" settles the turn but must not
    * auto-drain the queue — pressing stop is not "go on to the next". */
   interrupted: boolean;
+  /** Background tasks of this session, oldest first. Running tasks always
+   *  survive the retention trim. */
+  tasks: BackgroundTask[];
+  /** A running task exists: drives the background indicator and the pill. */
+  backgroundActive: boolean;
+  /** The reply settled but its background tasks are still running: the turn
+   *  reads as "运行中（后台任务）" and the CLI's completion turn may still
+   *  arrive in this run. */
+  awaitingTasks: boolean;
 }
 
 export const EMPTY_SESSION: SessionState = {
@@ -75,6 +107,9 @@ export const EMPTY_SESSION: SessionState = {
   compaction: null,
   queue: [],
   interrupted: false,
+  tasks: EMPTY_TASKS,
+  backgroundActive: false,
+  awaitingTasks: false,
 };
 
 /** The model one session runs with, most specific first:
