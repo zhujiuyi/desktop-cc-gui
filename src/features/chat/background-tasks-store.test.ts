@@ -7,7 +7,7 @@ import {
   type EngineEventDeps,
 } from "./store/engine-events";
 import { sessionKey } from "./store/persistence";
-import { EMPTY_SESSION, runRouting } from "./store/stream";
+import { EMPTY_SESSION, runRouting, type BackgroundTask } from "./store/stream";
 
 vi.mock("@/lib/ipc", () => ({
   ipc: { rescanSessions: vi.fn(async () => {}), usageRecord: vi.fn(async () => {}) },
@@ -159,5 +159,41 @@ describe("background task store", () => {
     expect(tasks.find((t) => t.id === "t1")).toBeUndefined();
     expect(tasks.find((t) => t.id === "t40")).toBeDefined();
     expect(tasks[tasks.length - 1].id).toBe("keep");
+  });
+
+  it("drops every settled task when running ones already fill the cap", () => {
+    const task = (id: string, status: BackgroundTask["status"]): BackgroundTask => ({
+      id, runId, taskType: "local_agent", description: id, status, startedAt: Date.now(), updatedAt: Date.now(),
+    });
+    const settled = [task("s1", "completed"), task("s2", "completed")];
+    const running = Array.from({ length: 33 }, (_, i) => task(`r${i}`, "running"));
+    useChatStore.setState((s) => ({
+      bySession: {
+        ...s.bySession,
+        [KEY]: { ...s.bySession[KEY]!, tasks: [...settled, ...running], backgroundActive: true },
+      },
+    }));
+    handleEngineEvents([ev("task_progress", 2, { taskId: "r0", description: "阶段" })], deps());
+    const tasks = useChatStore.getState().bySession[KEY]!.tasks;
+    // The cap leaves no budget for settled rows; running ones are never dropped.
+    expect(tasks.filter((t) => t.status !== "running")).toHaveLength(0);
+    expect(tasks.filter((t) => t.status === "running")).toHaveLength(33);
+  });
+
+  it("keeps settled rows out once running tasks reach the cap through frames", () => {
+    const frames: ReturnType<typeof ev>[] = [
+      ev("task_started", 1, { taskId: "s1", taskType: "local_agent", description: "s1" }),
+      ev("task_notification", 2, { taskId: "s1", status: "completed" }),
+      ev("task_started", 3, { taskId: "s2", taskType: "local_agent", description: "s2" }),
+      ev("task_notification", 4, { taskId: "s2", status: "completed" }),
+    ];
+    for (let i = 1; i <= 32; i++) {
+      frames.push(ev("task_started", 100 + i, { taskId: `r${i}`, taskType: "local_workflow", description: `r${i}` }));
+    }
+    handleEngineEvents(frames, deps());
+    const tasks = useChatStore.getState().bySession[KEY]!.tasks;
+    expect(tasks).toHaveLength(32);
+    expect(tasks.filter((t) => t.status !== "running")).toHaveLength(0);
+    expect(tasks.filter((t) => t.status === "running")).toHaveLength(32);
   });
 });

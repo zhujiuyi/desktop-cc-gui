@@ -491,7 +491,10 @@ function withTaskDerived(cur: SessionState): SessionState {
   let tasks = cur.tasks;
   if (tasks.length > TASK_LIMIT) {
     const running = tasks.filter((t) => t.status === "running");
-    const settled = tasks.filter((t) => t.status !== "running").slice(-(TASK_LIMIT - running.length));
+    // A zero budget has to drop the settled rows outright: `slice(-0)` is
+    // `slice(0)`, which would keep the whole tail instead.
+    const budget = Math.max(0, TASK_LIMIT - running.length);
+    const settled = budget > 0 ? tasks.filter((t) => t.status !== "running").slice(-budget) : [];
     tasks = [...settled, ...running].sort((a, b) => a.startedAt - b.startedAt);
   }
   return { ...cur, tasks, backgroundActive };
