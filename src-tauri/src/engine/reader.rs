@@ -165,6 +165,15 @@ pub(crate) struct TurnState {
     gen_explicit: bool,
     /// Generation milliseconds closed but not yet attached to a usage report.
     gen_ms: u64,
+    /// Content-bearing frames (delta/thinking/message) of the CURRENT turn.
+    /// A `done` that closes a turn with none of them is not a reply ending:
+    /// the CLI ran a turn it had queued itself — the resume-time
+    /// reconciliation task notification it emits for a previous process's
+    /// still-running tasks — while the message the user actually sent sits
+    /// behind it. Treating that done as terminal suppressed the real turn's
+    /// frames (the "reply never shows in the UI" report), so such a done
+    /// leaves the run open (see the Done arm).
+    pub(crate) saw_content: bool,
     /// Live background tasks of this run (claude task frames). While non-empty
     /// after a `done`, the reader keeps the CLI's stdin open so its wind-down
     /// cannot sweep them, and lets the follow-up completion turn through.
@@ -193,6 +202,7 @@ impl TurnState {
             gen_open_since: None,
             gen_explicit: false,
             gen_ms: 0,
+            saw_content: false,
             pending_tasks: std::collections::HashMap::new(),
             awaiting_tasks: false,
             close_deadline: None,
@@ -427,6 +437,14 @@ impl TurnCore {
             state.saw_done = false;
             state.awaiting_tasks = false;
             state.close_deadline = None;
+        }
+        // Track content per turn: the Done arm uses it to tell a real reply
+        // ending from a queued notification-only turn (see `saw_content`).
+        if matches!(
+            event,
+            EngineEvent::Delta(_) | EngineEvent::Thinking(_) | EngineEvent::Message { .. }
+        ) {
+            state.saw_content = true;
         }
         match event {
             EngineEvent::Delta(text) => {
@@ -838,16 +856,25 @@ impl TurnCore {
                     serde_json::json!({ "tasks": wire }),
                 );
             }
-             EngineEvent::Done { session_id, usage } => {
-                 let gen_ms = state.take_gen_ms();
-                state.saw_done = true;
-                 if let Some(id) = session_id {
-                     self.adopt_session_id(state, &id, false);
-                 }
-                 let pending = state.pending_tasks.len();
+            EngineEvent::Done { session_id, usage } => {
+                let gen_ms = state.take_gen_ms();
+                // A done with no content of its own is not the run's last
+                // word: the CLI closes a notification-only turn it queued
+                // itself (the resume-time reconciliation of a previous
+                // process's tasks) before running the message the user sent,
+                // and marking the run terminal here would suppress that
+                // follow-up turn's frames. Keep the run open — its own done
+                // (or the process-exit path) settles it.
+                let run_continues = !state.saw_content;
+                state.saw_content = false;
+                state.saw_done = !run_continues;
+                if let Some(id) = session_id {
+                    self.adopt_session_id(state, &id, false);
+                }
+                let pending = state.pending_tasks.len();
                 if pending == 0 {
-                     crate::mcp::mark_run_ended(&self.run_id);
-                 }
+                    crate::mcp::mark_run_ended(&self.run_id);
+                }
                 if pending == 0 {
                     // The turn is over and nothing is still running in this
                     // process: EOF the interactive stdin so the CLI exits
@@ -868,7 +895,13 @@ impl TurnCore {
                     &self.run_id,
                     &self.engine_id,
                     "done",
-                    serde_json::json!({ "usage": usage, "backgroundTasks": pending }),
+                    serde_json::json!({
+                        "usage": usage,
+                        "backgroundTasks": pending,
+                        // A notification-only turn is followed by the user turn;
+                        // preserve run routing until that real turn is settled.
+                        "runContinues": run_continues,
+                    }),
                     gen_ms,
                 );
             }
@@ -1921,6 +1954,32 @@ mod terminal_event_tests {
         ));
         state.awaiting_tasks = false;
         assert!(suppressed_after_terminal(&state, &EngineEvent::Delta("late".into())));
+    }
+
+    #[tokio::test]
+    async fn hollow_done_leaves_room_for_the_cli_s_queued_turn() {
+        let collector = Arc::new(Collector::default());
+        let core = TurnCore {
+            sink: event_sink::EventSink::new(collector.clone()),
+            registry: Arc::new(ProcessRegistry::default()),
+            engine_id: "claude".into(), run_id: "hollow-test".into(),
+        };
+        let mut state = TurnState::new(Some("session".into()));
+        // The resume-time reconciliation turn carries no content of its own.
+        core.dispatch_event(&mut state, EngineEvent::Model("m".into()));
+        core.dispatch_event(&mut state, EngineEvent::Done { session_id: None, usage: None });
+        assert!(!state.saw_done, "a content-free done is not the run's terminal event");
+        // The CLI's queued turn — the message the user actually sent — still
+        // has to stream, and its own done settles the run.
+        core.dispatch_event(&mut state, EngineEvent::Delta("reply".into()));
+        core.dispatch_event(&mut state, EngineEvent::Done { session_id: None, usage: None });
+        assert!(state.saw_done);
+        core.sink.flush();
+        let events = collector.0.lock().unwrap();
+        let kinds: Vec<_> = events.iter().map(|event| event["kind"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["model", "done", "delta", "done"]);
+        assert_eq!(events[1]["data"]["runContinues"], true);
+        assert_eq!(events[3]["data"]["runContinues"], false);
     }
 
     #[test]

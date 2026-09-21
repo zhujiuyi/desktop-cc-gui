@@ -112,6 +112,37 @@ describe("background task store", () => {
     expect(s.backgroundActive).toBe(false);
   });
 
+  // The CLI's resume-time reconciliation of a NEW process cannot see the older
+  // process's still-live tasks and reports them as stopped ("didn't finish
+  // before the previous session ended"). The row belongs to the run that
+  // reported it, so a foreign run's notification must not settle it.
+  it("ignores another run's stopped notification for this run's task", () => {
+    runRouting.set("other-run", KEY);
+    handleEngineEvents(
+      [
+        ev("task_started", 2, { taskId: "w1", taskType: "local_workflow", description: "wf" }),
+        ev("task_notification", 3, { taskId: "w1", status: "stopped" }, "other-run"),
+      ],
+      deps(),
+    );
+    const s = useChatStore.getState().bySession[KEY]!;
+    expect(s.tasks[0]).toMatchObject({ id: "w1", runId, status: "running" });
+    expect(s.backgroundActive).toBe(true);
+  });
+
+  it("still settles the row on its own run's notification after a foreign one", () => {
+    runRouting.set("other-run", KEY);
+    handleEngineEvents(
+      [
+        ev("task_started", 2, { taskId: "w1", taskType: "local_workflow", description: "wf" }),
+        ev("task_notification", 3, { taskId: "w1", status: "stopped" }, "other-run"),
+        ev("task_notification", 4, { taskId: "w1", status: "completed" }),
+      ],
+      deps(),
+    );
+    expect(useChatStore.getState().bySession[KEY]!.tasks[0].status).toBe("completed");
+  });
+
   it("marks running tasks missing from the replace set as stopped", () => {
     handleEngineEvents(
       [

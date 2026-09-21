@@ -70,6 +70,45 @@ describe("background turn lifecycle", () => {
     expect(drainSpy).toHaveBeenCalledTimes(1); // 输入不锁
   });
 
+  // The CLI can close a content-free turn of its own: the resume-time
+  // reconciliation notification it queues ahead of the message the user just
+  // sent, reported as `runContinues`. Taking that done as terminal settles
+  // the run and the settled gate then drops the real turn's frames — observed
+  // live on 2026-09-22, when the reply to a mid-background message never
+  // reached the UI.
+  it("keeps a run open when its done closed a content-free turn", () => {
+    const queued = `${runId}-queued`;
+    runRouting.set(queued, KEY);
+    const evq = (seq: number, kind: EngineEventPayload["kind"], data: unknown) => ({
+      runId: queued, sessionId: "s-1", engine: "claude", seq, kind, data,
+    });
+    handleEngineEvents([
+      evq(1, "model", "m"),
+      evq(2, "done", { usage: null, backgroundTasks: 0, runContinues: true }),
+    ], deps());
+    expect(settledRuns.has(queued)).toBe(false);
+    expect(runRouting.get(queued)).toBe(KEY);
+
+    handleEngineEvents([
+      evq(3, "delta", "答案在这里"),
+      evq(4, "done", { usage: null, backgroundTasks: 0 }),
+    ], deps());
+    flushPendingStreams(useChatStore.setState);
+    const s = useChatStore.getState().bySession[KEY]!;
+    expect(s.messages.some((m) => m.role === "assistant" && m.text.includes("答案在这里"))).toBe(true);
+    expect(settledRuns.has(queued)).toBe(true);
+    expect(runRouting.get(queued)).toBeUndefined();
+  });
+
+  it("still settles a done that carried content", () => {
+    handleEngineEvents([
+      ev("delta", 1, "答"),
+      ev("done", 2, { usage: null, backgroundTasks: 0 }),
+    ], deps());
+    expect(settledRuns.has(runId)).toBe(true);
+    expect(runRouting.get(runId)).toBeUndefined();
+  });
+
   it("reopens a live segment for the completion turn, then settles fully", () => {
     handleEngineEvents([
       ev("delta", 1, "正文段"),

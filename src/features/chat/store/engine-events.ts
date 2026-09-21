@@ -43,6 +43,7 @@ import {
 import { mergeUsage, parseUsage, reportedContextWindow, type ParsedUsage } from "../usage";
 import { usageTrackingEnabled } from "@/features/settings/usage-tracking";
 import { migrateSelectedAgent } from "@/features/agents/selected-agent";
+import { trace, traceDelta } from "./trace";
 
 /**
  * Engine-event handling: the main loop resolves each event's session key and
@@ -538,6 +539,21 @@ function isForeignContent(
   return owner !== null && owner !== runId;
 }
 
+/** Compact state snapshot for the temporary trace channel (no-op unless
+ *  CCGUI_TRACE=1 was set at app start — see store/trace.ts). */
+function traceState(
+  event: EngineEventPayload,
+  key: string,
+  act: string,
+  deps: EngineEventDeps,
+) {
+  const cur = deps.get().bySession[key];
+  trace(
+    `ev ${event.kind} run=${event.runId} act=${act} streaming=${cur?.streaming === true} ` +
+      `owner=${turnOwner(cur, key) ?? "-"} cur=${cur?.currentRunId ?? "-"} await=${cur?.awaitingTasks === true}`,
+  );
+}
+
 /** Re-derive the fields the task list owns from the list itself, then trim it
  *  back to TASK_LIMIT: a running task must never be dropped by retention, so
  *  the settled ones are the ones that go. */
@@ -581,6 +597,14 @@ function applyTaskEvent(event: EngineEventPayload, key: string, deps: EngineEven
     const upsert = (id: string, patch: Partial<BackgroundTask>, base?: Partial<BackgroundTask>) => {
       const idx = tasks.findIndex((t) => t.id === id);
       if (idx >= 0) {
+        // A row belongs to the run that reported the task. Another run of the
+        // same session must not rewrite it: the CLI's resume-time
+        // reconciliation cannot see a still-live older process's tasks, so a
+        // new run reports them as stopped ("didn't finish before the previous
+        // session ended") — a false terminal for work that is still running.
+        // The owning run's own frames (progress, its real notification, and
+        // the reader's closing empty `tasks` frame) keep full control.
+        if (tasks[idx].runId !== event.runId) return;
         tasks = tasks.map((t, i) => (i === idx ? { ...t, ...patch, updatedAt: now } : t));
       } else {
         tasks = [
@@ -1247,6 +1271,16 @@ function onDone(event: EngineEventPayload, key: string, deps: EngineEventDeps) {
     typeof (event.data as { backgroundTasks?: unknown } | null)?.backgroundTasks === "number"
       ? (event.data as { backgroundTasks: number }).backgroundTasks
       : 0;
+  // A done the reader marked `runContinues` closed a content-free turn (the
+  // CLI's queued reconciliation turn): the run is not terminal — the real
+  // turn's frames are still coming — so every "the run is over" bookkeeping
+  // below (settled ids, routing, ledger booking) stays off.
+  const runContinues =
+    (event.data as { runContinues?: unknown } | null)?.runContinues === true;
+  trace(
+    `done run=${event.runId} own=${ownTurn} bg=${backgroundTasks} continues=${runContinues} ` +
+      `cur=${prev.currentRunId ?? "-"} await=${prev.awaitingTasks === true} streaming=${prev.streaming === true}`,
+  );
   // Occupancy for the context meter: the newest single report (claude's one
   // payload already carries the turn's totals).
   const turnTotals = turnUsageTotals.get(event.runId);
@@ -1263,12 +1297,16 @@ function onDone(event: EngineEventPayload, key: string, deps: EngineEventDeps) {
     : settledUsage;
   // 回复即落账：后台期的 done 也把这一轮的 usage 记进台账（进程可能死在后台
   // 期，等最终 done 就丢账），落账后把 runId 记为已记账，最终 done 自动跳过。
-  const booked = recordTurnUsage(deps, event, key, finalUsage);
+  // A continuing done books nothing: its usage is the reconciliation turn's,
+  // and holding `liveLedgerRuns` would make the real reply's done skip the
+  // booking. The real turn's own done books as usual.
+  const booked = runContinues ? false : recordTurnUsage(deps, event, key, finalUsage);
 
   if (!ownTurn) {
     // 同会话双 run：这个 run 不认领会话（会话在流另一个更晚的 run），它的 done
     // 只能做 run 级收尾——结算它自己的任务、记住它的终局身份、去掉路由与用量
     // 记账。streaming / turnStartedAt / live 行 / 队列 / 前台流标一律不碰。
+    const held = backgroundTasks > 0 || runContinues;
     deps.set((s) => {
       const cur = s.bySession[key];
       if (!cur) return {};
@@ -1278,20 +1316,21 @@ function onDone(event: EngineEventPayload, key: string, deps: EngineEventDeps) {
           [key]: withTaskDerived({
             ...cur,
             tasks:
-              backgroundTasks > 0
+              held
                 ? cur.tasks
                 : settleRunTasks(cur.tasks ?? EMPTY_TASKS, event.runId, "interrupted"),
             settledRunIds:
-              backgroundTasks > 0
+              held
                 ? cur.settledRunIds
                 : rememberSettledRun(cur, event.runId),
           }),
         },
       };
     });
-    if (backgroundTasks > 0) {
-      // Its background tasks keep this run alive: routing stays, and the
-      // booking holds so its own final done does not book the reply twice.
+    if (held) {
+      // Background tasks (or the CLI's queued turn) keep this run alive:
+      // routing stays, and the booking holds so its own final done does not
+      // book the reply twice.
       if (booked) liveLedgerRuns.add(event.runId);
       void ipc.rescanSessions().catch(() => {});
       return;
@@ -1367,7 +1406,7 @@ function onDone(event: EngineEventPayload, key: string, deps: EngineEventDeps) {
           awaitingTasks: backgroundTasks > 0,
           // Keep this run alive for its background tasks; only a done with
           // nothing running is the run's terminal event.
-          settledRunIds: backgroundTasks > 0 ? cur.settledRunIds : rememberSettledRun(cur, event.runId),
+          settledRunIds: backgroundTasks > 0 || runContinues ? cur.settledRunIds : rememberSettledRun(cur, event.runId),
           tasks,
         }),
       },
@@ -1375,11 +1414,13 @@ function onDone(event: EngineEventPayload, key: string, deps: EngineEventDeps) {
       retryingByKey: setRetryingFlag(s.retryingByKey, key, false),
     };
   });
-  if (backgroundTasks > 0) {
+  if (backgroundTasks > 0 || runContinues) {
     // The reply's own segment is over, but the run is not terminal: routing
-    // and runActivity stay (task frames and the completion turn still come
-    // back here); the queue drains as usual so typing is never locked; the
-    // usage ledger was booked above, and the completion turn's done skips it.
+    // and runActivity stay (task frames and the CLI's own follow-up turn —
+    // background completion, or the queued turn a continuing done left
+    // behind — still come back here); the queue drains as usual so typing is
+    // never locked; the usage ledger was booked above, and the follow-up
+    // done skips it.
     if (booked) liveLedgerRuns.add(event.runId);
     void ipc.rescanSessions().catch(() => {});
     deps.markUnseenIfBackground(key);
@@ -1453,7 +1494,10 @@ function adoptObservedRun(
   // they are not the completion turn, so they must not clear awaitingTasks,
   // restart the segment timer, or make the session read as streaming again
   // (the composer would start queueing while the user should be able to send).
-  if (cur?.awaitingTasks && taskFrame) return;
+  if (cur?.awaitingTasks && taskFrame) {
+    trace(`adopt run=${event.runId} act=skip-task-frame`);
+    return;
+  }
   if (!cur?.streaming) {
     // A completion turn reopens the run after its background phase: its text
     // is a fresh segment, so the elapsed timer restarts and the background
@@ -1466,12 +1510,16 @@ function adoptObservedRun(
       currentRunId: event.runId,
       ...(reopen ? { awaitingTasks: false } : {}),
     });
+    trace(
+      `adopt run=${event.runId} act=open reopen=${reopen} prevCur=${cur?.currentRunId ?? "-"}`,
+    );
   } else if (!cur.awaitingTasks && turnOwner(cur, key) === null) {
     // Streaming without a claimed run (a session restored without one): the
     // run now talking owns the turn. A session still awaiting its background
     // tasks is NOT claimed here — its live run already owns it, and the
     // frames arriving are the background phase's, not a newer turn's.
     patchSession(deps.set, key, { currentRunId: event.runId });
+    trace(`adopt run=${event.runId} act=claim-unowned`);
   }
   if (!deps.get().streamingByKey[key]) {
     deps.set((s) => ({
@@ -1527,8 +1575,10 @@ export function handleEngineEvents(
             event.kind === "error" ||
             event.kind === "question_settled"))
       )
-    )
+    ) {
+      trace(`ev ${event.kind} run=${event.runId} act=settled-skip`);
       continue;
+    }
     const state = deps.get();
     let key = runRouting.get(event.runId) ?? Object.keys(state.bySession).find(
       (candidate) => state.bySession[candidate]?.settledRunIds?.includes(event.runId),
@@ -1544,13 +1594,23 @@ export function handleEngineEvents(
         if (match) key = match;
       }
     }
-    if (!key) continue;
+    if (!key) {
+      trace(`ev ${event.kind} run=${event.runId} act=no-key sess=${event.sessionId ?? "-"}`);
+      continue;
+    }
     if (event.kind === "done" || event.kind === "error") {
       const bg =
         event.kind === "done" &&
         typeof (event.data as { backgroundTasks?: unknown } | null)?.backgroundTasks === "number" &&
         (event.data as { backgroundTasks: number }).backgroundTasks > 0;
-      if (!bg) {
+      // The reader marks a done that closed a content-free turn (the CLI's
+      // own queued reconciliation turn) as `runContinues`: the process still
+      // has the user's message to answer, so this done must not mark the run
+      // settled — that would drop the real turn's frames at the gate above.
+      const runContinues =
+        event.kind === "done" &&
+        (event.data as { runContinues?: unknown } | null)?.runContinues === true;
+      if (!bg && !runContinues) {
         settledRuns.set(event.runId, event.kind);
         if (settledRuns.size > MAX_SETTLED_RUNS) {
           settledRuns.delete(settledRuns.keys().next().value!);
@@ -1562,6 +1622,7 @@ export function handleEngineEvents(
       void ipc.computerUseSetActive?.(false)?.catch(() => {});
     }
     if (state.bySession[key]?.settledRunIds?.includes(event.runId)) {
+      traceState(event, key, "run-settled", deps);
       // A usage report trailing the terminal event carries the turn's final
       // occupancy. Re-read it from the transcript instead of patching the
       // settled state — the file can lag the event, and refreshSessionUsage
@@ -1587,6 +1648,7 @@ export function handleEngineEvents(
       FOREIGN_CONTENT_KINDS.has(event.kind) &&
       isForeignContent(deps.get().bySession[key], key, event.runId)
     ) {
+      traceState(event, key, "foreign-drop", deps);
       continue;
     }
 
@@ -1598,6 +1660,11 @@ export function handleEngineEvents(
     // card's resend has to stay available while it waits.
     if (!settled && event.kind !== "done" && event.kind !== "error" && event.kind !== "permission_denied") {
       adoptObservedRun(event, key, deps);
+    }
+    if (event.kind === "delta" || event.kind === "thinking") {
+      traceDelta(event.runId, typeof event.data === "string" ? event.data.length : 0);
+    } else {
+      traceState(event, key, "routed", deps);
     }
 
     switch (event.kind) {

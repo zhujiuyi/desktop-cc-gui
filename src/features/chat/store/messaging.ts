@@ -43,6 +43,7 @@ import { ASK_OTHER_OPTION, askLoops, beginAskSubmit, revertAskSubmit } from "./a
 import { engineSupportsComputerUse } from "../computer-use";
 import type { SendOptions } from "./types";
 import { effectivePermission } from "./permissions";
+import { trace } from "./trace";
 import {
   buildAgentBlock,
   hasAgentBlock,
@@ -260,6 +261,7 @@ export function createMessagingActions(
       // failed spawn), so the system-wide hotkey never outlives the run.
       void ipc.computerUseSetActive?.(true)?.catch(() => {});
     }
+    trace(`send req=${requestedRunId} key=${key} sess=${tab.sessionId ?? "-"} engine=${engine}`);
     try {
       const result = await ipc.sendMessage({
         runId: requestedRunId,
@@ -278,6 +280,7 @@ export function createMessagingActions(
         providerId: provider,
         computerUse: options?.computerUse === true,
       });
+      trace(`sendres req=${requestedRunId} res=${result.runId} sess=${result.sessionId ?? "-"}`);
       // Older backends choose their own id. Retire the provisional route —
       // and with it the provisional claim: a claim whose run is no longer
       // routed to this session reads as no claim (see turnOwner), so the run
@@ -405,6 +408,7 @@ export function createMessagingActions(
         ]);
       }
     } catch (error) {
+      trace(`senderr req=${requestedRunId} err=${String(error)}`);
       const failedKey = runRouting.get(requestedRunId) ?? key;
       runRouting.delete(requestedRunId);
       untrackRun(requestedRunId);

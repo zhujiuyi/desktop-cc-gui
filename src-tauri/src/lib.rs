@@ -10,6 +10,7 @@ pub mod config;
 pub mod creator_skill;
 pub mod cu_overlay;
 pub mod db;
+pub mod debug_trace;
 pub mod dsh_host;
 pub mod engine;
 pub mod event_sink;
@@ -409,6 +410,8 @@ pub fn run() {
             usage::usage_record,
             usage::usage_summary,
             usage::usage_clear,
+            debug_trace::trace_frontend_enabled,
+            debug_trace::trace_frontend,
             history::reader::load_session_page,
             history::reader::load_remote_session_page,
             history::search::search_messages,

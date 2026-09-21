@@ -184,6 +184,11 @@ impl EventSink {
             std::mem::take(&mut pending.events)
         };
         let payload = format!("[{}]", events.join(","));
+        // Temporary diagnostics (2026-09-22): record exactly what the webview
+        // receives. No-op unless the app was started with CCGUI_TRACE=1.
+        if self.name == ENGINE_EVENT_NAME {
+            crate::debug_trace::trace_engine_payload(&payload);
+        }
         self.emitter.emit_json(self.name, &payload);
     }
 
