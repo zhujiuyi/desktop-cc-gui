@@ -2,7 +2,7 @@
 //! event dispatch core, and settle/cleanup path for engine process runs.
 
 use super::codex_usage;
-use super::events::EngineEvent;
+use super::events::{EngineEvent, TaskSummary};
 #[cfg(test)]
 use super::grok;
 #[cfg(windows)]
@@ -33,6 +33,14 @@ pub(crate) const READER_SETTLE_GRACE: std::time::Duration = std::time::Duration:
 /// of parking on the grandchild forever (which leaked the run's registry
 /// entries — ps shows no process, yet the concurrency gate stays full).
 pub(crate) const POST_EXIT_DRAIN: std::time::Duration = std::time::Duration::from_millis(200);
+/// Grace after the last background task settles before stdin is closed: the
+/// CLI answers a finished background task with one more turn (its completion
+/// note), and EOF-ing stdin first truncates that turn mid-generation.
+const BACKGROUND_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+/// Backstop while background tasks are still live but have gone silent. ccgui
+/// no longer lets the CLI's own wind-down sweep them (stdin stays open while
+/// tasks run), so this is the only bound on a wedged task pinning the process.
+const BACKGROUND_STALL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 /// Hard cap on one NDJSON line from an engine. Real events are kilobytes;
 /// `BufReader::lines` has no limit, so a runaway engine writing without
 /// newlines would buffer the line whole and OOM the host.
@@ -153,6 +161,16 @@ pub(crate) struct TurnState {
     gen_explicit: bool,
     /// Generation milliseconds closed but not yet attached to a usage report.
     gen_ms: u64,
+    /// Live background tasks of this run (claude task frames). While non-empty
+    /// after a `done`, the reader keeps the CLI's stdin open so its wind-down
+    /// cannot sweep them, and lets the follow-up completion turn through.
+    pub(crate) pending_tasks: std::collections::HashMap<String, TaskSummary>,
+    /// A `done` arrived while background tasks were still running: the reply
+    /// has settled but the run is not terminal until they finish and the CLI's
+    /// follow-up turn (if any) ends.
+    pub(crate) awaiting_tasks: bool,
+    /// When set, the read loop closes stdin once this instant passes.
+    pub(crate) close_deadline: Option<tokio::time::Instant>,
 }
 impl TurnState {
     pub(crate) fn new(preassigned: Option<String>) -> Self {
@@ -168,6 +186,9 @@ impl TurnState {
             gen_open_since: None,
             gen_explicit: false,
             gen_ms: 0,
+            pending_tasks: std::collections::HashMap::new(),
+            awaiting_tasks: false,
+            close_deadline: None,
         }
     }
 
@@ -271,6 +292,63 @@ impl TurnState {
         }
     }
 }
+
+/// A task-lifecycle frame: panel state for the run's background work, not
+/// content of a turn — it is forwarded even after done/error.
+fn is_task_event(event: &EngineEvent) -> bool {
+    matches!(
+        event,
+        EngineEvent::TaskStarted { .. }
+            | EngineEvent::TaskProgress { .. }
+            | EngineEvent::TaskNotification { .. }
+            | EngineEvent::TasksChanged { .. }
+    )
+}
+
+/// Frames of the CLI's follow-up turn, which begins once the run's background
+/// tasks finish. Only content-bearing frames (plus the turn's own done and its
+/// usage/model tails) may reopen a settled-but-awaiting run.
+fn continues_after_done(event: &EngineEvent) -> bool {
+    matches!(
+        event,
+        EngineEvent::Delta(_)
+            | EngineEvent::Thinking(_)
+            | EngineEvent::Message { .. }
+            | EngineEvent::Done { .. }
+            | EngineEvent::Usage(_)
+            | EngineEvent::Model(_)
+    )
+}
+
+/// Whether a post-terminal event must be dropped. Task frames always pass;
+/// SessionId keeps its historical exception; while awaiting tasks the
+/// follow-up turn passes; everything else stays suppressed (terminal monotonic).
+fn suppressed_after_terminal(state: &TurnState, event: &EngineEvent) -> bool {
+    if matches!(event, EngineEvent::SessionId(_)) || is_task_event(event) {
+        return false;
+    }
+    if state.saw_error {
+        return true;
+    }
+    if !state.saw_done {
+        return false;
+    }
+    !(state.awaiting_tasks && continues_after_done(event))
+}
+
+/// Next stdin-close deadline for the current background state: 30s once
+/// nothing is running (leave room for the completion turn), a 30-minute stall
+/// backstop while tasks are live, `None` when not awaiting.
+fn next_close_deadline(
+    pending: usize,
+    awaiting: bool,
+    now: tokio::time::Instant,
+) -> Option<tokio::time::Instant> {
+    if !awaiting {
+        return None;
+    }
+    Some(now + if pending == 0 { BACKGROUND_GRACE } else { BACKGROUND_STALL })
+}
 /// Event-routing core shared by process runs ([`RunContext`]) and virtual
 /// host-stream runs ([`dsh_session::run_host_turn`]): the fields
 /// `dispatch_event` needs to route engine events to the UI sink and keep the
@@ -302,13 +380,30 @@ impl TurnCore {
     }
 
     pub(crate) fn dispatch_event(&self, state: &mut TurnState, event: EngineEvent) {
-        // Terminal state is monotonic, even if a CLI or its usage tail emits
-        // more data before exiting: no late retry/content/warn event may
-        // revive a settled run. The one exception is SessionId — a done that
-        // raced the CLI's session announcement must still rekey/announce, or
-        // the conversation strands under its provisional key.
-        if (state.saw_done || state.saw_error) && !matches!(event, EngineEvent::SessionId(_)) {
+        // Terminal state is monotonic for turn CONTENT — but a run with live
+        // background tasks is not terminal yet: its task frames are panel
+        // state, and the CLI's completion turn arrives after the reply's done.
+        // The legacy SessionId exception stays (a done racing the CLI's
+        // session announcement must still rekey the conversation).
+        if suppressed_after_terminal(state, &event) {
             return;
+        }
+        if state.saw_done
+            && state.awaiting_tasks
+            && matches!(
+                event,
+                EngineEvent::Delta(_)
+                    | EngineEvent::Thinking(_)
+                    | EngineEvent::Message { .. }
+                    | EngineEvent::Done { .. }
+            )
+        {
+            // The follow-up turn starts inside this process: reopen the run.
+            // Only content frames count as starters — a trailing usage/model
+            // tail is not a new turn.
+            state.saw_done = false;
+            state.awaiting_tasks = false;
+            state.close_deadline = None;
         }
         match event {
             EngineEvent::Delta(text) => {
@@ -585,8 +680,7 @@ impl TurnCore {
                 );
             }
             EngineEvent::McpServers { servers, tools } => {
-                // Not a chat event: the MCP settings page reads this snapshot
-                // (workspace-scoped, timestamped) instead of the stream.
+                // Keep the runtime snapshot path from the v1.0.8 MCP support.
                 crate::mcp::record_from_run(
                     &self.run_id,
                     state.native_session_id.as_deref(),
@@ -594,22 +688,141 @@ impl TurnCore {
                     tools,
                 );
             }
-            EngineEvent::Done { session_id, usage } => {
-                let gen_ms = state.take_gen_ms();
+            EngineEvent::TaskStarted {
+                id,
+                task_type,
+                description,
+                subagent_type,
+                is_backgrounded,
+                spawn_depth,
+                workflow_name,
+            } => {
+                state.pending_tasks.insert(
+                    id.clone(),
+                    TaskSummary {
+                        id: id.clone(),
+                        task_type: task_type.clone(),
+                        description: description.clone(),
+                        ambient: false,
+                    },
+                );
+                state.close_deadline = next_close_deadline(
+                    state.pending_tasks.len(),
+                    state.awaiting_tasks,
+                    tokio::time::Instant::now(),
+                );
+                state.push(
+                    &self.sink,
+                    &self.run_id,
+                    &self.engine_id,
+                    "task_started",
+                    serde_json::json!({
+                        "taskId": id,
+                        "taskType": task_type,
+                        "description": description,
+                        "subagentType": subagent_type,
+                        "isBackgrounded": is_backgrounded,
+                        "spawnDepth": spawn_depth,
+                        "workflowName": workflow_name,
+                    }),
+                );
+            }
+            EngineEvent::TaskProgress {
+                id,
+                description,
+                last_tool,
+                usage,
+            } => {
+                state.close_deadline = next_close_deadline(
+                    state.pending_tasks.len(),
+                    state.awaiting_tasks,
+                    tokio::time::Instant::now(),
+                );
+                state.push(
+                    &self.sink,
+                    &self.run_id,
+                    &self.engine_id,
+                    "task_progress",
+                    serde_json::json!({
+                        "taskId": id,
+                        "description": description,
+                        "lastTool": last_tool,
+                        "usage": usage,
+                    }),
+                );
+            }
+            EngineEvent::TaskNotification { id, status } => {
+                state.pending_tasks.remove(&id);
+                state.close_deadline = next_close_deadline(
+                    state.pending_tasks.len(),
+                    state.awaiting_tasks,
+                    tokio::time::Instant::now(),
+                );
+                state.push(
+                    &self.sink,
+                    &self.run_id,
+                    &self.engine_id,
+                    "task_notification",
+                    serde_json::json!({ "taskId": id, "status": status }),
+                );
+            }
+            EngineEvent::TasksChanged { tasks } => {
+                state.pending_tasks = tasks.iter().map(|t| (t.id.clone(), t.clone())).collect();
+                state.close_deadline = next_close_deadline(
+                    state.pending_tasks.len(),
+                    state.awaiting_tasks,
+                    tokio::time::Instant::now(),
+                );
+                let wire: Vec<serde_json::Value> = tasks
+                    .iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "taskId": t.id,
+                            "taskType": t.task_type,
+                            "description": t.description,
+                            "ambient": t.ambient,
+                        })
+                    })
+                    .collect();
+                state.push(
+                    &self.sink,
+                    &self.run_id,
+                    &self.engine_id,
+                    "tasks",
+                    serde_json::json!({ "tasks": wire }),
+                );
+            }
+             EngineEvent::Done { session_id, usage } => {
+                 let gen_ms = state.take_gen_ms();
                 state.saw_done = true;
-                crate::mcp::mark_run_ended(&self.run_id);
-                if let Some(id) = session_id {
-                    self.adopt_session_id(state, &id, false);
+                 if let Some(id) = session_id {
+                     self.adopt_session_id(state, &id, false);
+                 }
+                 let pending = state.pending_tasks.len();
+                if pending == 0 {
+                     crate::mcp::mark_run_ended(&self.run_id);
+                 }
+                if pending == 0 {
+                    // The turn is over and nothing is still running in this
+                    // process: EOF the interactive stdin so the CLI exits
+                    // instead of waiting for a next message forever.
+                    self.registry.close_stdin(&self.run_id);
+                    state.awaiting_tasks = false;
+                    state.close_deadline = None;
+                } else {
+                    // Background tasks outlive the turn. EOF now would make the
+                    // CLI wind them down (its print-teardown sweep); keep stdin
+                    // open and let the completion turn and task frames stream.
+                    state.awaiting_tasks = true;
+                    state.close_deadline =
+                        next_close_deadline(pending, true, tokio::time::Instant::now());
                 }
-                // The turn is over: EOF the interactive stdin so the CLI
-                // exits instead of waiting for a next message forever.
-                self.registry.close_stdin(&self.run_id);
                 state.push_with_gen_ms(
                     &self.sink,
                     &self.run_id,
                     &self.engine_id,
                     "done",
-                    serde_json::json!({ "usage": usage }),
+                    serde_json::json!({ "usage": usage, "backgroundTasks": pending }),
                     gen_ms,
                 );
             }
@@ -738,6 +951,8 @@ pub(crate) enum LineRead {
     Eof,
     /// No newline within MAX_LINE_BYTES: the run must be torn down.
     TooLong,
+    /// The stdin-close deadline passed while the read was still pending.
+    Deadline,
 }
 /// Cancellation-safe replacement for `BufReader::lines().next_line()` with a
 /// hard byte cap: partial bytes live in the caller-owned `line`, and the
@@ -833,8 +1048,24 @@ pub(crate) async fn run_reader(stdout: ChildStdout, ctx: RunContext) {
     }
     let mut child_exited = false;
     loop {
+        // While background tasks hold stdin open, the run has no other bound:
+        // arm a deadline so a wedged task cannot pin this process forever.
+        let deadline = state.close_deadline;
         let read = tokio::select! {
-            line = read_line_capped(&mut reader, &mut line_buf) => line,
+            line = async {
+                match deadline {
+                    Some(at) => match tokio::time::timeout_at(
+                        at,
+                        read_line_capped(&mut reader, &mut line_buf),
+                    )
+                    .await
+                    {
+                        Ok(r) => r,
+                        Err(_) => Ok(LineRead::Deadline),
+                    },
+                    None => read_line_capped(&mut reader, &mut line_buf).await,
+                }
+            } => line,
             _ = &mut exit_rx, if !child_exited => {
                 child_exited = true;
                 continue;
@@ -875,6 +1106,18 @@ pub(crate) async fn run_reader(stdout: ChildStdout, ctx: RunContext) {
                     )),
                 );
                 break;
+            }
+            // The background grace/stall deadline passed with stdin still
+            // open: end the run through the only lever left — EOF the CLI's
+            // stdin (its wind-down then sweeps whatever never finished).
+            Ok(LineRead::Deadline) => {
+                state.close_deadline = None;
+                ring_push(
+                    &ctx.stdout_plain_buf,
+                    "background tasks silent past the close deadline; closing stdin\n",
+                );
+                ctx.core.registry.close_stdin(&ctx.core.run_id);
+                continue;
             }
             Err(_) => break,
         };
@@ -1498,5 +1741,43 @@ mod terminal_event_tests {
             );
             assert_eq!(events.last().unwrap()["kind"], "done");
         }
+    }
+
+    #[test]
+    fn task_frames_survive_terminal_done() {
+        let mut state = TurnState::new(None);
+        state.saw_done = true;
+        assert!(!suppressed_after_terminal(
+            &state,
+            &EngineEvent::TaskProgress { id: "t".into(), description: None, last_tool: None, usage: None }
+        ));
+        assert!(!suppressed_after_terminal(
+            &state,
+            &EngineEvent::TaskNotification { id: "t".into(), status: "completed".into() }
+        ));
+    }
+
+    #[test]
+    fn follow_up_turn_passes_only_while_awaiting_tasks() {
+        let mut state = TurnState::new(None);
+        state.saw_done = true;
+        state.awaiting_tasks = true;
+        assert!(!suppressed_after_terminal(&state, &EngineEvent::Delta("note".into())));
+        assert!(!suppressed_after_terminal(&state, &EngineEvent::Done { session_id: None, usage: None }));
+        // 非内容类事件（retry/warn/error）仍被终态挡住。
+        assert!(suppressed_after_terminal(
+            &state,
+            &EngineEvent::Retry { attempt: 1, max: 3, message: "x".into() }
+        ));
+        state.awaiting_tasks = false;
+        assert!(suppressed_after_terminal(&state, &EngineEvent::Delta("late".into())));
+    }
+
+    #[test]
+    fn close_deadline_tracks_pending_tasks() {
+        let now = tokio::time::Instant::now();
+        assert_eq!(next_close_deadline(0, false, now), None);
+        assert_eq!(next_close_deadline(0, true, now), Some(now + BACKGROUND_GRACE));
+        assert_eq!(next_close_deadline(3, true, now), Some(now + BACKGROUND_STALL));
     }
 }
