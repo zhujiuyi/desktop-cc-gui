@@ -472,6 +472,9 @@ export const zh = {
     sendShortcutEnter: "Enter",
     sendShortcutCmdEnter: "Cmd+Enter",
     sendShortcutCmdEnterCtrl: "Ctrl+Enter",
+    thinkingAutoExpand: "思考过程自动展开",
+    thinkingAutoExpandDesc:
+      "输出时自动展开思考与工具调用面板；关闭后这些面板保持折叠，点击行头可手动展开",
     thinkingAutoCollapse: "思考结束后自动收起",
     thinkingAutoCollapseDesc:
       "关闭后，思考结束时思考过程保持展开（界面不再跳动），可点击标题手动收起",

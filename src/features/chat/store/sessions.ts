@@ -224,6 +224,7 @@ export function createSessionActions(
             archivedWorkspaces: settings.archivedWorkspaces ?? [],
             sendShortcut: settings.composerSendShortcut ?? "enter",
             thinkingAutoCollapse: settings.thinkingAutoCollapse ?? true,
+            thinkingAutoExpand: settings.thinkingAutoExpand ?? true,
           }),
         )
         .catch(() => {});

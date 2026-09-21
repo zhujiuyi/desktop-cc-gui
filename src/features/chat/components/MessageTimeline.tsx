@@ -48,6 +48,7 @@ const TimelineRowView = memo(function TimelineRowView({
   turnLive,
   autoExpand,
   thinkingAutoCollapse,
+  thinkingAutoExpand,
   seenTools,
   searchTarget,
 }: {
@@ -56,10 +57,14 @@ const TimelineRowView = memo(function TimelineRowView({
   /** True while the current turn is still streaming; suppresses the footer. */
   turnLive: boolean;
   /** True on the timeline's last process row: it rides open until a newer
-   * one appears, and stays open once the turn settles. */
+   *  one appears, and stays open once the turn settles. Only fed through
+   *  when the auto-expand setting allows it (or on a search jump). */
   autoExpand: boolean;
   /** False keeps a settled thinking row expanded (设置 → 通用 → 行为). */
   thinkingAutoCollapse: boolean;
+  /** False keeps streaming process rows collapsed until the user expands
+   *  one (设置 → 通用 → 行为). */
+  thinkingAutoExpand: boolean;
   seenTools: Set<string>;
   searchTarget?: ProcessSearchTarget;
 }) {
@@ -87,6 +92,7 @@ const TimelineRowView = memo(function TimelineRowView({
         autoExpand={autoExpand}
         turnLive={turnLive}
         thinkingAutoCollapse={thinkingAutoCollapse}
+        thinkingAutoExpand={thinkingAutoExpand}
         processId={row.firstSeq}
         seenTools={seenTools}
         searchTarget={searchTarget}
@@ -465,6 +471,7 @@ export const MessageTimeline = memo(function MessageTimeline({
 
   const { t } = useTranslation();
   const thinkingAutoCollapse = useChatStore((s) => s.thinkingAutoCollapse);
+  const thinkingAutoExpand = useChatStore((s) => s.thinkingAutoExpand);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const items = session.messages;
   const rows = useMemo(() => buildRows(items), [items]);
@@ -691,10 +698,12 @@ export const MessageTimeline = memo(function MessageTimeline({
                     workspacePath={workspacePath}
                     turnLive={turnLive}
                     autoExpand={
-                      rowKey(rows[item.index]) === lastProcessKey ||
+                      (thinkingAutoExpand &&
+                        rowKey(rows[item.index]) === lastProcessKey) ||
                       item.index === currentSearchRow
                     }
                     thinkingAutoCollapse={thinkingAutoCollapse}
+                    thinkingAutoExpand={thinkingAutoExpand}
                     seenTools={seenTools}
                     searchTarget={item.index === currentSearchRow ? processSearchTarget : undefined}
                   />

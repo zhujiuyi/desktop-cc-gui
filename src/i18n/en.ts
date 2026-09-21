@@ -488,6 +488,9 @@ export const en: Messages = {
     sendShortcutEnter: "Enter",
     sendShortcutCmdEnter: "Cmd+Enter",
     sendShortcutCmdEnterCtrl: "Ctrl+Enter",
+    thinkingAutoExpand: "Auto-expand thinking while streaming",
+    thinkingAutoExpandDesc:
+      "Open thinking and tool-call panels as they stream; turn off to keep them collapsed until you click a row header",
     thinkingAutoCollapse: "Fold thinking when it finishes",
     thinkingAutoCollapseDesc:
       "Turn off to keep the thinking process expanded after thinking settles (no layout jump); click the header to fold it manually",
