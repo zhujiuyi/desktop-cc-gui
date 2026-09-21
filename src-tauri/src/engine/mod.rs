@@ -730,7 +730,6 @@ async fn send_message_inner_with_sink(
     {
         return Err("invalid run id".into());
     }
-    crate::debug_trace::note_send(&run_id, session_id.as_deref(), &engine);
     // Reserve the run id atomically, before the first await: a contains_key
     // check here with the registry insert after spawn would let two
     // concurrent sends carrying the same client id both pass, and the second

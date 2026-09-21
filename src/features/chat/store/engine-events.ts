@@ -43,7 +43,6 @@ import {
 import { mergeUsage, parseUsage, reportedContextWindow, type ParsedUsage } from "../usage";
 import { usageTrackingEnabled } from "@/features/settings/usage-tracking";
 import { migrateSelectedAgent } from "@/features/agents/selected-agent";
-import { trace, traceDelta } from "./trace";
 
 /**
  * Engine-event handling: the main loop resolves each event's session key and
@@ -537,21 +536,6 @@ function isForeignContent(
   if (!cur?.streaming) return false;
   const owner = turnOwner(cur, key);
   return owner !== null && owner !== runId;
-}
-
-/** Compact state snapshot for the temporary trace channel (no-op unless
- *  CCGUI_TRACE=1 was set at app start — see store/trace.ts). */
-function traceState(
-  event: EngineEventPayload,
-  key: string,
-  act: string,
-  deps: EngineEventDeps,
-) {
-  const cur = deps.get().bySession[key];
-  trace(
-    `ev ${event.kind} run=${event.runId} act=${act} streaming=${cur?.streaming === true} ` +
-      `owner=${turnOwner(cur, key) ?? "-"} cur=${cur?.currentRunId ?? "-"} await=${cur?.awaitingTasks === true}`,
-  );
 }
 
 /** Re-derive the fields the task list owns from the list itself, then trim it
@@ -1277,10 +1261,6 @@ function onDone(event: EngineEventPayload, key: string, deps: EngineEventDeps) {
   // below (settled ids, routing, ledger booking) stays off.
   const runContinues =
     (event.data as { runContinues?: unknown } | null)?.runContinues === true;
-  trace(
-    `done run=${event.runId} own=${ownTurn} bg=${backgroundTasks} continues=${runContinues} ` +
-      `cur=${prev.currentRunId ?? "-"} await=${prev.awaitingTasks === true} streaming=${prev.streaming === true}`,
-  );
   // Occupancy for the context meter: the newest single report (claude's one
   // payload already carries the turn's totals).
   const turnTotals = turnUsageTotals.get(event.runId);
@@ -1494,10 +1474,7 @@ function adoptObservedRun(
   // they are not the completion turn, so they must not clear awaitingTasks,
   // restart the segment timer, or make the session read as streaming again
   // (the composer would start queueing while the user should be able to send).
-  if (cur?.awaitingTasks && taskFrame) {
-    trace(`adopt run=${event.runId} act=skip-task-frame`);
-    return;
-  }
+  if (cur?.awaitingTasks && taskFrame) return;
   if (!cur?.streaming) {
     // A completion turn reopens the run after its background phase: its text
     // is a fresh segment, so the elapsed timer restarts and the background
@@ -1510,16 +1487,12 @@ function adoptObservedRun(
       currentRunId: event.runId,
       ...(reopen ? { awaitingTasks: false } : {}),
     });
-    trace(
-      `adopt run=${event.runId} act=open reopen=${reopen} prevCur=${cur?.currentRunId ?? "-"}`,
-    );
   } else if (!cur.awaitingTasks && turnOwner(cur, key) === null) {
     // Streaming without a claimed run (a session restored without one): the
     // run now talking owns the turn. A session still awaiting its background
     // tasks is NOT claimed here — its live run already owns it, and the
     // frames arriving are the background phase's, not a newer turn's.
     patchSession(deps.set, key, { currentRunId: event.runId });
-    trace(`adopt run=${event.runId} act=claim-unowned`);
   }
   if (!deps.get().streamingByKey[key]) {
     deps.set((s) => ({
@@ -1576,7 +1549,6 @@ export function handleEngineEvents(
             event.kind === "question_settled"))
       )
     ) {
-      trace(`ev ${event.kind} run=${event.runId} act=settled-skip`);
       continue;
     }
     const state = deps.get();
@@ -1594,10 +1566,7 @@ export function handleEngineEvents(
         if (match) key = match;
       }
     }
-    if (!key) {
-      trace(`ev ${event.kind} run=${event.runId} act=no-key sess=${event.sessionId ?? "-"}`);
-      continue;
-    }
+    if (!key) continue;
     if (event.kind === "done" || event.kind === "error") {
       const bg =
         event.kind === "done" &&
@@ -1622,7 +1591,6 @@ export function handleEngineEvents(
       void ipc.computerUseSetActive?.(false)?.catch(() => {});
     }
     if (state.bySession[key]?.settledRunIds?.includes(event.runId)) {
-      traceState(event, key, "run-settled", deps);
       // A usage report trailing the terminal event carries the turn's final
       // occupancy. Re-read it from the transcript instead of patching the
       // settled state — the file can lag the event, and refreshSessionUsage
@@ -1648,7 +1616,6 @@ export function handleEngineEvents(
       FOREIGN_CONTENT_KINDS.has(event.kind) &&
       isForeignContent(deps.get().bySession[key], key, event.runId)
     ) {
-      traceState(event, key, "foreign-drop", deps);
       continue;
     }
 
@@ -1660,11 +1627,6 @@ export function handleEngineEvents(
     // card's resend has to stay available while it waits.
     if (!settled && event.kind !== "done" && event.kind !== "error" && event.kind !== "permission_denied") {
       adoptObservedRun(event, key, deps);
-    }
-    if (event.kind === "delta" || event.kind === "thinking") {
-      traceDelta(event.runId, typeof event.data === "string" ? event.data.length : 0);
-    } else {
-      traceState(event, key, "routed", deps);
     }
 
     switch (event.kind) {

@@ -1161,11 +1161,6 @@ export const ipc = {
   rememberSessionProvider: (engine: string, sessionId: string, providerId: string) =>
     invoke<void>("remember_session_provider", { engine, sessionId, providerId }),
   rescanSessions: () => invoke<void>("rescan_sessions"),
-  /** Temporary diagnostics channel (2026-09-22): the Rust side only writes
-   *  anything when CCGUI_TRACE=1 is set at app start; otherwise every call is
-   *  a cheap no-op. Used to root-cause the "reply never shows" report. */
-  traceFrontendEnabled: () => invoke<boolean>("trace_frontend_enabled"),
-  traceFrontend: (lines: string[]) => invoke<void>("trace_frontend", { lines }),
   listWorkspaces: () => invoke<Workspace[]>("list_workspaces"),
   addWorkspace: (path: string, meta?: Record<string, unknown>) =>
     invoke<Workspace>("add_workspace", { path, meta: meta ?? null }),
