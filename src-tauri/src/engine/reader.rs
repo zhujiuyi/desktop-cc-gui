@@ -357,6 +357,26 @@ fn next_close_deadline(
     }
     Some(now + if pending == 0 { BACKGROUND_GRACE } else { BACKGROUND_STALL })
 }
+/// Final level frame for a run that dies with tasks still pending. `saw_done`
+/// is already true (the reply settled, its background phase was still open), so
+/// no terminal event is synthesized and the frontend would keep every running
+/// row until its 30-minute orphan sweep. An empty `tasks` frame is REPLACE
+/// semantics: the live set is now empty, so the panel settles those rows as
+/// stopped on the spot. No-op when nothing is pending.
+fn push_final_task_frame(state: &mut TurnState, core: &TurnCore) {
+    if state.pending_tasks.is_empty() {
+        return;
+    }
+    state.pending_tasks.clear();
+    state.push(
+        &core.sink,
+        &core.run_id,
+        &core.engine_id,
+        "tasks",
+        serde_json::json!({ "tasks": [] }),
+    );
+}
+
 /// Event-routing core shared by process runs ([`RunContext`]) and virtual
 /// host-stream runs ([`dsh_session::run_host_turn`]): the fields
 /// `dispatch_event` needs to route engine events to the UI sink and keep the
@@ -396,19 +416,14 @@ impl TurnCore {
         if suppressed_after_terminal(state, &event) {
             return;
         }
-        if state.saw_done
-            && state.awaiting_tasks
-            && matches!(
-                event,
-                EngineEvent::Delta(_)
-                    | EngineEvent::Thinking(_)
-                    | EngineEvent::Message { .. }
-                    | EngineEvent::Done { .. }
-            )
-        {
+        if state.saw_done && state.awaiting_tasks && !is_task_event(&event) {
             // The follow-up turn starts inside this process: reopen the run.
-            // Only content frames count as starters — a trailing usage/model
-            // tail is not a new turn.
+            // ANY non-task frame counts as its start, not just content — the
+            // CLI may open with a preamble (usage/model tails, a re-announced
+            // session) before its first token, and the 30s grace armed for its
+            // arrival would otherwise EOF stdin into the middle of the turn.
+            // (Terminal kinds that stay suppressed, retry/warn/error, never
+            // reach here: suppressed_after_terminal drops them above.)
             state.saw_done = false;
             state.awaiting_tasks = false;
             state.close_deadline = None;
@@ -741,11 +756,21 @@ impl TurnCore {
                 last_tool,
                 usage,
             } => {
-                state.close_deadline = next_close_deadline(
-                    state.pending_tasks.len(),
-                    state.awaiting_tasks,
-                    tokio::time::Instant::now(),
-                );
+                // Only a task this run actually waits for may push the stall
+                // bound out. An ambient (session-scoped) task heartbeats for
+                // the session's whole life, so re-arming on it would defer
+                // stdin closure forever — the one lever left on a run whose
+                // task wedged without a final frame. A frame for a task that is
+                // not pending is deliberately left alone even when nothing else
+                // is pending: that is exactly the ambient case, and recomputing
+                // there would hand out the 30s grace at every heartbeat.
+                if state.pending_tasks.contains_key(&id) {
+                    state.close_deadline = next_close_deadline(
+                        state.pending_tasks.len(),
+                        state.awaiting_tasks,
+                        tokio::time::Instant::now(),
+                    );
+                }
                 state.push(
                     &self.sink,
                     &self.run_id,
@@ -1310,6 +1335,12 @@ pub(crate) async fn run_reader(stdout: ChildStdout, ctx: RunContext) {
             );
         }
     }
+    // The process is gone: whatever it still owed this run's task list is never
+    // coming. Close the list out so the panel does not show running rows until
+    // the frontend's orphan sweep (see push_final_task_frame).
+    push_final_task_frame(&mut state, &ctx.core);
+    // Flush the task-list settlement before releasing a deferred terminal
+    // event, so the final run event remains the last lifecycle transition.
     if status.is_some() {
         state.confirm_exit(&ctx.core);
     }
@@ -1320,6 +1351,17 @@ mod staging_tests {
     use super::*;
     use crate::engine::ChildEntry;
     use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct EventLog(Mutex<Vec<Value>>);
+    impl event_sink::Emit for EventLog {
+        fn emit_json(&self, _: &str, raw: &str) {
+            self.0
+                .lock()
+                .unwrap()
+                .extend(serde_json::from_str::<Vec<Value>>(raw).unwrap());
+        }
+    }
 
     /// The ring truncates by byte count: a naive drain start can land
     /// mid-CJK and panic (killing the stderr capture task silently).
@@ -1390,6 +1432,73 @@ mod staging_tests {
             assert_eq!(result.is_err(), abort);
             assert!(!directory.exists());
         }
+    }
+
+    /// 后台期静默死亡（这里用「写完一帧任务帧就退出的假 CLI」表示，例如它带走的
+    /// 那个后台任务）：saw_done 已真，不会合成终局帧，前端只剩 30 分钟的 orphan
+    /// sweep，期间尾部一直「运行中」。退出路径必须补一帧空 level 帧（REPLACE
+    /// 语义），让面板当场把该 run 的 running 行收敛为 stopped。
+    #[tokio::test]
+    async fn a_run_that_dies_mid_background_phase_closes_its_task_list() {
+        let frame = std::env::temp_dir()
+            .join(format!("ccgui-reader-taskframe-{}.ndjson", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &frame,
+            "{\"type\":\"system\",\"subtype\":\"task_started\",\"task_id\":\"t1\",\
+             \"task_type\":\"local_bash\",\"description\":\"sleep 60\"}\n",
+        )
+        .unwrap();
+        let mut command = Command::new(if cfg!(windows) { "cmd.exe" } else { "sh" });
+        if cfg!(windows) {
+            command.args(["/c", "type"]).arg(&frame);
+        } else {
+            command.args(["-c", &format!("cat '{}'", frame.display())]);
+        }
+        command.stdout(std::process::Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let log = Arc::new(EventLog::default());
+        let ctx = RunContext {
+            core: TurnCore {
+                sink: event_sink::EventSink::new(log.clone()),
+                registry: Arc::new(ProcessRegistry::default()),
+                engine_id: "claude".into(),
+                run_id: "exit-with-tasks".into(),
+            },
+            engine_impl: Box::new(crate::engine::claude::ClaudeEngine::new()),
+            pid: 0,
+            preassigned_session_id: None,
+            initial_model: None,
+            initial_effort: None,
+            child: Arc::new(TokioMutex::new(child)),
+            killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cleanup_files: Vec::new(),
+            mcp_restore: None,
+            stderr_buf: Arc::new(Mutex::new(String::new())),
+            stdout_plain_buf: Arc::new(Mutex::new(String::new())),
+            #[cfg(windows)]
+            _tree_guard: None,
+        };
+
+        run_reader(stdout, ctx).await;
+        let _ = std::fs::remove_file(&frame);
+
+        let events = log.0.lock().unwrap();
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            ["task_started", "done", "tasks"],
+            "the exit path must close the task list after the terminal frame"
+        );
+        let last = events.last().unwrap();
+        assert_eq!(
+            last["data"]["tasks"].as_array().map(Vec::len),
+            Some(0),
+            "the final level frame must be the empty live set"
+        );
     }
 
     /// Slot accounting must survive a reader that dies without reaching
@@ -1916,5 +2025,161 @@ mod terminal_event_tests {
             .expect("tasks event was not pushed");
         assert_eq!(last["data"]["tasks"][0]["taskId"], "task-monitor");
         assert_eq!(last["data"]["tasks"][0]["ambient"], true);
+    }
+
+    fn core_for(run_id: &str) -> (TurnCore, Arc<Collector>) {
+        let collector = Arc::new(Collector::default());
+        (
+            TurnCore {
+                sink: event_sink::EventSink::new(collector.clone()),
+                registry: Arc::new(ProcessRegistry::default()),
+                engine_id: "claude".into(),
+                run_id: run_id.into(),
+            },
+            collector,
+        )
+    }
+
+    fn task_summary(id: &str, ambient: bool) -> TaskSummary {
+        TaskSummary {
+            id: id.to_string(),
+            task_type: "local_bash".into(),
+            description: "pnpm test".into(),
+            ambient,
+        }
+    }
+
+    /// A reply that settled with one task still running: awaiting the CLI's
+    /// completion turn, the 30s close grace armed.
+    fn awaiting_state() -> TurnState {
+        let mut state = TurnState::new(None);
+        state.pending_tasks.insert("task-1".into(), task_summary("task-1", false));
+        state.saw_done = true;
+        state.awaiting_tasks = true;
+        state.close_deadline = Some(tokio::time::Instant::now() + BACKGROUND_GRACE);
+        state
+    }
+
+    /// 通知轮的开头帧也算「回合已重新开始」：CLI 可能先吐 usage/model 一类的
+    /// 前导帧再出正文，只把 Delta/Thinking/Message/Done 当重开信号的话，30s
+    /// 宽限会在正文到达之前 EOF 掉 stdin，通知轮被从中间截断。
+    #[tokio::test]
+    async fn any_non_task_frame_cancels_the_background_grace() {
+        for follow_up in [
+            EngineEvent::Usage(serde_json::json!({ "input_tokens": 1 })),
+            EngineEvent::Model("claude-sonnet-4".into()),
+        ] {
+            let (core, _collector) = core_for("grace-cancel");
+            let mut state = awaiting_state();
+
+            core.dispatch_event(&mut state, follow_up);
+
+            assert!(!state.saw_done, "the follow-up turn reopened the run");
+            assert!(!state.awaiting_tasks);
+            assert!(
+                state.close_deadline.is_none(),
+                "the grace must not EOF the CLI's stdin into the follow-up turn"
+            );
+        }
+    }
+
+    /// 反之，任务帧不是通知轮：等待与期限都该原地不动（任务进度只重设期限，
+    /// 不改等待状态）。
+    #[tokio::test]
+    async fn task_frames_leave_the_wait_and_its_deadline_alone() {
+        let (core, _collector) = core_for("task-frame-keeps-wait");
+        let mut state = awaiting_state();
+        let armed = state.close_deadline;
+
+        core.dispatch_event(
+            &mut state,
+            EngineEvent::TaskNotification { id: "task-1".into(), status: "completed".into() },
+        );
+
+        assert!(state.saw_done && state.awaiting_tasks);
+        assert!(
+            state.close_deadline.is_some_and(|at| at >= armed.unwrap()),
+            "a task frame re-arms the bound instead of dropping it"
+        );
+    }
+
+    /// TaskProgress 只能为本 run 真正在等的任务顺延停滞上限：ambient（会话级）
+    /// 任务的生命周期比 turn 长，它每次心跳若都重算期限，就等于把这根唯一的
+    /// 时间杠杆无限顺延下去。
+    #[tokio::test]
+    async fn task_progress_only_rearms_for_a_task_the_run_waits_for() {
+        let (core, _collector) = core_for("progress-rearm");
+        let mut state = TurnState::new(None);
+        state.pending_tasks.insert("task-1".into(), task_summary("task-1", false));
+        state.awaiting_tasks = true;
+        // A deadline already in the past: recomputing moves it, leaving it
+        // alone keeps the exact value.
+        let stale = tokio::time::Instant::now() - std::time::Duration::from_secs(60);
+        state.close_deadline = Some(stale);
+
+        core.dispatch_event(
+            &mut state,
+            EngineEvent::TaskProgress {
+                id: "task-monitor".into(),
+                description: Some("Running Wait 590 seconds".into()),
+                last_tool: None,
+                usage: None,
+            },
+        );
+        assert_eq!(
+            state.close_deadline,
+            Some(stale),
+            "an ambient task's heartbeat must not extend the stall bound"
+        );
+
+        core.dispatch_event(
+            &mut state,
+            EngineEvent::TaskProgress {
+                id: "task-1".into(),
+                description: Some("阶段: probe".into()),
+                last_tool: None,
+                usage: None,
+            },
+        );
+        assert!(
+            state.close_deadline > Some(stale),
+            "the task the run waits for still re-arms the bound"
+        );
+    }
+
+    /// 后台期进程静默死亡：saw_done 已真，前端等不到任何终局帧，只能等 30 分钟
+    /// 的 orphan sweep，期间尾部一直「运行中」。退出路径补一帧空 level 帧
+    /// （REPLACE 语义），前端把该 run 的 running 行收敛为 stopped。
+    #[tokio::test]
+    async fn a_run_dying_with_pending_tasks_reports_an_empty_level_frame() {
+        let (core, collector) = core_for("exit-with-tasks");
+        let mut state = TurnState::new(None);
+        state.pending_tasks.insert("task-1".into(), task_summary("task-1", false));
+
+        push_final_task_frame(&mut state, &core);
+
+        core.sink.flush();
+        assert!(state.pending_tasks.is_empty());
+        let events = collector.0.lock().unwrap();
+        let last = events.last().expect("no final task frame was pushed");
+        assert_eq!(last["kind"], "tasks");
+        assert_eq!(
+            last["data"]["tasks"].as_array().map(Vec::len),
+            Some(0),
+            "the level frame must be the empty live set"
+        );
+    }
+
+    /// 没有挂起任务时退出不是「后台期死亡」：不该多推任何帧（否则每个正常
+    /// 结束的 run 都会多一帧空列表，把面板的 running 行无谓地结算一遍）。
+    #[tokio::test]
+    async fn a_run_dying_without_pending_tasks_pushes_nothing() {
+        let (core, collector) = core_for("exit-without-tasks");
+        let mut state = TurnState::new(None);
+
+        push_final_task_frame(&mut state, &core);
+
+        core.sink.flush();
+        assert!(collector.0.lock().unwrap().is_empty());
     }
 }
