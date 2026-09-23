@@ -206,7 +206,11 @@ describe("ProcessDisclosure bounded history", () => {
     const items = tools(120);
     const text = "中文与 emoji 👨‍👩‍👧‍👦\n".repeat(300);
     await render([...items, { type: "thinking", text, live: true }], { turnLive: true });
-    expect(container.querySelector(".whitespace-pre-wrap")!.textContent).toBe(text);
+    const liveBody = container.querySelector<HTMLElement>(".whitespace-pre-wrap")!;
+    expect(liveBody.textContent).not.toBe(text);
+    expect(liveBody.textContent!.length).toBeLessThanOrEqual(2000);
+    expect(liveBody.textContent).toContain(text.slice(-80));
+    expect(liveBody.className).toContain("mask-image");
     await render([...items, { type: "thinking", text }], { turnLive: true });
     expect(headerExpanded()).toBe(false);
     expect(container.querySelector(".whitespace-pre-wrap")).toBeNull();

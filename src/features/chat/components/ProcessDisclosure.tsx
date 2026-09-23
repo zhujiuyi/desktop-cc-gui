@@ -513,8 +513,7 @@ export const ProcessDisclosure = memo(function ProcessDisclosure({
   searchTarget?: ProcessSearchTarget;
 }) {
   const { t } = useTranslation();
-  const sections = useMemo(() => groupProcessSections(items), [items]);
-  const hasLiveThinking = sections.some((s) => s.type === "thinking" && s.live);
+  const hasLiveThinking = items.some((item) => item.type === "thinking" && item.live);
   const { expanded, toggleExpanded } = useProcessExpansion(
     autoExpand,
     turnLive,

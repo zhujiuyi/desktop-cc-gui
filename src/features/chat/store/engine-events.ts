@@ -5,7 +5,6 @@ import { dedupeTabs, persistTabs, sessionKey } from "./persistence";
 import {
   EMPTY_SESSION,
   EMPTY_TASKS,
-  appendToolMessage,
   appendToolMessages,
   applyStreamParts,
   bufferStreamPart,
