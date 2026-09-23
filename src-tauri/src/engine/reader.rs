@@ -872,7 +872,11 @@ impl TurnCore {
                     self.adopt_session_id(state, &id, false);
                 }
                 let pending = state.pending_tasks.len();
-                if pending == 0 {
+                // A content-free done only closes the CLI's internal
+                // reconciliation turn; the queued user turn is still active.
+                // Keep its MCP run→workspace mapping until the actual terminal
+                // done so a later MCP snapshot is not silently discarded.
+                if pending == 0 && !run_continues {
                     crate::mcp::mark_run_ended(&self.run_id);
                 }
                 if pending == 0 {
@@ -1980,6 +1984,37 @@ mod terminal_event_tests {
         assert_eq!(kinds, ["model", "done", "delta", "done"]);
         assert_eq!(events[1]["data"]["runContinues"], true);
         assert_eq!(events[3]["data"]["runContinues"], false);
+    }
+
+    #[tokio::test]
+    async fn hollow_done_keeps_mcp_run_registered_until_the_real_turn_ends() {
+        let collector = Arc::new(Collector::default());
+        let core = TurnCore {
+            sink: event_sink::EventSink::new(collector),
+            registry: Arc::new(ProcessRegistry::default()),
+            engine_id: "claude".into(),
+            run_id: "mcp-hollow-done-test".into(),
+        };
+        let workspace = std::env::temp_dir().join("ccgui-mcp-hollow-done-test");
+        let workspace = workspace.to_string_lossy().into_owned();
+        crate::mcp::register_run(&core.run_id, &workspace);
+        let mut state = TurnState::new(Some("session".into()));
+
+        core.dispatch_event(
+            &mut state,
+            EngineEvent::McpServers {
+                servers: vec![("test-server".into(), Some("connected".into()))],
+                tools: Vec::new(),
+            },
+        );
+        assert_eq!(crate::mcp::claude_section(Some(&workspace)).status, "ready");
+
+        core.dispatch_event(&mut state, EngineEvent::Done { session_id: None, usage: None });
+        assert_eq!(crate::mcp::claude_section(Some(&workspace)).status, "ready");
+
+        core.dispatch_event(&mut state, EngineEvent::Delta("reply".into()));
+        core.dispatch_event(&mut state, EngineEvent::Done { session_id: None, usage: None });
+        assert_eq!(crate::mcp::claude_section(Some(&workspace)).status, "session_ended");
     }
 
     #[test]
