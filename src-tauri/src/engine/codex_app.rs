@@ -230,9 +230,10 @@ impl AppServer {
                         MAX_LINE_BYTES / (1024 * 1024),
                     ));
                 }
-                // This reader has no background-task close deadline; if the
-                // shared reader reports one, keep polling until the RPC's own
-                // deadline or a complete line arrives.
+                // The Codex app-server wait loop has no background-task
+                // deadline; only the shared reader synthesizes this variant.
+                // Keep this polling loop alive if the shared result type grows
+                // another deadline source in the future.
                 Ok(Ok(LineRead::Deadline)) => continue,
                 Ok(Ok(LineRead::Line(line))) => line,
             };
