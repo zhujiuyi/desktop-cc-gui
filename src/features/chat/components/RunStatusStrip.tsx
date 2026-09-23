@@ -758,10 +758,12 @@ function RunStatusPills({
   onToggle: (id: SectionId) => void;
 }) {
   const { t } = useTranslation();
-  const completedCount = steps.filter((step) => step.state === "complete").length;
-  // A failed step is settled, not running. For message-derived steps the
-  // derivation settles them when streaming ends; task-backed Claude steps may
-  // remain active while their background work outlives the text stream.
+  // The numerator counts SETTLED steps, not just succeeded ones: a failed
+  // step is as settled as a finished one, and a settled pill reading "1/2"
+  // forever would imply outstanding work that is not coming.
+  const settledCount = steps.filter((step) => step.state !== "active").length;
+  // "Still working" is the active state, not "not complete": a pill that keeps
+  // breathing after a failure promises progress that is not coming.
   const anyRunning = steps.some((step) => step.state === "active");
   const todosDone = todos.filter((item) => item.status === "complete").length;
   const todosRunning = streaming && todos.some((item) => item.status === "active");
@@ -782,7 +784,7 @@ function RunStatusPills({
           selected={section === "subagent"}
           running={anyRunning}
           label={t("chat.subagentPill")}
-          count={`${completedCount}/${steps.length}`}
+          count={`${settledCount}/${steps.length}`}
           icon={<BotIcon />}
           onClick={() => onToggle("subagent")}
         />
@@ -830,6 +832,7 @@ export const RunStatusStrip = memo(function RunStatusStrip({
   const messages = useChatStore((s) =>
     sessionKey ? (s.bySession[sessionKey]?.messages ?? EMPTY_MESSAGES) : EMPTY_MESSAGES,
   );
+  const { t } = useTranslation();
   const subagentHistory = useChatStore((s) =>
     sessionKey ? (s.bySession[sessionKey]?.subagentHistory ?? EMPTY_MESSAGES) : EMPTY_MESSAGES,
   );
@@ -856,9 +859,11 @@ export const RunStatusStrip = memo(function RunStatusStrip({
   const steps = useMemo(
     () =>
       engine === "claude" && tasks.length > 0
-        ? stepsFromTasks(tasks, currentRunId)
+        ? stepsFromTasks(tasks, currentRunId, (type) =>
+            t(`chat.tasks.type.${type}`, { defaultValue: type }),
+          )
         : deriveAgentTaskSteps(allHistory, streaming, engine),
-    [tasks, currentRunId, allHistory, streaming, engine],
+    [tasks, currentRunId, allHistory, streaming, engine, t],
   );
   const files = useMemo(() => deriveEditedFiles(messages), [messages]);
   const todos = useMemo(() => deriveTodoList(allHistory), [allHistory]);

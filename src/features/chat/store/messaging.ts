@@ -237,6 +237,9 @@ export function createMessagingActions(
         interrupted: false,
         turnStartedAt: Date.now(),
         currentRunId: requestedRunId,
+        // This send starts the session's new turn: any background wait
+        // left over from the previous run no longer describes the phase.
+        awaitingTasks: false,
         activeModel: model,
         activeEffort: effort,
         activeProvider: provider,
@@ -686,7 +689,14 @@ export function createMessagingActions(
         // store reserves 已中断 for a run that died without a notification.
         // Runs whose routing entry is already gone are out of this scope:
         // the orphan sweep settles whatever they left running.
-        const stoppingTasks = cur.awaitingTasks || cur.backgroundActive;
+        // backgroundActive excludes ambient tasks, so it alone would skip
+        // the settle for a session whose only running rows are ambient —
+        // those rows would spin forever (routing is deleted below and the
+        // settledRunIds gate drops their late frames). Look at the stopped
+        // runs' own rows instead.
+        const stoppingTasks =
+          cur.awaitingTasks ||
+          cur.tasks.some((t) => stoppedRunIds.includes(t.runId) && t.status === "running");
         const tasks = stoppingTasks
           ? stoppedRunIds.reduce(
               (acc, runId) => settleRunTasks(acc, runId, "stopped"),
@@ -713,7 +723,9 @@ export function createMessagingActions(
                 ? {
                     tasks,
                     awaitingTasks: false,
-                    backgroundActive: tasks.some((t) => t.status === "running"),
+                    // Same derivation as withTaskDerived: ambient tasks never
+                    // drive the turn-level flag.
+                    backgroundActive: tasks.some((t) => t.status === "running" && !t.ambient),
                   }
                 : {}),
               // Mark the runs dead in this same write. The kill IPCs below can
@@ -739,7 +751,11 @@ export function createMessagingActions(
         await ipc.interruptSession(active.sessionId).catch(() => false);
       const deadRunIds: string[] = [];
       for (const [runId, routed] of runRouting) {
-        if (routed === key) deadRunIds.push(runId);
+        // Intersect with the pre-kill snapshot: a run started while the kill
+        // IPCs were in flight (Stop→Send race) is routed to this key but was
+        // never asked to stop — killing and settling it here would strand its
+        // streaming state and drop all its frames.
+        if (routed === key && stoppedRunIds.includes(runId)) deadRunIds.push(runId);
       }
       // Independent kills, one IPC call per routed run — fired together.
       await Promise.all(

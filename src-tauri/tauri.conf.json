@@ -35,7 +35,7 @@
       "resources/agent-catalogs": "agent-catalogs",
       "resources/skills": "skills"
     },
-    "createUpdaterArtifacts": false,
+    "createUpdaterArtifacts": true,
     "targets": "all",
     "linux": {
       "rpm": {

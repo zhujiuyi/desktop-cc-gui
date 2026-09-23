@@ -573,6 +573,9 @@ export function settleRunTasks(
  *  same row instead of duplicating it. */
 function applyTaskEvent(event: EngineEventPayload, key: string, deps: EngineEventDeps) {
   const data = (event.data ?? {}) as Record<string, unknown>;
+  // A task frame without an id is malformed: String(undefined) would create
+  // a row literally keyed "undefined".
+  if (event.kind !== "tasks" && data.taskId == null) return;
   deps.set((s) => {
     const cur = s.bySession[key] ?? EMPTY_SESSION;
     let tasks = cur.tasks;
@@ -625,7 +628,11 @@ function applyTaskEvent(event: EngineEventPayload, key: string, deps: EngineEven
         break;
       }
       case "tasks": {
-        const listed = (data.tasks as Record<string, unknown>[] | undefined) ?? [];
+        // Entries without a task id are malformed; skip them rather than
+        // keying a row "undefined".
+        const listed = ((data.tasks as Record<string, unknown>[] | undefined) ?? []).filter(
+          (t) => t.taskId != null,
+        );
         const live = new Set(listed.map((t) => String(t.taskId)));
         // REPLACE semantics: the payload is the authoritative live set, so a
         // running task missing from it is gone without a terminal notification.
@@ -674,15 +681,23 @@ export function settleOrphanedRuns(
 ) {
   if (orphaned.length === 0) return;
   for (const [runId] of orphaned) dropRunUsage(runId);
-  for (const [, key] of orphaned) retryingKeys.delete(key);
   set((s) => {
     let streamingByKey = s.streamingByKey;
     let retryingByKey = s.retryingByKey;
     let bySession = s.bySession;
     for (const [runId, key] of orphaned) {
-      streamingByKey = setStreamingFlag(streamingByKey, key, false);
-      retryingByKey = setRetryingFlag(retryingByKey, key, false);
       const cur = bySession[key];
+      // The turn's streaming state belongs to its owner. With dual-run (a
+      // backgrounded run overlapping the next turn), reaping a run that does
+      // not own the turn must not flip the session to not-streaming under the
+      // owner's feet: that unlocks the composer mid-turn, and a send in that
+      // window spawns a third concurrent run.
+      const foreignOwned = cur != null && cur.currentRunId != null && cur.currentRunId !== runId;
+      if (!foreignOwned) {
+        streamingByKey = setStreamingFlag(streamingByKey, key, false);
+        retryingByKey = setRetryingFlag(retryingByKey, key, false);
+        retryingKeys.delete(key);
+      }
       if (!cur) continue;
       // A reaped run can leave tasks running with the turn already settled
       // (background work outlives its spawner's reply), so the task settle
@@ -692,12 +707,12 @@ export function settleOrphanedRuns(
       if (bySession === s.bySession) bySession = { ...s.bySession };
       bySession[key] = withTaskDerived({
         ...cur,
-        streaming: false,
-        turnStartedAt: null,
+        // The owner's streaming state survives; the reaped run's own
+        // leftovers (its task rows, the background wait) still settle.
+        ...(foreignOwned ? {} : { streaming: false, turnStartedAt: null, retry: null }),
         // A reaped run can never settle this turn again: drop its claim so the
         // next run's own terminal event is not read as a foreign one.
         ...(cur.currentRunId === runId ? { currentRunId: null } : {}),
-        retry: null,
         compaction: null,
         // The reaped run's completion turn is never coming.
         awaitingTasks: false,
@@ -1346,8 +1361,10 @@ function onDone(event: EngineEventPayload, key: string, deps: EngineEventDeps) {
     // housekeeping never drives the indicator.) A background-phase done keeps
     // the rows untouched: those tasks are exactly what the turn waits for.
     const tasks =
-      backgroundTasks > 0
-        ? cur.tasks
+      backgroundTasks > 0 || runContinues
+        ? // A runContinues done is not terminal either: the run explicitly
+          // continues, so its rows are not orphaned work.
+          cur.tasks
         : settleRunTasks(cur.tasks ?? EMPTY_TASKS, event.runId, "interrupted");
     // Stamp usage, durationMs, effort, and model onto the turn's last assistant message.
     for (let i = messages.length - 1; i >= 0; i--) {

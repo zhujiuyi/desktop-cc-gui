@@ -1,6 +1,21 @@
 import type { AgentTaskStep } from "./components/agent-task-steps";
 import type { BackgroundTask } from "./store/stream";
 
+/** The task's display label: the engine's own name for it first (workflow,
+ *  subagent type, description), then its bare type. `translateType` localizes
+ *  that type fallback (`chat.tasks.type.*`); without it the raw type name
+ *  shows. Shared by the tasks panel and the run-status pill so both name the
+ *  same task the same way. */
+export function taskLabel(
+  task: BackgroundTask,
+  translateType: (taskType: string) => string = (taskType) => taskType,
+): string {
+  if (task.workflowName || task.subagentType || task.description) {
+    return task.workflowName || task.subagentType || task.description;
+  }
+  return translateType(task.taskType);
+}
+
 /** Tasks grouped under their run (turn), running groups first, then newest. */
 export function groupTasksByRun(
   tasks: BackgroundTask[],
@@ -39,6 +54,7 @@ export function runningTaskCount(tasks: BackgroundTask[]): number {
 export function stepsFromTasks(
   tasks: BackgroundTask[],
   currentRunId: string | null,
+  translateType?: (taskType: string) => string,
 ): AgentTaskStep[] {
   return tasks
     .filter(
@@ -48,7 +64,7 @@ export function stepsFromTasks(
     )
     .map((t) => ({
       key: t.id,
-      label: t.workflowName || t.subagentType || t.description || t.taskType,
+      label: taskLabel(t, translateType),
       state: t.status === "running" ? "active" : t.status === "failed" ? "failed" : "complete",
     }));
 }

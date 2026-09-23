@@ -1,12 +1,11 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import type { TFunction } from "i18next";
 import Activity from "lucide-react/dist/esm/icons/activity";
 import Bot from "lucide-react/dist/esm/icons/bot";
 import TerminalSquare from "lucide-react/dist/esm/icons/terminal-square";
 import Workflow from "lucide-react/dist/esm/icons/workflow";
 import { cx } from "@/utils/cx";
-import { groupTasksByRun } from "../background-tasks";
+import { groupTasksByRun, taskLabel } from "../background-tasks";
 import { sessionKey, useChatStore } from "../store";
 import { EMPTY_TASKS, type BackgroundTask } from "../store/stream";
 import { formatDuration } from "./format-duration";
@@ -16,17 +15,6 @@ const TYPE_ICON: Record<string, typeof Activity> = {
   local_agent: Bot,
   local_bash: TerminalSquare,
 };
-
-/** The row's label: the engine's own name for the task first, then the raw
- *  type name. A task the CLI reported without any description or agent type
- *  names its TYPE — translated, so the panel does not surface `local_bash`;
- *  a type this build has no key for still shows its raw name. */
-function taskLabel(t: TFunction, task: BackgroundTask): string {
-  if (task.workflowName || task.subagentType || task.description) {
-    return task.workflowName || task.subagentType || task.description;
-  }
-  return t(`chat.tasks.type.${task.taskType}`, { defaultValue: task.taskType });
-}
 
 function StatusBadge({ status }: { status: BackgroundTask["status"] }) {
   const { t } = useTranslation();
@@ -56,9 +44,11 @@ function TaskRow({ task, now }: { task: BackgroundTask; now: number }) {
   return (
     <div className="flex flex-col gap-0.5 rounded-[6px] px-2 py-1.5 hover:bg-background-tertiary-default/50">
       <div className="flex min-w-0 items-center gap-2">
-        <Icon className="size-3.5 shrink-0 text-foreground-icon-secondary" />
+        <Icon aria-hidden className="size-3.5 shrink-0 text-foreground-icon-secondary" />
         <span className="min-w-0 flex-1 truncate text-xs text-text-primary">
-          {taskLabel(t, task)}
+          {/* Bare-type fallback goes through chat.tasks.type.* so the panel never
+              surfaces a raw `local_bash` (defaultValue keeps unknown types). */}
+          {taskLabel(task, (type) => t(`chat.tasks.type.${type}`, { defaultValue: type }))}
         </span>
         {duration && (
           <span
@@ -85,7 +75,7 @@ export function BackgroundTasksPanel({ workspacePath }: { workspacePath: string 
   // to a *session*: two tabs can share one workspace, so the active tab (the
   // same store selector QuestionDock/GrantCard use) is what identifies them.
   void workspacePath;
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const active = useChatStore((s) => s.active);
   const tasks = useChatStore((s) => {
     if (!active) return EMPTY_TASKS;
@@ -112,7 +102,8 @@ export function BackgroundTasksPanel({ workspacePath }: { workspacePath: string 
       {groups.map((group) => (
         <div key={group.runId} className="mb-1.5">
           <div className="px-2 py-1 text-[11px] text-foreground-icon-tertiary">
-            {t("chat.tasks.turnAt", { time: new Date(group.startedAt).toLocaleTimeString() })}
+            {/* Format in the app's language, not the OS locale. */}
+            {t("chat.tasks.turnAt", { time: new Date(group.startedAt).toLocaleTimeString(i18n.language) })}
           </div>
           {group.tasks.map((task) => <TaskRow key={task.id} task={task} now={now} />)}
         </div>
@@ -121,7 +112,8 @@ export function BackgroundTasksPanel({ workspacePath }: { workspacePath: string 
   );
 }
 
-/** One-line background marker for the timeline tail (Task 6 uses it). */
+/** One-line background marker for the timeline tail (MessageTimeline renders
+ *  it while the turn waits on background tasks). */
 export function BackgroundTasksLine({ count }: { count: number }) {
   const { t } = useTranslation();
   return (

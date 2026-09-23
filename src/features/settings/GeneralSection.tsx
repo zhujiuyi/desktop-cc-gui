@@ -265,12 +265,12 @@ function useGeneralSettingsState() {
     onSendShortcutChange,
     onThinkingAutoCollapseChange,
     onThinkingAutoExpandChange,
-    onThinkingAutoExpandChange,
     onPetEnabledChange,
     onPetScaleChange,
     onPetChange,
     importPet,
   };
+<<<<<<< HEAD
 }
 
 /** Appearance card: theme, Windows titlebar + restart, language, thread limit. */
@@ -556,6 +556,7 @@ export function GeneralSection() {
     onThreadLimitKeyDown,
     onSendShortcutChange,
     onThinkingAutoCollapseChange,
+    onThinkingAutoExpandChange,
     onPetEnabledChange,
     onPetScaleChange,
     onPetChange,

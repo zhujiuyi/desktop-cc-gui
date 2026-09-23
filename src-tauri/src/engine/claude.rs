@@ -349,47 +349,50 @@ impl Engine for ClaudeEngine {
                             }
                         }
                         "task_notification" => {
-                            if let Some(id) = value.get("task_id").and_then(Value::as_str) {
+                            // A notification without a status is malformed:
+                            // defaulting it to "stopped" would mislabel the
+                            // task as user-stopped in the panel. Drop it; the
+                            // authoritative level frame converges the row.
+                            if let (Some(id), Some(status)) = (
+                                value.get("task_id").and_then(Value::as_str),
+                                value.get("status").and_then(Value::as_str),
+                            ) {
                                 out.push(EngineEvent::TaskNotification {
                                     id: id.to_string(),
-                                    status: value
-                                        .get("status")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("stopped")
-                                        .to_string(),
+                                    status: status.to_string(),
                                 });
                             }
                         }
                         "background_tasks_changed" => {
-                            let tasks = value
-                                .get("tasks")
-                                .and_then(Value::as_array)
-                                .map(|arr| {
-                                    arr.iter()
-                                        .filter_map(|t| {
-                                            let id = t.get("task_id").and_then(Value::as_str)?;
-                                            Some(TaskSummary {
-                                                id: id.to_string(),
-                                                task_type: t
-                                                    .get("task_type")
-                                                    .and_then(Value::as_str)
-                                                    .unwrap_or("")
-                                                    .to_string(),
-                                                description: t
-                                                    .get("description")
-                                                    .and_then(Value::as_str)
-                                                    .unwrap_or("")
-                                                    .to_string(),
-                                                ambient: t
-                                                    .get("ambient")
-                                                    .and_then(Value::as_bool)
-                                                    .unwrap_or(false),
-                                            })
+                            // A missing/non-array `tasks` field is not an empty set:
+                            // emitting TasksChanged with [] would REPLACE-wipe
+                            // genuinely running tasks in the reader and panel.
+                            if let Some(arr) = value.get("tasks").and_then(Value::as_array) {
+                                let tasks = arr
+                                    .iter()
+                                    .filter_map(|t| {
+                                        let id = t.get("task_id").and_then(Value::as_str)?;
+                                        Some(TaskSummary {
+                                            id: id.to_string(),
+                                            task_type: t
+                                                .get("task_type")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("")
+                                                .to_string(),
+                                            description: t
+                                                .get("description")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("")
+                                                .to_string(),
+                                            ambient: t
+                                                .get("ambient")
+                                                .and_then(Value::as_bool)
+                                                .unwrap_or(false),
                                         })
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            out.push(EngineEvent::TasksChanged { tasks });
+                                    })
+                                    .collect();
+                                out.push(EngineEvent::TasksChanged { tasks });
+                            }
                         }
                         // `task_updated` carries a wire-safe merge subset with no
                         // stable schema; status converges via task_notification

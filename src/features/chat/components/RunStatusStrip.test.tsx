@@ -489,7 +489,8 @@ describe("RunStatusStrip", () => {
     );
     await renderStrip("claude");
 
-    expect(pill("子代理").textContent).toContain("1/3");
+    // Settled over total: 1 running, 1 completed, 1 failed → 2/3.
+    expect(pill("子代理").textContent).toContain("2/3");
     await click(pill("子代理"));
     const panel = container.querySelector("[data-testid='run-status-subagents']")?.textContent;
     expect(panel).toContain("general-purpose");
@@ -529,7 +530,9 @@ describe("RunStatusStrip", () => {
     ]);
     await renderStrip("claude");
     // The only task is dead: the pill must not claim something is running.
-    expect(pill("子代理").textContent).toContain("0/1");
+    // Settled semantics: the failed step counts toward the numerator (1/1) —
+    // what matters is that nothing claims to be running.
+    expect(pill("子代理").textContent).toContain("1/1");
     expect(container.querySelector(".animate-ping")).toBeNull();
 
     await click(pill("子代理"));

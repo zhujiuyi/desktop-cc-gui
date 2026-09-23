@@ -1,14 +1,8 @@
-import { useMemo } from "react";
 import Activity from "lucide-react/dist/esm/icons/activity";
 import FolderSymlink from "lucide-react/dist/esm/icons/folder-symlink";
 import GitBranch from "lucide-react/dist/esm/icons/git-branch";
 import i18n from "@/lib/i18n";
-import {
-  compareByOrder,
-  panelTabRegistry,
-  useRegistry,
-  type PanelTabDef,
-} from "@ccgui/plugin-sdk";
+import { panelTabRegistry } from "@ccgui/plugin-sdk";
 import { FilesPanel } from "@/features/files/FilesPanel";
 import { ChangesPanel } from "@/features/git/ChangesPanel";
 import { BackgroundTasksPanel } from "./components/BackgroundTasksPanel";
@@ -48,23 +42,6 @@ panelTabRegistry.register({
   component: BackgroundTasksPanel,
 });
 
-/** Registry entries in display order (compareByOrder: undefined order sorts
- *  last, ties by id). Shared by ChatPanelHeader's pills and ChatSidePanel's
- *  panels so both always agree on tab order. */
-export function useSortedPanelTabs(): PanelTabDef[] {
-  const tabs = useRegistry(panelTabRegistry);
-  return useMemo(() => [...tabs].sort(compareByOrder), [tabs]);
-}
-
-/** Read-side fallback for the persisted active tab: a plugin tab can vanish
- *  (plugin unloaded/quarantined) while its id stays in layout state, which
- *  would hide every panel and blank the sidebar. Resolve to the first tab
- *  instead. Deliberately NOT written back — the stale id re-resolves if the
- *  plugin returns. */
-export function resolveActivePanelTab(
-  tabs: PanelTabDef[],
-  activeId: string,
-): string | undefined {
-  if (tabs.some((tab) => tab.id === activeId)) return activeId;
-  return tabs[0]?.id;
-}
+/* Sorting (useSortedPanelTabs) and the persisted-tab fallback
+ * (resolveActivePanelTab) live in ./use-panel-tabs — the single source both
+ * ChatPanelHeader and ChatSidePanel consume. Do not re-add copies here. */

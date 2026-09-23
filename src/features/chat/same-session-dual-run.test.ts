@@ -3,6 +3,7 @@ import type { EngineEventPayload } from "@/lib/events";
 import { useChatStore } from "./store";
 import {
   handleEngineEvents,
+  settleOrphanedRuns,
   settledRuns,
   type EngineEventDeps,
 } from "./store/engine-events";
@@ -148,7 +149,8 @@ describe("same-session dual run", () => {
     const claimed = session().currentRunId;
     expect(claimed).toBeTruthy();
     expect(session().streaming).toBe(true);
-
+    // B 的开始终结 A 的后台等待：awaitingTasks 不得带着旧标志进入新回合。
+    expect(session().awaitingTasks).toBe(false);
     // A 的通知轮照旧在 B 流式期间到达，但会话已归 B。
     handleEngineEvents([
       ev(RUN_A, "delta", 4, "工作流完成："),
@@ -164,6 +166,34 @@ describe("same-session dual run", () => {
     handleEngineEvents([ev(claimed!, "done", 6, { usage: null, backgroundTasks: 0 })], deps());
     expect(session().streaming).toBe(false);
     expect(session().currentRunId).toBeNull();
+  });
+
+  it("reaps an older run without clearing the newer owner's retry state", () => {
+    settleRunAOnBackground();
+    handleEngineEvents([ev(RUN_B, "delta", 1, "B 正文")], deps());
+    handleEngineEvents(
+      [ev(RUN_B, "retry", 2, { attempt: 1, max: 3, message: "重试中 (1/3)" })],
+      deps(),
+    );
+    expect(session().currentRunId).toBe(RUN_B);
+    expect(useChatStore.getState().retryingByKey[KEY]).toBe(true);
+
+    settleOrphanedRuns(useChatStore.setState, [[RUN_A, KEY]]);
+
+    expect(session()).toMatchObject({
+      currentRunId: RUN_B,
+      streaming: true,
+      retry: { attempt: 1, max: 3 },
+    });
+    expect(useChatStore.getState().streamingByKey[KEY]).toBe(true);
+    expect(useChatStore.getState().retryingByKey[KEY]).toBe(true);
+    expect(session().tasks.find((task) => task.id === "w1")?.status).toBe("interrupted");
+
+    // The retryingKeys fast-path must survive too, so B's next output can clear
+    // the retry marker rather than leaving stale progress in the session.
+    handleEngineEvents([ev(RUN_B, "delta", 3, "B 恢复输出")], deps());
+    expect(session().retry).toBeNull();
+    expect(useChatStore.getState().retryingByKey[KEY]).toBeUndefined();
   });
 
   it("lets a run take over a session whose claim was already settled", () => {

@@ -584,6 +584,11 @@ export const ProcessDisclosure = memo(function ProcessDisclosure({
             )}
             <span className={liveCollapsed ? "agent-progress-loading-text" : undefined}>
               {label}
+              {/* The marquee is purely visual: announce the still-working
+                  state to screen readers while folded and streaming. */}
+              {liveCollapsed && (
+                <span className="sr-only">{` (${t("chat.tasks.status.running")})`}</span>
+              )}
             </span>
             <ChevronRight
               className={cx("size-3.5 transition-transform duration-200", expanded && "rotate-90")}
