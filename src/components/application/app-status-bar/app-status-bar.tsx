@@ -260,7 +260,7 @@ export function AppStatusBar() {
                 useReleaseNotesTabStore.getState().openTab();
               }}
             >
-              v{version}
+              v{version} · {t("settings.selfBuilt")}
             </button>
           </>
         )}

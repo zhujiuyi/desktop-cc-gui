@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import Activity from "lucide-react/dist/esm/icons/activity";
 import Bot from "lucide-react/dist/esm/icons/bot";
+import Square from "lucide-react/dist/esm/icons/square";
 import TerminalSquare from "lucide-react/dist/esm/icons/terminal-square";
 import Workflow from "lucide-react/dist/esm/icons/workflow";
 import { cx } from "@/utils/cx";
@@ -37,10 +38,23 @@ function StatusBadge({ status }: { status: BackgroundTask["status"] }) {
  *  start, a settled one shows the span it actually ran (updatedAt - startedAt). */
 function TaskRow({ task, now }: { task: BackgroundTask; now: number }) {
   const { t } = useTranslation();
+  const stopBackgroundTask = useChatStore((s) => s.stopBackgroundTask);
+  const [stopping, setStopping] = useState(false);
   const Icon = TYPE_ICON[task.taskType] ?? Activity;
   const duration = formatDuration(
     (task.status === "running" ? now : task.updatedAt) - task.startedAt,
   );
+  const stop = async () => {
+    if (stopping) return;
+    setStopping(true);
+    // A false result (dead process, rejected frame) just re-arms the control:
+    // the row still reads running, so another attempt is legitimate.
+    try {
+      await stopBackgroundTask(task.id);
+    } finally {
+      setStopping(false);
+    }
+  };
   return (
     <div className="flex flex-col gap-0.5 rounded-[6px] px-2 py-1.5 hover:bg-background-tertiary-default/50">
       <div className="flex min-w-0 items-center gap-2">
@@ -59,6 +73,18 @@ function TaskRow({ task, now }: { task: BackgroundTask; now: number }) {
           </span>
         )}
         <StatusBadge status={task.status} />
+        {task.status === "running" && (
+          <button
+            type="button"
+            aria-label={t("chat.tasks.stopTask")}
+            title={t("chat.tasks.stopTask")}
+            disabled={stopping}
+            onClick={stop}
+            className="shrink-0 cursor-pointer rounded p-0.5 text-foreground-icon-tertiary transition-colors hover:text-red-600 disabled:cursor-default disabled:opacity-40"
+          >
+            <Square className="size-3" aria-hidden />
+          </button>
+        )}
       </div>
       {(task.progress || task.lastTool) && (
         <div className="truncate pl-5 text-[11px] text-foreground-icon-tertiary">
@@ -107,20 +133,34 @@ export function BackgroundTasksPanel({ workspacePath }: { workspacePath: string 
     const ticker = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(ticker);
   }, [hasRunning]);
+  const clearSettledTasks = useChatStore((s) => s.clearSettledTasks);
   const groups = groupTasksByRun(tasks);
   if (groups.length === 0) {
     return <div className="p-3 text-xs text-foreground-icon-tertiary">{t("chat.tasks.empty")}</div>;
   }
+  const hasSettled = tasks.some((task) => task.status !== "running");
   return (
-    <div className="flex h-full flex-col overflow-y-auto p-1.5">
-      {groups.map((group) => (
-        <div key={group.runId} className="mb-1.5">
-          <div className="px-2 py-1 text-[11px] text-foreground-icon-tertiary">
-            {t("chat.tasks.turnAt", { time: formatTurnTime(group.startedAt) })}
+    <div className="flex h-full flex-col">
+      <div className="flex shrink-0 items-center justify-end px-1.5 pt-1.5">
+        <button
+          type="button"
+          disabled={!hasSettled}
+          onClick={clearSettledTasks}
+          className="cursor-pointer rounded px-2 py-0.5 text-[11px] text-text-secondary transition-colors hover:bg-background-tertiary-default disabled:cursor-default disabled:opacity-40"
+        >
+          {t("chat.tasks.clearSettled")}
+        </button>
+      </div>
+      <div className="min-h-0 flex-1 overflow-y-auto p-1.5">
+        {groups.map((group) => (
+          <div key={group.runId} className="mb-1.5">
+            <div className="px-2 py-1 text-[11px] text-foreground-icon-tertiary">
+              {t("chat.tasks.turnAt", { time: formatTurnTime(group.startedAt) })}
+            </div>
+            {group.tasks.map((task) => <TaskRow key={task.id} task={task} now={now} />)}
           </div>
-          {group.tasks.map((task) => <TaskRow key={task.id} task={task} now={now} />)}
-        </div>
-      ))}
+        ))}
+      </div>
     </div>
   );
 }

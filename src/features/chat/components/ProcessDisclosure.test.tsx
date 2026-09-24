@@ -57,6 +57,7 @@ async function render(
   props: {
     autoExpand?: boolean;
     turnLive?: boolean;
+    activeRow?: boolean;
     thinkingAutoCollapse?: boolean;
     thinkingAutoExpand?: boolean;
   } = {},
@@ -67,6 +68,7 @@ async function render(
         items={items}
         autoExpand={props.autoExpand ?? true}
         turnLive={props.turnLive}
+        activeRow={props.activeRow}
         thinkingAutoCollapse={props.thinkingAutoCollapse}
         thinkingAutoExpand={props.thinkingAutoExpand}
         processId={1}
@@ -629,5 +631,59 @@ describe("ProcessDisclosure left-to-right marquee on the collapsed streaming row
     expect(container.querySelector(".process-live-thinking-icon")).toBeTruthy();
     expect(container.textContent).toContain("思考");
     expect(container.textContent).toContain("工具调用");
+  });
+});
+
+describe("ProcessDisclosure marquee for a tool-only live phase", () => {
+  // The row is folded (auto-expand off / already settled thinking) and the
+  // turn is still live: the last tool has started but produced no result yet.
+  const props = { turnLive: true, autoExpand: false, thinkingAutoExpand: false, activeRow: true };
+
+  it("shows the marquee while the active row's last step is a running tool", async () => {
+    await render([{ type: "tool", text: "Bash", path: null }], props);
+    expect(headerExpanded()).toBe(false);
+    expect(container.querySelector("button.process-live-marquee")).toBeTruthy();
+    expect(container.querySelector(".process-live-content-live")).toBeTruthy();
+    expect(container.querySelector(".agent-progress-loading-text")).toBeTruthy();
+  });
+
+  it("drops the marquee once the tool's result lands", async () => {
+    await render([{ type: "tool", text: "Bash", path: null, result: "ok" }], props);
+    expect(container.querySelector(".process-live-marquee")).toBeNull();
+  });
+
+  it("drops the marquee once the turn ends", async () => {
+    await render([{ type: "tool", text: "Bash", path: null }], { ...props, turnLive: false });
+    expect(container.querySelector(".process-live-marquee")).toBeNull();
+  });
+
+  it("keeps the marquee off rows that are not the timeline's active one", async () => {
+    await render([{ type: "tool", text: "Bash", path: null }], { ...props, activeRow: false });
+    expect(container.querySelector(".process-live-marquee")).toBeNull();
+  });
+});
+
+describe("ProcessDisclosure bottom collapse control", () => {
+  it("collapses the expanded row from the bottom control", async () => {
+    await render([{ type: "thinking", text: "很长的思考", live: true }], { turnLive: true, autoExpand: true });
+    expect(headerExpanded()).toBe(true);
+    const bottom = container.querySelector<HTMLButtonElement>("button[data-collapse-process]");
+    expect(bottom).toBeTruthy();
+    await act(async () => bottom!.click());
+    expect(headerExpanded()).toBe(false);
+  });
+
+  it("offers the control once a settled row is expanded by hand", async () => {
+    await render(tools(2), { autoExpand: false });
+    expect(container.querySelector("button[data-collapse-process]")).toBeNull();
+    const header = container.querySelector<HTMLButtonElement>("button[aria-expanded]")!;
+    await act(async () => header.click());
+    expect(headerExpanded()).toBe(true);
+    expect(container.querySelector("button[data-collapse-process]")).toBeTruthy();
+  });
+
+  it("hides the control while the row is folded", async () => {
+    await render(tools(2), { autoExpand: false });
+    expect(container.querySelector("button[data-collapse-process]")).toBeNull();
   });
 });

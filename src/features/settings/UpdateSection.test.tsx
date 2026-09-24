@@ -25,15 +25,13 @@ globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 const startUpdateSpy = vi.fn();
 const checkForUpdatesSpy = vi.fn();
 
-describe("UpdateSection update row", () => {
+describe("UpdateSection self-built identity", () => {
   let container: HTMLDivElement;
   let root: Root | null;
 
   beforeEach(() => {
     startUpdateSpy.mockReset();
     checkForUpdatesSpy.mockReset();
-    // The update store is module-level session state: drive it directly and
-    // swap the two actions for spies so button clicks are observable.
     useUpdateStore.setState({
       stage: "idle",
       version: undefined,
@@ -66,53 +64,20 @@ describe("UpdateSection update row", () => {
     });
   }
 
-  function rowButton(label: string): HTMLButtonElement | undefined {
-    return [...container.querySelectorAll("button")].find(
-      (button) => button.textContent?.trim() === label,
-    );
-  }
-
-  it("available: the row carries the version line and its own update CTA", async () => {
-    useUpdateStore.setState({ stage: "available", version: "1.0.6" });
+  it("shows the self-built label and version with no update controls", async () => {
     await render();
 
-    // Previously the row went blank here and the only affordance was the
-    // toast (which the settings shell used to cover).
-    expect(container.textContent).toContain("发现新版本 v1.0.6");
-
-    const cta = rowButton("立即更新");
-    expect(cta).not.toBeUndefined();
-    expect(cta!.disabled).toBe(false);
-
-    await act(async () => cta!.click());
-    expect(startUpdateSpy).toHaveBeenCalledTimes(1);
+    expect(container.textContent).toContain("CC GUI 自建版");
+    expect(container.textContent).toContain("v1.0.5");
+    // 自建线：检查/立即更新入口整体下线，页面上没有可点的更新动作。
+    expect(container.textContent).not.toContain("检查更新");
+    expect(container.textContent).not.toContain("立即更新");
+    expect(container.querySelectorAll("button")).toHaveLength(0);
   });
 
-  it("available: the check button stays available for a re-check", async () => {
-    useUpdateStore.setState({ stage: "available", version: "1.0.6" });
+  it("explains that in-app updates are disabled", async () => {
     await render();
 
-    const check = rowButton("检查更新");
-    expect(check).not.toBeUndefined();
-    await act(async () => check!.click());
-    expect(checkForUpdatesSpy).toHaveBeenCalledWith({ interactive: true });
-  });
-
-  it("downloading: progress replaces the actions instead of offering a race", async () => {
-    useUpdateStore.setState({ stage: "downloading", downloadedBytes: 512, totalBytes: 1024 });
-    await render();
-
-    expect(container.textContent).toContain("正在下载更新… 50%");
-    expect(rowButton("立即更新")!.disabled).toBe(true);
-    expect(rowButton("检查更新")).toBeUndefined();
-  });
-
-  it("error: the row surfaces the failure and offers a retry", async () => {
-    useUpdateStore.setState({ stage: "error", error: "network down" });
-    await render();
-
-    expect(container.textContent).toContain("更新失败：network down");
-    expect(rowButton("立即更新")).toBeUndefined();
-    expect(rowButton("检查更新")!.disabled).toBe(false);
+    expect(container.textContent).toContain("应用内更新已关闭");
   });
 });

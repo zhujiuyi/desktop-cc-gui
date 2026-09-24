@@ -96,6 +96,8 @@ export function createMessagingActions(
   | "clearQueue"
   | "sendQueuedNow"
   | "interrupt"
+  | "clearSettledTasks"
+  | "stopBackgroundTask"
   | "compactContext"
   | "refreshSessionUsage"
 > & {
@@ -805,6 +807,56 @@ export function createMessagingActions(
       // backoff, and Stop must complete immediately (every other caller
       // fires and forgets).
       void get().refreshSessionUsage(key);
+    },
+
+    clearSettledTasks: () => {
+      const { active } = get();
+      if (!active) return;
+      const key = sessionKey(
+        active.engine,
+        active.sessionId,
+        active.workspacePath,
+      );
+      set((s) => {
+        const cur = s.bySession[key] ?? EMPTY_SESSION;
+        const tasks = cur.tasks.filter((t) => t.status === "running");
+        if (tasks.length === cur.tasks.length) return {};
+        return {
+          bySession: {
+            ...s.bySession,
+            [key]: {
+              ...cur,
+              tasks,
+              // Same derivation as withTaskDerived: ambient tasks never drive
+              // the turn-level flag.
+              backgroundActive: tasks.some((t) => t.status === "running" && !t.ambient),
+            },
+          },
+        };
+      });
+    },
+
+    stopBackgroundTask: async (taskId: string) => {
+      const { active } = get();
+      if (!active) return false;
+      const key = sessionKey(
+        active.engine,
+        active.sessionId,
+        active.workspacePath,
+      );
+      const task = (get().bySession[key]?.tasks ?? []).find(
+        (t) => t.id === taskId,
+      );
+      // The row is the authority on which process owns the task: background
+      // tasks outlive the turn that spawned them, so the owning run's key is
+      // the live one — not necessarily the active conversation session id.
+      if (!task) return false;
+      try {
+        await ipc.stopBackgroundTask(task.runId, taskId);
+        return true;
+      } catch {
+        return false;
+      }
     },
 
     compactContext: async (key?: string) => {

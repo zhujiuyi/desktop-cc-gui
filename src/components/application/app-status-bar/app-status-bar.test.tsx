@@ -159,9 +159,11 @@ describe("AppStatusBar version chip", () => {
         root.render(<AppStatusBar />);
       });
       const chip = [...container.querySelectorAll("button")].find(
-        (b) => b.textContent === "v1.0.2",
+        (b) => b.textContent === `v1.0.2 · ${i18n.t("settings.selfBuilt")}`,
       );
       expect(chip).toBeDefined();
+      // 自建线：版本号旁常驻「自建版」，与官方包一眼可分。
+      expect(chip!.textContent).toBe(`v1.0.2 · ${i18n.t("settings.selfBuilt")}`);
       await act(async () => {
         chip!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       });

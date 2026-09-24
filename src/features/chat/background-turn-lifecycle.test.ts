@@ -17,6 +17,7 @@ vi.mock("@/lib/ipc", () => ({
     usageRecord: vi.fn(async () => {}),
     // Only the interrupt path reaches these two.
     interruptSession: vi.fn(async () => true),
+    stopBackgroundTask: vi.fn(async () => true),
     loadSessionPage: vi.fn(async () => ({ messages: [], nextBefore: null })),
   },
 }));
@@ -420,5 +421,56 @@ describe("background turn lifecycle", () => {
     const s = useChatStore.getState().bySession[KEY]!;
     expect(s.awaitingTasks).toBe(false);
     expect(s.streaming).toBe(false);
+  });
+});
+
+describe("stopBackgroundTask", () => {
+  const ACTIVE = { engine: "claude", sessionId: "s-1", workspacePath: "/tmp/ws" };
+
+  beforeEach(() => {
+    runId = `bg-stop-${Date.now()}-${Math.random()}`;
+    localStorage.clear();
+    vi.clearAllMocks();
+    drainSpy = vi.fn();
+    runRouting.clear();
+    settledRuns.clear();
+    useChatStore.setState({
+      openTabs: [], active: null, unseen: {},
+      bySession: { [KEY]: { ...EMPTY_SESSION, streaming: true, turnStartedAt: Date.now(), messages: [{ seq: 1, role: "user", text: "go", ts: null }] } },
+      streamingByKey: { [KEY]: true },
+    });
+  });
+
+  it("sends stop_task to the run that owns the task", async () => {
+    handleEngineEvents(
+      [ev("task_started", 1, { taskId: "w1", taskType: "local_workflow", description: "wf" })],
+      deps(),
+    );
+    useChatStore.setState({ active: ACTIVE });
+    const ok = await useChatStore.getState().stopBackgroundTask("w1");
+    expect(ok).toBe(true);
+    // The owning run's key, not the bare session id: the task's shell lives in
+    // the process that spawned it.
+    expect(ipc.stopBackgroundTask).toHaveBeenCalledWith(runId, "w1");
+  });
+
+  it("returns false and sends nothing for an unknown task id", async () => {
+    useChatStore.setState({ active: ACTIVE });
+    const ok = await useChatStore.getState().stopBackgroundTask("nope");
+    expect(ok).toBe(false);
+    expect(ipc.stopBackgroundTask).not.toHaveBeenCalled();
+  });
+
+  it("returns false when the write to the CLI fails", async () => {
+    handleEngineEvents(
+      [ev("task_started", 1, { taskId: "w1", taskType: "local_workflow", description: "wf" })],
+      deps(),
+    );
+    useChatStore.setState({ active: ACTIVE });
+    vi.mocked(ipc.stopBackgroundTask).mockRejectedValueOnce(
+      new Error("the session is no longer accepting input"),
+    );
+    const ok = await useChatStore.getState().stopBackgroundTask("w1");
+    expect(ok).toBe(false);
   });
 });

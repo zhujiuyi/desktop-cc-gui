@@ -47,6 +47,7 @@ const TimelineRowView = memo(function TimelineRowView({
   workspacePath,
   turnLive,
   autoExpand,
+  activeRow,
   thinkingAutoCollapse,
   thinkingAutoExpand,
   seenTools,
@@ -60,6 +61,9 @@ const TimelineRowView = memo(function TimelineRowView({
    *  one appears, and stays open once the turn settles. Only fed through
    *  when the auto-expand setting allows it (or on a search jump). */
   autoExpand: boolean;
+  /** True on the timeline's last process row, independent of the auto-expand
+   *  setting: the row the live turn is still writing into. */
+  activeRow: boolean;
   /** False keeps a settled thinking row expanded (设置 → 通用 → 行为). */
   thinkingAutoCollapse: boolean;
   /** False keeps streaming process rows collapsed until the user expands
@@ -91,6 +95,7 @@ const TimelineRowView = memo(function TimelineRowView({
         items={row.items}
         autoExpand={autoExpand}
         turnLive={turnLive}
+        activeRow={activeRow}
         thinkingAutoCollapse={thinkingAutoCollapse}
         thinkingAutoExpand={thinkingAutoExpand}
         processId={row.firstSeq}
@@ -702,6 +707,7 @@ export const MessageTimeline = memo(function MessageTimeline({
                         rowKey(rows[item.index]) === lastProcessKey) ||
                       item.index === currentSearchRow
                     }
+                    activeRow={rowKey(rows[item.index]) === lastProcessKey}
                     thinkingAutoCollapse={thinkingAutoCollapse}
                     thinkingAutoExpand={thinkingAutoExpand}
                     seenTools={seenTools}

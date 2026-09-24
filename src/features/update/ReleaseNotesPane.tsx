@@ -4,15 +4,11 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import CircleAlert from "lucide-react/dist/esm/icons/circle-alert";
 import Info from "lucide-react/dist/esm/icons/info";
-import Loader2 from "lucide-react/dist/esm/icons/loader-2";
-import RefreshCcw from "lucide-react/dist/esm/icons/refresh-ccw";
-import { ActionFeedbackIcon, useActionFeedback, type ActionFeedback } from "@/components/base/action-feedback";
-import { Button } from "@/components/base/buttons/button";
 import { cx } from "@/utils/cx";
 import { CHANGELOG_DATA, changelogEntryFor, type ChangelogEntry } from "@/version/changelog";
 import { useReleaseNotesTabStore } from "./notes-tab";
 import { useUpdateDescription } from "./stage-message";
-import { useUpdateStore, type UpdateStage } from "./store";
+import { useUpdateStore } from "./store";
 
 /**
  * Resolve content to display. Shows both EN and ZH when both exist,
@@ -88,23 +84,13 @@ function ReleaseHeader({
   displayVersion,
   displayDate,
   unread,
-  stage,
-  checkFeedback,
-  onUpdate,
-  onCheck,
 }: {
   displayVersion: string | undefined;
   displayDate: string | undefined;
   /** 升级后首启的未读标记：版本号旁挂「新版本」。 */
   unread: boolean;
-  stage: UpdateStage;
-  checkFeedback: ActionFeedback;
-  onUpdate: () => void;
-  onCheck: () => void;
 }) {
   const { t } = useTranslation();
-  const inFlight =
-    stage === "downloading" || stage === "installing" || stage === "restarting";
   return (
     <div className="flex h-12 shrink-0 items-center justify-between gap-3 border-b border-separator-border px-4">
       <div className="flex min-w-0 items-center gap-3">
@@ -124,35 +110,6 @@ function ReleaseHeader({
         )}
       </div>
 
-      <div className="flex shrink-0 items-center gap-2">
-        {stage === "available" && (
-          <Button size="small" variant="primary" onClick={onUpdate}>
-            {t("settings.updateNow")}
-          </Button>
-        )}
-        {inFlight && (
-          <Loader2
-            className="size-4 shrink-0 animate-spin text-foreground-icon-secondary"
-            aria-hidden
-          />
-        )}
-        <Button
-          size="small"
-          variant="secondary"
-          disabled={stage === "checking" || inFlight}
-          onClick={onCheck}
-        >
-          <span className="flex items-center gap-1.5">
-            <ActionFeedbackIcon
-              icon={RefreshCcw}
-              feedback={checkFeedback}
-              spin
-              iconClassName="size-3.5"
-            />
-            {t("settings.checkUpdates")}
-          </span>
-        </Button>
-      </div>
     </div>
   );
 }
@@ -229,11 +186,6 @@ export function ReleaseNotesPane() {
   const error = useUpdateStore((s) => s.error);
   const latestVersion = useUpdateStore((s) => s.latestVersion);
   const latestPubDate = useUpdateStore((s) => s.latestPubDate);
-  const startUpdate = useUpdateStore((s) => s.startUpdate);
-  const checkForUpdates = useUpdateStore((s) => s.checkForUpdates);
-  // 检查更新是刷新型动作：转圈 → 对号（§4.1）。检查失败（stage error）不出
-  // 对号，失败信息由结果行用 role="alert" 说明。
-  const checkAction = useActionFeedback({ spin: true });
 
   // 页签标题上的版本：优先本次检测结果，其次是最近一次发现的快照，再次是升级
   // 后首启宣布的未读版本，最后才是本地最新条目（手动打开、还没有任何更新检查时）。
@@ -260,16 +212,6 @@ export function ReleaseNotesPane() {
         displayVersion={displayVersion}
         displayDate={displayDate}
         unread={unreadVersion !== undefined}
-        stage={stage}
-        checkFeedback={checkAction.feedback}
-        onUpdate={() => void startUpdate()}
-        onCheck={() =>
-          void checkAction.start(
-            () => checkForUpdates({ interactive: true }),
-            // 非抛错型动作把失败写进 store（store.ts 的 error 分支）。
-            () => useUpdateStore.getState().stage === "error",
-          )
-        }
       />
       <ReleaseDescription description={description} failed={failed} />
       <ReleaseBody body={body} parts={parts} />

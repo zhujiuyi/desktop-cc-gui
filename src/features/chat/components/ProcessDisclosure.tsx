@@ -4,6 +4,7 @@ import type { TFunction } from "i18next";
 import { useReducedMotion } from "motion/react";
 import Brain from "lucide-react/dist/esm/icons/brain";
 import ChevronRight from "lucide-react/dist/esm/icons/chevron-right";
+import ChevronUp from "lucide-react/dist/esm/icons/chevron-up";
 import { cx } from "@/utils/cx";
 import { StepRow, type TaskListChip } from "@/components/application/task-list/task-list";
 import { getFileTreeIconSvg } from "@/features/files/fileIcons";
@@ -489,6 +490,7 @@ export const ProcessDisclosure = memo(function ProcessDisclosure({
   items,
   autoExpand = false,
   turnLive = false,
+  activeRow = false,
   thinkingAutoCollapse = true,
   thinkingAutoExpand = true,
   processId,
@@ -501,6 +503,11 @@ export const ProcessDisclosure = memo(function ProcessDisclosure({
    *  thinking settles even mid-turn; this only keeps pre-thinking content
    *  (early tool rows) mounted until the turn ends. */
   turnLive?: boolean;
+  /** True on the timeline's last process row — the one the live turn is
+   *  still writing into (independent of the auto-expand setting). With
+   *  `turnLive` and a trailing tool that has not reported a result yet, the
+   *  folded row reads "work in flight". */
+  activeRow?: boolean;
   /** True (default): fold the row when its thinking settles. False (设置 →
    *  通用 → 行为): keep the settled thinking expanded so the timeline does
    *  not jump shut; the user can still fold it by hand. */
@@ -557,9 +564,18 @@ export const ProcessDisclosure = memo(function ProcessDisclosure({
     const timeout = window.setTimeout(() => setBodyMounted(false), PROCESS_COLLAPSE_MS);
     return () => window.clearTimeout(timeout);
   }, [showBody, skipProcessAnimation]);
-  // Folded while this row's own thinking still streams: mark the header so
+  // Folded while this row's own work is still in flight: mark the header so
   // CSS can dress it with the live ring (decorative "still working" cue).
-  const liveCollapsed = !expanded && hasLiveThinking;
+  // Besides streaming thinking, a trailing tool call that has not produced a
+  // result yet counts — a tools-only phase must keep the cue, not drop it the
+  // moment the thinking settles.
+  const lastItem = items[items.length - 1];
+  const toolInFlight =
+    turnLive &&
+    activeRow &&
+    lastItem?.type === "tool" &&
+    lastItem.result === undefined;
+  const liveCollapsed = !expanded && (hasLiveThinking || toolInFlight);
   return (
     <div className="mb-1.5 flex flex-col">
       <button
@@ -625,6 +641,21 @@ export const ProcessDisclosure = memo(function ProcessDisclosure({
           ) : null}
         </div>
       </div>
+      {/* Bottom collapse affordance: sticky at the viewport bottom while this
+          row is scrolled through, so a very long expanded run can be folded
+          without scrolling all the way back up to the header. */}
+      {expanded ? (
+        <button
+          type="button"
+          data-collapse-process
+          aria-label={t("chat.collapseProcess")}
+          title={t("chat.collapseProcess")}
+          onClick={toggleExpanded}
+          className="sticky bottom-3 z-10 mx-auto mt-1 flex size-6 cursor-pointer items-center justify-center rounded-full border border-background-tertiary-default bg-background-primary-default/90 text-foreground-icon-secondary shadow-sm transition-colors hover:text-text-primary"
+        >
+          <ChevronUp className="size-3.5" aria-hidden />
+        </button>
+      ) : null}
     </div>
   );
 });

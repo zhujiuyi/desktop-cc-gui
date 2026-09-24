@@ -383,6 +383,7 @@ pub fn run() {
             engine::send_message,
             engine::interrupt_session,
             engine::answer_question,
+            engine::stop_background_task,
             engine::list_engines,
             engine::models::list_engine_models,
             engine::pi_family_auth::pi_family_auth_list,

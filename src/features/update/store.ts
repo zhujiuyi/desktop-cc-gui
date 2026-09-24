@@ -106,11 +106,19 @@ async function closeUpdateHandle(update: Update | null) {
   }
 }
 
+/** 自建线开关：true＝应用内更新彻底关闭。显式标注 boolean，避免字面量类型
+ *  把后面的实现标记成不可达代码。 */
+const UPDATES_DISABLED: boolean = true;
+
 export const useUpdateStore = create<UpdateStore>((set, get) => ({
   stage: "idle",
   downloadedBytes: 0,
 
   checkForUpdates: async (options) => {
+    // 自建线：应用内更新已彻底关闭——自动检查与手动入口均已移除，tauri.conf
+    // 的 updater endpoint 同步摘除。整个机制保留（将来想恢复时少动刀），运行
+    // 时由这里短路兜底：任何漏网调用都不得触网。
+    if (UPDATES_DISABLED) return;
     // The LAN web-access frontend has no native shell to update; the desktop
     // host serves it, so update checks are meaningless there.
     if (isWeb) return;

@@ -2,9 +2,18 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/lib/i18n";
+import { ipc } from "@/lib/ipc";
 import { sessionKey, useChatStore } from "../store";
 import { EMPTY_SESSION, type BackgroundTask } from "../store/stream";
 import { BackgroundTasksLine, BackgroundTasksPanel } from "./BackgroundTasksPanel";
+
+vi.mock("@/lib/ipc", () => ({
+  ipc: {
+    stopBackgroundTask: vi.fn(async () => true),
+    rescanSessions: vi.fn(async () => {}),
+    usageRecord: vi.fn(async () => {}),
+  },
+}));
 
 // React's act() environment flag — same boundary as RunStatusStrip.test.tsx.
 const actEnvironment = globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean };
@@ -183,5 +192,57 @@ describe("BackgroundTasksPanel", () => {
     const dot = container.querySelector(".animate-pulse");
     expect(dot).not.toBeNull();
     expect(dot!.className).toContain("motion-reduce:animate-none");
+  });
+
+  /** 清空按钮：只清已结束的行，运行中的一行都不许动。 */
+  it("clears settled rows from the toolbar and keeps running ones", async () => {
+    seed(TASKS);
+    await renderPanel();
+    const clear = Array.from(container.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("清空已结束"),
+    ) as HTMLButtonElement | undefined;
+    expect(clear).toBeTruthy();
+    expect(clear!.disabled).toBe(false);
+    await act(async () => {
+      clear!.click();
+    });
+    const tasks = useChatStore.getState().bySession[KEY]!.tasks;
+    expect(tasks.map((t) => t.id)).toEqual(["w"]);
+  });
+
+  it("disables the clear control while nothing has settled", async () => {
+    seed([task({ id: "only", status: "running" })]);
+    await renderPanel();
+    const clear = Array.from(container.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("清空已结束"),
+    ) as HTMLButtonElement | undefined;
+    expect(clear).toBeTruthy();
+    expect(clear!.disabled).toBe(true);
+  });
+
+  /** 停止按钮：只出现在运行中的行，点击把该任务的 runId 交给 stop_task。 */
+  it("offers stop on running rows only and disables it while the request is in flight", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = () => resolve();
+    });
+    vi.mocked(ipc.stopBackgroundTask).mockImplementationOnce(() => gate);
+    seed(TASKS);
+    await renderPanel();
+    const stops = container.querySelectorAll('button[aria-label="停止任务"]');
+    // Only the running row ("w") carries the control; the completed row has none.
+    expect(stops).toHaveLength(1);
+    const stop = stops[0] as HTMLButtonElement;
+    expect(stop.disabled).toBe(false);
+    await act(async () => {
+      stop.click();
+    });
+    expect(ipc.stopBackgroundTask).toHaveBeenCalledWith("old", "w");
+    // The request is still in flight: the control must not accept a second one.
+    expect((container.querySelector('button[aria-label="停止任务"]') as HTMLButtonElement).disabled).toBe(true);
+    await act(async () => {
+      release();
+    });
+    expect((container.querySelector('button[aria-label="停止任务"]') as HTMLButtonElement).disabled).toBe(false);
   });
 });

@@ -24,7 +24,7 @@ describe("pet state aggregation", () => {
     expect(states[0]?.activity).toBe("thinking");
   });
 
-  it("prioritizes terminal failures over waiting", () => {
+  it("keeps waiting ahead of a sibling task failure", () => {
     expect(
       firstStatus(
         chat({
@@ -36,7 +36,7 @@ describe("pet state aggregation", () => {
         }),
         mission({}),
       ),
-    ).toBe("failed");
+    ).toBe("waiting");
   });
 
   it("shows resumed session activity after a child task failed", () => {
@@ -46,6 +46,85 @@ describe("pet state aggregation", () => {
           error: null,
           streaming: true,
           backgroundActive: false,
+          awaitingTasks: false,
+          tasks: [{ status: "failed" }],
+          messages: [],
+        }),
+        mission({}),
+      ),
+    ).toBe("running");
+  });
+
+  it("shows a failed task while the session sits idle", () => {
+    expect(
+      firstStatus(
+        chat({
+          error: null,
+          streaming: false,
+          backgroundActive: false,
+          awaitingTasks: false,
+          tasks: [{ status: "failed" }],
+          messages: [],
+        }),
+        mission({}),
+      ),
+    ).toBe("failed");
+  });
+
+  it("drops the failure once a newer task settles", () => {
+    const states = derivePetStates(
+      chat({
+        error: null,
+        streaming: false,
+        backgroundActive: false,
+        awaitingTasks: false,
+        // Array order is start order: the later task's completion supersedes
+        // the earlier failure — the pet must not pin 任务失败 forever.
+        tasks: [{ status: "failed" }, { status: "completed" }],
+        messages: [],
+      }),
+      mission({}),
+    );
+    expect(states).toHaveLength(0);
+  });
+
+  it("does not read an interrupted task as a failure", () => {
+    const states = derivePetStates(
+      chat({
+        error: null,
+        streaming: false,
+        backgroundActive: false,
+        awaitingTasks: false,
+        tasks: [{ status: "interrupted" }],
+        messages: [],
+      }),
+      mission({}),
+    );
+    expect(states).toHaveLength(0);
+  });
+
+  it("ignores an ambient task's failure", () => {
+    const states = derivePetStates(
+      chat({
+        error: null,
+        streaming: false,
+        backgroundActive: false,
+        awaitingTasks: false,
+        tasks: [{ status: "failed", ambient: true }],
+        messages: [],
+      }),
+      mission({}),
+    );
+    expect(states).toHaveLength(0);
+  });
+
+  it("prefers background activity over a stale failure", () => {
+    expect(
+      firstStatus(
+        chat({
+          error: null,
+          streaming: false,
+          backgroundActive: true,
           awaitingTasks: false,
           tasks: [{ status: "failed" }],
           messages: [],
@@ -84,6 +163,36 @@ describe("pet state aggregation", () => {
         }),
       ),
     ).toBe("failed");
+  });
+
+  it("keeps an active mission run's human wait ahead of a failed sibling", () => {
+    expect(
+      firstStatus(
+        chat({ error: null, streaming: false, backgroundActive: false, awaitingTasks: false, tasks: [] }),
+        mission({
+          run: {
+            endedAt: undefined,
+            cancelled: false,
+            tasks: [{ status: "failed" }, { status: "waiting_human" }],
+          },
+        }),
+      ),
+    ).toBe("waiting");
+  });
+
+  it("keeps a mission run's live work ahead of a failed sibling", () => {
+    expect(
+      firstStatus(
+        chat({ error: null, streaming: false, backgroundActive: false, awaitingTasks: false, tasks: [] }),
+        mission({
+          run: {
+            endedAt: undefined,
+            cancelled: false,
+            tasks: [{ status: "failed" }, { status: "running" }],
+          },
+        }),
+      ),
+    ).toBe("running");
   });
 
   it("ignores finished mission runs instead of pinning a stale state", () => {

@@ -32,6 +32,7 @@ interface PetTaskSignal {
   description?: string;
   progress?: string;
   lastTool?: string;
+  ambient?: boolean;
 }
 
 interface PetSessionCompatibility {
@@ -83,10 +84,12 @@ function runningActivity(sessions: SessionState[]): PetActivity {
 function missionPetStatus(runs: Record<string, MissionRun>): PetStatus | null {
   for (const run of Object.values(runs)) {
     if (run.endedAt !== undefined || run.cancelled) continue;
-    if (run.tasks.some((task) => task.status === "failed" || task.status === "cancelled")) {
-      return "failed";
-    }
+    // An active run is never read as failed: live work or a pending human
+    // decision outranks a failed sibling (same rule as the session side).
+    // `cancelled` tasks are deliberate cancellations, not failures.
     if (run.tasks.some((task) => task.status === "waiting_human")) return "waiting";
+    if (run.tasks.some((task) => task.status === "running")) return "running";
+    if (run.tasks.some((task) => task.status === "failed")) return "failed";
     const status = runStatus(run);
     if (status === "attention") return "waiting";
     if (status === "running") return "running";
@@ -95,8 +98,18 @@ function missionPetStatus(runs: Record<string, MissionRun>): PetStatus | null {
   return null;
 }
 
-function taskIsFailed(status: string): boolean {
-  return status === "failed" || status === "cancelled" || status === "interrupted";
+/** The freshest non-ambient task outcome is a failure. "Freshest" is array
+ *  order (tasks only ever append or update in place), so a later task's
+ *  settlement supersedes an earlier failure — the pet never pins 任务失败
+ *  once newer work has had the last word. `interrupted`/`stopped` are not
+ *  failures — a stop the user asked for must not read as one — and ambient
+ *  monitors never drive the session-facing state. */
+function latestTaskFailed(tasks: PetTaskSignal[]): boolean {
+  for (let i = tasks.length - 1; i >= 0; i--) {
+    if (tasks[i].ambient) continue;
+    return tasks[i].status === "failed";
+  }
+  return false;
 }
 
 function sessionNameFromState(session: SessionState): string | null {
@@ -121,14 +134,13 @@ function stateForSession(
   if (session.streaming || signals.backgroundActive === true) {
     return { ...base, status: "running", activity: runningActivity([session]) };
   }
-  if (
-    session.error ||
-    (signals.tasks ?? []).some((task) => task.status && taskIsFailed(task.status))
-  ) {
-    return { ...base, status: "failed", activity: "failed" };
-  }
+  // A session still waiting on background work is active, not failed: a
+  // sibling task's stale failure must not outrank the wait (2026-09-23 rule).
   if (signals.awaitingTasks === true) {
     return { ...base, status: "waiting", activity: "waiting" };
+  }
+  if (session.error || latestTaskFailed(signals.tasks ?? [])) {
+    return { ...base, status: "failed", activity: "failed" };
   }
   return null;
 }

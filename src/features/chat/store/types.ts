@@ -202,6 +202,10 @@ export interface ChatStore {
   /** Drop every queued message from the active session. */
   clearQueue: () => void;
   interrupt: () => Promise<void>;
+  /** Drop every settled task row of the active session (running rows stay). */
+  clearSettledTasks: () => void;
+  /** Ask the CLI to stop one background task; false when the request never left. */
+  stopBackgroundTask: (taskId: string) => Promise<boolean>;
   archiveSession: (session: SessionMeta) => Promise<void>;
   deleteSession: (engine: string, sessionId: string) => Promise<void>;
   pinSession: (

@@ -290,3 +290,71 @@ describe("background task store", () => {
     expect(tasks.filter((t) => t.status === "running")).toHaveLength(32);
   });
 });
+
+describe("clearSettledTasks", () => {
+  const ACTIVE = { engine: "claude", sessionId: "s-1", workspacePath: "/tmp/ws" };
+
+  beforeEach(() => {
+    runId = `bg-clear-${Date.now()}-${Math.random()}`;
+    localStorage.clear();
+    vi.clearAllMocks();
+    drainSpy = vi.fn();
+    runRouting.clear();
+    useChatStore.setState({
+      openTabs: [],
+      active: null,
+      unseen: {},
+      bySession: {
+        [KEY]: { ...EMPTY_SESSION, streaming: true, messages: [{ seq: 1, role: "user", text: "go", ts: null }] },
+      },
+      streamingByKey: { [KEY]: true },
+    });
+  });
+
+  it("drops settled rows and keeps running ones with backgroundActive intact", () => {
+    handleEngineEvents(
+      [
+        ev("task_started", 2, { taskId: "w1", taskType: "local_workflow", description: "wf" }),
+        ev("task_started", 3, { taskId: "mon", taskType: "local_agent", description: "monitor", ambient: true }),
+        ev("task_started", 4, { taskId: "w2", taskType: "local_bash", description: "cmd" }),
+        ev("task_notification", 5, { taskId: "w1", status: "completed" }),
+        ev("task_notification", 6, { taskId: "mon", status: "completed" }),
+      ],
+      deps(),
+    );
+    useChatStore.setState({ active: ACTIVE });
+    useChatStore.getState().clearSettledTasks();
+    const s = useChatStore.getState().bySession[KEY]!;
+    // Settled rows — ambient or not — are cleared; the running one stays.
+    expect(s.tasks.map((t) => t.id)).toEqual(["w2"]);
+    expect(s.backgroundActive).toBe(true);
+  });
+
+  it("empties the list and drops backgroundActive when nothing is running", () => {
+    handleEngineEvents(
+      [
+        ev("task_started", 2, { taskId: "w1", taskType: "local_workflow", description: "wf" }),
+        ev("task_notification", 3, { taskId: "w1", status: "failed" }),
+      ],
+      deps(),
+    );
+    useChatStore.setState({ active: ACTIVE });
+    useChatStore.getState().clearSettledTasks();
+    const s = useChatStore.getState().bySession[KEY]!;
+    expect(s.tasks).toHaveLength(0);
+    expect(s.backgroundActive).toBe(false);
+  });
+
+  it("does nothing without an active session", () => {
+    handleEngineEvents(
+      [
+        ev("task_started", 2, { taskId: "w1", taskType: "local_workflow", description: "wf" }),
+        ev("task_notification", 3, { taskId: "w1", status: "completed" }),
+      ],
+      deps(),
+    );
+    // beforeEach leaves active = null.
+    useChatStore.getState().clearSettledTasks();
+    expect(useChatStore.getState().bySession[KEY]!.tasks).toHaveLength(1);
+  });
+});

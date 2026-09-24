@@ -1080,6 +1080,11 @@ export const ipc = {
   }) => invoke<SendResult>("send_message", args),
   interruptSession: (sessionId: string) =>
     invoke<boolean>("interrupt_session", { sessionId }),
+  /** Stop one background task (claude control protocol). `sessionId` accepts
+   *  the owning run id or the conversation session id; the task's own
+   *  task_notification(status=stopped) settles the panel row. */
+  stopBackgroundTask: (sessionId: string, taskId: string) =>
+    invoke<void>("stop_background_task", { sessionId, taskId }),
   // 电脑操控 (computer use)
   /** macOS TCC probe. `osPermissionsRequired` is false on Windows/Linux,
    *  where the driver needs no OS grant. */

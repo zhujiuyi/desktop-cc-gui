@@ -222,7 +222,7 @@ settingsRegistry.register({
 settingsRegistry.register({
   id: "update",
   key: "update",
-  label: () => i18n.t("settings.checkUpdates"),
+  label: () => i18n.t("settings.selfBuilt"),
   icon: RefreshCw,
   group: "misc",
   order: 1,

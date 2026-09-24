@@ -133,36 +133,6 @@ describe("ReleaseNotesPane", () => {
     expect(button("立即更新")).toBeUndefined();
   });
 
-  it("checks for updates in place and reports the already-latest result", async () => {
-    // 交互式检查：store 把最新版本与发布时间写进 latestVersion/latestPubDate
-    // （见 store.ts 的 applyNoUpdate），页签跟随呈现。
-    checkForUpdatesSpy.mockImplementation(async () => {
-      useUpdateStore.setState({
-        stage: "latest",
-        latestVersion: "1.0.7",
-        latestPubDate: "2026-09-23T00:00:00Z",
-      });
-    });
-    await render();
-
-    const check = button(i18n.t("settings.checkUpdates"));
-    expect(check).not.toBeUndefined();
-    await act(async () => check!.click());
-
-    expect(checkForUpdatesSpy).toHaveBeenCalledWith({ interactive: true });
-    expect(container.textContent).toContain("当前已是最新版本");
-    // 日期跟随 UI 语言格式化：只断言「vX（… 发布）」结构，不钉死本地化格式。
-    expect(container.textContent).toMatch(/最新版为 v1\.0\.7（.+ 发布）/);
-  });
-
-  it("disables the check while one is already running", async () => {
-    useUpdateStore.setState({ stage: "checking" });
-    await render();
-
-    expect(container.textContent).toContain("正在检查更新…");
-    expect(button(i18n.t("settings.checkUpdates"))!.disabled).toBe(true);
-  });
-
   it("says so instead of borrowing another version's notes", async () => {
     // 检测到的版本清单没带 notes、本地也没有这个版本的条目。版本号不写死
     // 「下一个发布号」——那个号一旦真的进了 CHANGELOG_DATA，这条用例的前提
@@ -176,49 +146,4 @@ describe("ReleaseNotesPane", () => {
     expect(container.textContent).not.toContain(newestMarker);
   });
 
-  it("offers the in-place update while a release is available", async () => {
-    useUpdateStore.setState({
-      stage: "available",
-      version: "1.0.9",
-      notesRelease: { version: "1.0.9", body: "notes" },
-    });
-    await render();
-
-    expect(container.textContent).toContain("发现新版本 v1.0.9");
-    const cta = button("立即更新");
-    expect(cta).not.toBeUndefined();
-
-    await act(async () => cta!.click());
-    expect(startUpdateSpy).toHaveBeenCalledTimes(1);
-  });
-
-  it("swaps the CTA for download progress so it cannot be clicked twice", async () => {
-    useUpdateStore.setState({
-      stage: "downloading",
-      version: "1.0.9",
-      notesRelease: { version: "1.0.9", body: "notes" },
-      downloadedBytes: 512,
-      totalBytes: 1024,
-    });
-    await render();
-
-    expect(container.textContent).toContain("正在下载更新… 50%");
-    expect(button("立即更新")).toBeUndefined();
-  });
-
-  it("surfaces a failed install and keeps the check button as the retry", async () => {
-    useUpdateStore.setState({
-      stage: "error",
-      version: "1.0.9",
-      notesRelease: { version: "1.0.9", body: "notes" },
-      error: "network down",
-    });
-    await render();
-
-    expect(container.textContent).toContain("更新失败：network down");
-    // 失败行是 alert（读屏会报），重试就是页头那个「检查更新」，不再另开一个按钮。
-    const alert = container.querySelector('[role="alert"]');
-    expect(alert?.textContent).toContain("更新失败：network down");
-    expect(button(i18n.t("settings.checkUpdates"))!.disabled).toBe(false);
-  });
 });

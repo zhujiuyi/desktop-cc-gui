@@ -5,8 +5,6 @@ import ChatPage from "@/features/chat/ChatPage";
 import { CommandPalette } from "@/features/commands/CommandPalette";
 import PluginPageHost from "@/features/plugins/manager/PluginPageHost";
 import { bindSystemThemeSync, bindThemeChangePersistence } from "@/features/settings/theme";
-import { UpdateToast } from "@/features/update/UpdateToast";
-import { useUpdateStore } from "@/features/update/store";
 import { announceReleaseAfterUpgrade } from "@/features/update/upgrade-announcement";
 import { GrantAccessDialogHost } from "@/components/dialogs";
 import { startPluginSystem } from "@/features/plugins";
@@ -59,13 +57,8 @@ function MainApp() {
   useEffect(() => {
     void announceReleaseAfterUpgrade();
   }, []);
-  // Background update check after startup settles; dev builds skip it so
-  // `tauri dev` doesn't nag about the published release being newer.
-  useEffect(() => {
-    if (import.meta.env.DEV) return;
-    const id = setTimeout(() => void useUpdateStore.getState().checkForUpdates(), 3000);
-    return () => clearTimeout(id);
-  }, []);
+  // 自建线：启动期的后台更新检查已移除（更新器整体关闭，见 update/store.ts
+  // 的 UPDATES_DISABLED）。
 
   return (
     <LazyMotion features={domAnimation}>
@@ -91,7 +84,6 @@ function MainApp() {
           <Route path="/p/:pageId" element={<PluginPageHost />} />
         </Routes>
       </HashRouter>
-      <UpdateToast />
       <GrantAccessDialogHost />
       <CloseConfirmDialogHost />
       <ShortcutsGuideModal />

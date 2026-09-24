@@ -1135,6 +1135,33 @@ pub async fn interrupt_session(
         .await
         .map_err(|e| e.to_string())
 }
+/// Stop one background task the CLI reported: a `stop_task` control request
+/// on the owning process's stdin. Accepts either the run id or the
+/// conversation session id, like `interrupt_session`. The task's own
+/// `task_notification(status=stopped)` settles the panel row — a success
+/// here only means the frame left. Probe-verified against claude 2.1.278
+/// print-mode workers (local_bash and local_workflow stop without any
+/// `initialize` handshake; see 23 页探针记录).
+#[tauri::command]
+pub async fn stop_background_task(
+    state: tauri::State<'_, crate::AppState>,
+    session_id: String,
+    task_id: String,
+) -> Result<(), String> {
+    let line = stop_task_frame(&uuid::Uuid::new_v4().to_string(), &task_id);
+    state.processes.write_line(&session_id, line).await
+}
+
+/// The `stop_task` control request line, split out so its shape stays under
+/// a unit test — the CLI parses it strictly.
+fn stop_task_frame(request_id: &str, task_id: &str) -> String {
+    serde_json::json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": { "subtype": "stop_task", "task_id": task_id },
+    })
+    .to_string()
+}
 /// Answer a pending question card. Five transports share this command:
 /// - claude (control protocol): the answers merge into the parked tool input
 ///   and ride stdin as a `control_response`.
@@ -1338,6 +1365,25 @@ pub async fn answer_question(
     }
     Ok(())
 }
+#[cfg(test)]
+mod stop_task_tests {
+    use super::stop_task_frame;
+    use serde_json::Value;
+
+    /// The CLI parses this frame strictly (`request_id`, `request.subtype`,
+    /// `request.task_id`); the shape is probe-verified against claude 2.1.278
+    /// print-mode workers (see 23 页探针记录).
+    #[test]
+    fn stop_task_frame_matches_the_control_protocol_shape() {
+        let line = stop_task_frame("req-1", "task-9");
+        let value: Value = serde_json::from_str(&line).expect("valid json");
+        assert_eq!(value["type"], "control_request");
+        assert_eq!(value["request_id"], "req-1");
+        assert_eq!(value["request"]["subtype"], "stop_task");
+        assert_eq!(value["request"]["task_id"], "task-9");
+    }
+}
+
 #[cfg(test)]
 mod permission_tests {
     use super::*;

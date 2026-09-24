@@ -314,15 +314,9 @@ export const builtinSearchEntries: SettingsSearchEntry[] = [
 
   ...shortcutEntries,
 
-  // 检查更新：品牌行没有译文（labelText），检查动作行与页标题同名，不再重复
-  // 一层面包屑。
-  { page: "update", anchor: "appVersion", labelText: "CC GUI" },
-  {
-    page: "update",
-    anchor: "checkUpdates",
-    labelKey: "settings.checkUpdates",
-    keywords: ["update", "version"],
-  },
+  // 自建版：更新页现在只有品牌行（label 走译文键）；更新检查入口已随自建线
+  // 关闭，不再为它建索引项。
+  { page: "update", anchor: "appVersion", labelKey: "settings.selfBuiltName", keywords: ["update", "version"] },
 
   ...betaFeatureEntries,
 
