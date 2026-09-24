@@ -270,7 +270,6 @@ function useGeneralSettingsState() {
     onPetChange,
     importPet,
   };
-<<<<<<< HEAD
 }
 
 /** Appearance card: theme, Windows titlebar + restart, language, thread limit. */

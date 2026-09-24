@@ -196,6 +196,8 @@ describe("same-session dual run", () => {
     handleEngineEvents([ev(RUN_B, "delta", 3, "B 恢复输出")], deps());
     expect(session().retry).toBeNull();
     expect(useChatStore.getState().retryingByKey[KEY]).toBeUndefined();
+  });
+
   it("backfills the dropped completion turn via a transcript reload when the foreign run settles", () => {
     const reload = vi.fn();
     const d = { ...deps(), reloadTranscript: reload };
