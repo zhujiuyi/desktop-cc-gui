@@ -100,6 +100,12 @@ export interface SessionState {
    *  reads as "运行中（后台任务）" and the CLI's completion turn may still
    *  arrive in this run. */
   awaitingTasks: boolean;
+  /** When the CLI reopened a settled-but-awaiting run with content of its own
+   *  (the notification/completion turn it queues after background tasks
+   *  settle). That segment's output is CLI bookkeeping, not a new round of
+   *  the conversation — the pet reads it so a task failure can persist at
+   *  rest instead of being cleared by the model's own receipt. */
+  notificationTurnStartedAt: number | null;
 }
 
 export const EMPTY_SESSION: SessionState = {
@@ -123,6 +129,7 @@ export const EMPTY_SESSION: SessionState = {
   tasks: EMPTY_TASKS,
   backgroundActive: false,
   awaitingTasks: false,
+  notificationTurnStartedAt: null,
 };
 
 /** The model one session runs with, most specific first:

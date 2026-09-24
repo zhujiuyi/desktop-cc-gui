@@ -40,6 +40,7 @@ interface PetSessionCompatibility {
   backgroundActive?: boolean;
   awaitingTasks?: boolean;
   tasks?: PetTaskSignal[];
+  notificationTurnStartedAt?: number | null;
 }
 
 type PetChatState = Pick<ChatStore, "bySession"> &
@@ -117,16 +118,31 @@ function newestNonAmbientTask(tasks: PetTaskSignal[]): PetTaskSignal | null {
   return newest;
 }
 
-/** Parsed timestamp of the conversation's latest dated message; null when no
- *  message carries one (engine-dependent). ts is RFC3339 or epoch millis as
- *  a string. */
-function lastMessageTime(session: SessionState): number | null {
+/** Parsed timestamp of the conversation's latest dated message that counts as
+ *  real activity after `failedAt`; null when there is none (engine-dependent:
+ *  some rows carry no ts). ts is RFC3339 or epoch millis as a string.
+ *
+ *  Messages produced by the CLI's own notification/completion turn — the
+ *  segment reopened after the reply settled (`notificationTurnStartedAt`)
+ *  when no user message intervened — are CLI bookkeeping, not a new round:
+ *  the model's receipt of a task notification must not clear a failure at
+ *  rest. User messages are never excluded. */
+function lastMessageTime(session: SessionState, failedAt: number): number | null {
+  const signals = petSignals(session);
+  const stamp = signals.notificationTurnStartedAt;
+  const excludeFrom =
+    Number.isFinite(failedAt) && typeof stamp === "number" && stamp > failedAt
+      ? stamp
+      : Number.POSITIVE_INFINITY;
   const messages = session.messages ?? [];
   for (let i = messages.length - 1; i >= 0; i--) {
-    const ts = messages[i]?.ts;
+    const message = messages[i];
+    const ts = message?.ts;
     if (!ts) continue;
     const ms = /^\d+$/.test(ts) ? Number(ts) : Date.parse(ts);
-    if (Number.isFinite(ms)) return ms;
+    if (!Number.isFinite(ms)) continue;
+    if (message.role !== "user" && ms >= excludeFrom) continue;
+    return ms;
   }
   return null;
 }
@@ -176,7 +192,7 @@ function stateForSession(
   // 状态持续显示；此后任何新一轮活动都会把它清掉。`interrupted`/`stopped`
   // 不算失败：用户主动停止不是失败。
   if (newest && newest.status === "failed") {
-    const lastAt = lastMessageTime(session);
+    const lastAt = lastMessageTime(session, failedAt);
     // 完全没有时间戳时（旧引擎/夹具）＝没有"后续活动"的证据，保守地按
     // 持续失败处理（与引入时间戳前的行为一致）。
     if (lastAt === null || !Number.isFinite(failedAt) || lastAt <= failedAt) {

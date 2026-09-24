@@ -1597,7 +1597,9 @@ function adoptObservedRun(
       streaming: true,
       turnStartedAt: reopen ? Date.now() : (cur?.turnStartedAt ?? Date.now()),
       currentRunId: event.runId,
-      ...(reopen ? { awaitingTasks: false } : {}),
+      // 重开＝CLI 自排的通知/完成回合（回复已结算、无用户发送）——打下时间戳
+      // 让宠物能把它与真实轮内活动区分开（见 stream.ts 字段注释）。
+      ...(reopen ? { awaitingTasks: false, notificationTurnStartedAt: Date.now() } : {}),
     });
   } else if (contentFrame && !cur.awaitingTasks && turnOwner(cur, key) === null) {
     // Streaming without a claimed run (a session restored without one): the

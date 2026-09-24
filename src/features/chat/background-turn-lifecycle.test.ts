@@ -55,6 +55,25 @@ describe("background turn lifecycle", () => {
     });
   });
 
+  it("stamps the reopened (notification) turn so the pet can tell it apart", () => {
+    handleEngineEvents([
+      ev("delta", 1, "跑起来了"),
+      ev("task_started", 2, { taskId: "w1", taskType: "local_workflow", description: "wf" }),
+      ev("done", 3, { usage: null, backgroundTasks: 1 }),
+    ], deps());
+    expect(
+      useChatStore.getState().bySession[KEY]!.notificationTurnStartedAt ?? null,
+    ).toBeNull();
+
+    // 回复结算后的内容帧＝CLI 自排的通知/完成回合重开了一个段。
+    handleEngineEvents([ev("delta", 4, "任务跑完了")], deps());
+
+    const s = useChatStore.getState().bySession[KEY]!;
+    expect(typeof s.notificationTurnStartedAt).toBe("number");
+    expect(s.awaitingTasks).toBe(false);
+    expect(s.streaming).toBe(true);
+  });
+
   it("keeps the run live after done with background tasks and drains the queue", () => {
     handleEngineEvents([
       ev("delta", 1, "跑起来了"),

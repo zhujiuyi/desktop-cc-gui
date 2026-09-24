@@ -364,6 +364,64 @@ describe("failure flash and round scoping", () => {
     ).toHaveLength(0);
   });
 
+  it("keeps the failure when only the CLI's notification turn followed it", () => {
+    expect(
+      firstStatus(
+        chat({
+          error: null,
+          streaming: false,
+          backgroundActive: false,
+          awaitingTasks: false,
+          tasks: [failedTask(NOW - 20_000)],
+          // 失败后 CLI 自排的通知回合重开了段：模型回执晚于失败，但它不是
+          // "新一轮对话"，不该把收尾持续状态的失败清掉。
+          notificationTurnStartedAt: NOW - 15_000,
+          messages: [
+            {
+              role: "assistant",
+              text: "那个任务失败了。",
+              ts: new Date(NOW - 12_000).toISOString(),
+              seq: 2,
+            },
+          ],
+        }),
+        mission({}),
+        NOW,
+      ),
+    ).toBe("failed");
+  });
+
+  it("clears the failure when a real user round follows it", () => {
+    expect(
+      derivePetStates(
+        chat({
+          error: null,
+          streaming: false,
+          backgroundActive: false,
+          awaitingTasks: false,
+          tasks: [failedTask(NOW - 20_000)],
+          notificationTurnStartedAt: NOW - 15_000,
+          messages: [
+            {
+              role: "assistant",
+              text: "那个任务失败了。",
+              ts: new Date(NOW - 12_000).toISOString(),
+              seq: 2,
+            },
+            {
+              role: "user",
+              text: "知道，继续。",
+              ts: new Date(NOW - 8_000).toISOString(),
+              seq: 3,
+            },
+          ],
+        }),
+        mission({}),
+        NOW,
+      ),
+    ).toHaveLength(0);
+  });
+
   it("drops the old failure once the conversation moved on", () => {
     expect(
       derivePetStates(
