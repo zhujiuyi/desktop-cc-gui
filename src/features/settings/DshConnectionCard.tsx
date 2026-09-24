@@ -47,6 +47,7 @@ export function DshConnectionCard({ dsh }: { dsh: DshHostSectionState }) {
     <div className="flex w-full flex-col gap-2">
       <button
         type="button"
+        data-setting-anchor="dshConnection"
         aria-expanded={connOpen ?? false}
         onClick={() => setConnOpen((open) => !(open ?? true))}
         className="flex w-full cursor-pointer items-center justify-between gap-3 rounded-2lg px-3 py-2 text-left outline-none transition-colors duration-150 hover:bg-background-secondary-hover focus-visible:ring-2 focus-visible:ring-border-focus-ring"
@@ -73,6 +74,7 @@ export function DshConnectionCard({ dsh }: { dsh: DshHostSectionState }) {
       {connOpen && (
         <SettingsCard>
           <SettingsRow
+            anchor="dshCustomPath"
             label={t("settings.dshCustomPath")}
             description={t("settings.dshCustomPathHint")}
           >
@@ -95,6 +97,7 @@ export function DshConnectionCard({ dsh }: { dsh: DshHostSectionState }) {
             </div>
           </SettingsRow>
           <SettingsRow
+            anchor="dshHostAddress"
             label={t("settings.dshHostAddress")}
             description={t("settings.dshHostAddressHint")}
           >
@@ -122,6 +125,7 @@ export function DshConnectionCard({ dsh }: { dsh: DshHostSectionState }) {
             </div>
           </SettingsRow>
           <SettingsRow
+            anchor="dshAutoStart"
             label={t("settings.dshAutoStart")}
             description={t("settings.dshAutoStartHint")}
           >

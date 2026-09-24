@@ -377,6 +377,16 @@ export interface AppSettings {
   codexHome?: string | null;
   /** Max sessions listed per workspace in the sidebar (default 5). */
   sidebarThreadLimit: number;
+  /** UI font: "" = 系统默认 (bundled stack + system fallback), "custom" =
+   *  the uploaded font file in `fontFile`. */
+  fontFamily: string;
+  /** Absolute path of the uploaded UI font file (设置 → 外观). */
+  fontFile: string;
+  /** Code font for chat code blocks and the built-in terminal: "" = 系统默认,
+   *  "custom" = the uploaded code font in `codeFontFile`. */
+  codeFontFamily: string;
+  /** Absolute path of the uploaded code font file. */
+  codeFontFile: string;
   /** Composer send gesture: "enter" (Enter sends) or "cmdEnter" (⌘/Ctrl+Enter sends). */
   composerSendShortcut: string;
   /** Keyboard shortcuts (快捷键), format "cmd+ctrl+alt+shift+key" lowercase;
@@ -486,6 +496,12 @@ export interface MessageSearchPage {
   /** Sessions still awaiting (re)indexing at query time; >0 means the
    *  hit list can grow without the query changing. */
   pending: number;
+  /** Time the query itself took, microseconds — snippet build included,
+   *  bookkeeping counts excluded (see history/search.rs). The palette
+   *  shows it as the search-speed line. */
+  elapsedUs: number;
+  /** Messages in the content index the query ran against. */
+  totalMessages: number;
 }
 /** One entry of the workspace file index (`list_file_index`). */
 export interface FileIndexEntry {
@@ -1008,6 +1024,9 @@ export const ipc = {
     settingsPromise = null;
   },
   listPets: () => invoke<PetSummary[]>("pet_list"),
+  /** Raw bytes of an uploaded font file, base64-encoded (设置 → 外观): the
+   *  webview cannot read the native dialog's file itself. */
+  readFontFile: (path: string) => invoke<string>("read_font_file", { path }),
   importPet: (path: string) => invoke<PetSummary>("pet_import", { path }),
   removePet: (id: string) => invoke<void>("pet_remove", { id }),
   getPetPackage: (id: string) => invoke<PetPackage>("pet_get_package", { id }),

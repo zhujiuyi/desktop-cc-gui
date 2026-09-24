@@ -8,18 +8,16 @@ import type { EngineInfo, PluginInfo } from "@/lib/ipc";
 // from the chat store); the proxy resolves any other method to null so section
 // module imports and the stub page stay inert. Methods a rendered section
 // actually consumes are called out: `pluginReadArtwork` so the plugin
-// rail-icon fallback can be asserted, `listPets` because GeneralSection (the
-// unknown-key fallback) loads the pet list on mount and maps over an array.
-const { pluginReadArtwork, listPets } = vi.hoisted(() => ({
+// rail-icon fallback can be asserted.
+const { pluginReadArtwork } = vi.hoisted(() => ({
   pluginReadArtwork: vi.fn(
     async (_id: string, _path: string): Promise<string> =>
       "data:image/png;base64,AAAA",
   ),
-  listPets: vi.fn(async () => []),
 }));
 vi.mock("@/lib/ipc", () => ({
   ipc: new Proxy(
-    { pluginReadArtwork, listPets },
+    { pluginReadArtwork },
     {
       get: (target, prop) =>
         prop in target ? Reflect.get(target, prop) : async () => null,
@@ -221,13 +219,15 @@ describe("SettingsPage system rail", () => {
       i18n.t("settings.proxy"),
     ]);
 
-    // 其他 holds the release/feedback pages, the 性能诊断 entry and the
-    // 内测功能 gate — engine sections used to lead that group.
+    // 其他 holds the release/feedback pages, the 性能诊断 entry, the
+    // 内测功能 gate and the extracted 桌面宠物 page — engine sections used to
+    // lead that group.
     expect(itemsUnder("settings.groupMisc")).toEqual([
       i18n.t("settings.betaFeatures"),
       i18n.t("settings.checkUpdates"),
       i18n.t("settings.about"),
       i18n.t("diagnostics.title"),
+      i18n.t("settings.pet"),
     ]);
   });
 });
@@ -515,7 +515,7 @@ describe("SettingsPage capabilities rail", () => {
       ).toBe("false");
     } finally {
       // Dropping the stub re-renders the open page back to General (the
-      // unknown-key fallback) and GeneralSection resolves a probe on mount;
+      // unknown-key fallback) and GeneralSection reads settings on mount;
       // flush both inside act like every other render in this file.
       await act(async () => {
         dispose();

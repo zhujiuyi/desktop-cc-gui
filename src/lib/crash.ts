@@ -18,9 +18,10 @@ import { isWeb } from "./transport";
  * the next launch can explain a crash that happened before React mounted.
  *
  * Not every `window` error is a crash: browsers report their own harmless
- * warnings through the same channel (see BENIGN_ERROR_PREFIXES). Those stop
- * at the ring — recording them is diagnostics, surfacing them is a false
- * alarm.
+ * warnings through the same channel (see BENIGN_ERROR_PREFIXES), and
+ * background network requests fail whenever the machine is offline or the
+ * host is unreachable (see BENIGN_NETWORK_PREFIXES). Those stop at the ring —
+ * recording them is diagnostics, surfacing them is a false alarm.
  */
 
 export type CrashSource = "render" | "error" | "unhandledrejection" | "boot";
@@ -35,8 +36,9 @@ export interface CrashReport {
   appVersion?: string;
   userAgent: string;
   /**
-   * Browser noise rather than a failure: kept in the diagnostics ring, never
-   * shown as a crash screen and never mirrored to storage.
+   * Browser noise or an environmental network failure rather than an app
+   * breakage: kept in the diagnostics ring, never shown as a crash screen and
+   * never mirrored to storage.
    */
   benign?: boolean;
 }
@@ -63,6 +65,29 @@ const BENIGN_ERROR_PREFIXES = [
   "ResizeObserver loop completed with undelivered notifications",
   "ResizeObserver loop limit exceeded",
   "Script error",
+];
+
+/**
+ * Environmental network failures — a request that never got a response —
+ * worded by the HTTP stacks this app uses:
+ *
+ *   - `error sending request for url …`: reqwest's Display for connect/DNS/
+ *     TLS failures, forwarded verbatim by Rust commands and the updater
+ *     plugin. The classic case is the background update check failing while
+ *     the machine is offline or GitHub is unreachable.
+ *   - `Load failed` / `Failed to fetch` / `NetworkError …`: the webview's
+ *     own fetch() rejection wording (WebKit / Chromium / Gecko).
+ *
+ * A failed request is a condition of the network, not a broken app: every
+ * feature that issues one (update check, marketplace, …) surfaces its own
+ * failure state, so the global capture records these for diagnostics but
+ * never puts up the crash screen.
+ */
+const BENIGN_NETWORK_PREFIXES = [
+  "error sending request for url",
+  "Load failed",
+  "Failed to fetch",
+  "NetworkError when attempting to fetch resource",
 ];
 
 let seq = 0;
@@ -165,7 +190,10 @@ export function publishCrash(report: CrashReport): void {
 }
 
 function isBenignErrorMessage(message: string): boolean {
-  return BENIGN_ERROR_PREFIXES.some((prefix) => message.startsWith(prefix));
+  return (
+    BENIGN_ERROR_PREFIXES.some((prefix) => message.startsWith(prefix)) ||
+    BENIGN_NETWORK_PREFIXES.some((prefix) => message.startsWith(prefix))
+  );
 }
 
 export function reportCrash(
@@ -238,26 +266,25 @@ export function installGlobalCrashHandlers(): void {
   if (installed || typeof window === "undefined") return;
   installed = true;
 
+  // One capture path for both global events: classify the message, then flag
+  // browser noise and environmental network failures as benign (ring only).
+  // The same wording thrown during render is still an app bug — the React
+  // boundary reports those itself and never goes through here.
+  const capture = (source: CrashSource, raw: unknown) => {
+    const report = createCrashReport(source, raw);
+    if (isBenignErrorMessage(report.message)) report.benign = true;
+    publishCrash(report);
+  };
+
   window.addEventListener("error", (event) => {
     // Resource load failures (img/script) surface as `error` events on the
     // element with no Error object — not app crashes; ignore them.
     if (!event.error && !event.message) return;
-    const raw = event.error ?? event.message;
-
-    // Classify the event's own wording: the same text in a rejection or a
-    // render throw is an app bug and still deserves the crash screen.
-    if (isBenignErrorMessage(normalize(raw).message)) {
-      const report = createCrashReport("error", raw);
-      report.benign = true;
-      publishCrash(report);
-      return;
-    }
-
-    reportCrash("error", raw);
+    capture("error", event.error ?? event.message);
   });
 
   window.addEventListener("unhandledrejection", (event) => {
-    reportCrash("unhandledrejection", event.reason);
+    capture("unhandledrejection", event.reason);
   });
 }
 

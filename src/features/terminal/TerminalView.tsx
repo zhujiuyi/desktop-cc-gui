@@ -4,7 +4,8 @@ import { useTranslation } from "react-i18next";
 import { isMacPlatform } from "@/features/shortcuts/shortcuts";
 import { ipc } from "@/lib/ipc";
 import { loadXterm, type XtermModules } from "./xterm-loader";
-import { TERMINAL_FONT_FAMILY, terminalTheme } from "./appearance";
+import { terminalFontFamily, terminalTheme } from "./appearance";
+import { FONT_CHANGE_EVENT } from "@/features/settings/font";
 import { createPathLinkProvider } from "./links";
 import { TerminalContextMenu, type TerminalMenuState } from "./TerminalContextMenu";
 import {
@@ -59,11 +60,12 @@ export const TerminalView = memo(function TerminalView({ id, cwd }: { id: string
     let linkDisposable: IDisposable | null = null;
     let resizeObserver: ResizeObserver | null = null;
     let themeObserver: MutationObserver | null = null;
+    let fontListener: (() => void) | null = null;
     let disposed = false;
     try {
       const { Terminal, FitAddon, WebglAddon } = xterm;
       const term = new Terminal({
-        fontFamily: TERMINAL_FONT_FAMILY,
+        fontFamily: terminalFontFamily(),
         fontSize: 12,
         cursorBlink: true,
         scrollback: 5000,
@@ -169,6 +171,13 @@ export const TerminalView = memo(function TerminalView({ id, cwd }: { id: string
         attributes: true,
         attributeFilter: ["class"],
       });
+      // Follow 设置 → 通用 → 外观 → 代码字体 changes live.
+      const onFontChange = () => {
+        term.options.fontFamily = terminalFontFamily();
+        safeFit();
+      };
+      window.addEventListener(FONT_CHANGE_EVENT, onFontChange);
+      fontListener = onFontChange;
     } catch (e: unknown) {
       setError(String(e));
     }
@@ -180,6 +189,7 @@ export const TerminalView = memo(function TerminalView({ id, cwd }: { id: string
       linkDisposable?.dispose();
       resizeObserver?.disconnect();
       themeObserver?.disconnect();
+      if (fontListener) window.removeEventListener(FONT_CHANGE_EVENT, fontListener);
       if (termRef) {
         setTerminalWriter(id, null);
         termRef.dispose();

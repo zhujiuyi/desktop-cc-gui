@@ -8,7 +8,8 @@ import {
 import { Select, SelectItem } from "@/components/base/select/select";
 import type { Workspace, WorkspaceGroup } from "@/lib/ipc";
 
-/** Compact select trigger (h 32, radius/lg), matching GeneralSection rows. */
+/** Compact select trigger (h 32, radius/lg), matching the settings pages'
+ *  (外观 / 对话与输入) rows. */
 const SELECT_TRIGGER = "h-8 w-auto gap-1 rounded-lg px-2 py-1.5";
 
 /** Per-project group assignment list. A group dropdown with only "未分组" is
@@ -26,7 +27,7 @@ export function WorkspaceProjectsCard({
   if (groups.length === 0 || workspaces.length === 0) return null;
   return (
     <div className="flex w-full flex-col gap-2">
-      <SettingsSectionLabel>
+      <SettingsSectionLabel anchor="projects">
         {t("settings.projects")}
         <span className="ml-2 text-body-2-regular font-normal text-text-tertiary">
           {t("settings.projectsDesc")}

@@ -1,9 +1,11 @@
 import { useTranslation } from "react-i18next";
+import ChevronDown from "lucide-react/dist/esm/icons/chevron-down";
+import ChevronUp from "lucide-react/dist/esm/icons/chevron-up";
 import ImageIcon from "lucide-react/dist/esm/icons/image";
 import ListOrdered from "lucide-react/dist/esm/icons/list-ordered";
 import SendHorizontal from "lucide-react/dist/esm/icons/send-horizontal";
 import X from "lucide-react/dist/esm/icons/x";
-import type { QueuedMessage } from "@/features/chat/store";
+import type { QueuedMessage, QueueMoveDirection } from "@/features/chat/store";
 import { cx } from "@/utils/cx";
 
 /**
@@ -15,6 +17,11 @@ import { cx } from "@/utils/cx";
  */
 
 const PREVIEW_LIMIT = 120;
+
+/** Reorder arrows share the row-action look; the end-of-list one is disabled
+ *  (cursor + dim) rather than unmounted so the control keeps its place. */
+const REORDER_BUTTON =
+  "flex size-5 cursor-pointer items-center justify-center rounded-full text-foreground-icon-tertiary transition-colors motion-reduce:transition-none hover:bg-background-secondary-hover hover:text-foreground-icon-primary disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-foreground-icon-tertiary";
 
 function preview(text: string): string {
   const normalized = text.replace(/\s+/g, " ").trim();
@@ -30,12 +37,16 @@ export interface MessageQueueProps {
    *  stopped first, since an engine takes one prompt at a time. Row button
    *  only renders when provided. */
   onSendNow?: (id: string) => void;
+  /** Move one row a single step inside the card; arrows only render when
+   *  provided and more than one message is queued. Directions are
+   *  screen-relative ("up" = toward the top of the card = sent later). */
+  onMove?: (id: string, direction: QueueMoveDirection) => void;
   /** Clear every queued message; header button only renders when provided. */
   onClear?: () => void;
   className?: string;
 }
 
-export function MessageQueue({ queue, onRemove, onSendNow, onClear, className }: MessageQueueProps) {
+export function MessageQueue({ queue, onRemove, onMove, onSendNow, onClear, className }: MessageQueueProps) {
   const { t } = useTranslation();
   if (queue.length === 0) return null;
 
@@ -67,6 +78,9 @@ export function MessageQueue({ queue, onRemove, onSendNow, onClear, className }:
       <div className="flex max-h-28 flex-col gap-0.5 overflow-y-auto px-1.5 pb-1.5">
         {[...queue].reverse().map((item, reversedIndex) => {
           const position = queue.length - reversedIndex;
+          // Top row is the last queued message, bottom row the next to send.
+          const canMoveUp = reversedIndex > 0;
+          const canMoveDown = reversedIndex < queue.length - 1;
           return (
             <div
               key={item.id}
@@ -92,6 +106,30 @@ export function MessageQueue({ queue, onRemove, onSendNow, onClear, className }:
                 {preview(item.text)}
               </span>
               <span className="flex shrink-0 items-center gap-0.5">
+                {onMove && queue.length > 1 && (
+                  <>
+                    <button
+                      type="button"
+                      aria-label={t("chat.queueMoveUp")}
+                      title={t("chat.queueMoveUp")}
+                      disabled={!canMoveUp}
+                      onClick={() => onMove(item.id, "up")}
+                      className={REORDER_BUTTON}
+                    >
+                      <ChevronUp className="size-3.5" aria-hidden />
+                    </button>
+                    <button
+                      type="button"
+                      aria-label={t("chat.queueMoveDown")}
+                      title={t("chat.queueMoveDown")}
+                      disabled={!canMoveDown}
+                      onClick={() => onMove(item.id, "down")}
+                      className={REORDER_BUTTON}
+                    >
+                      <ChevronDown className="size-3.5" aria-hidden />
+                    </button>
+                  </>
+                )}
                 {onSendNow && (
                   <button
                     type="button"

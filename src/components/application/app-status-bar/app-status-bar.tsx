@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { getAppVersion, isWeb, setWebviewZoom } from "@/lib/platform";
+import { getAppVersion, isWeb } from "@/lib/platform";
 import Activity from "lucide-react/dist/esm/icons/activity";
 import Minus from "lucide-react/dist/esm/icons/minus";
 import Plus from "lucide-react/dist/esm/icons/plus";
@@ -8,7 +8,6 @@ import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw";
 import { ActionFeedbackIcon, useRunningFeedback } from "@/components/base/action-feedback";
 import { ipc, type AppMetrics } from "@/lib/ipc";
 import { listenScanProgress, type ScanProgress } from "@/lib/events";
-import { readStoredNumber, writeStored } from "@/lib/storage";
 import { useTauriEvent } from "@/hooks/use-tauri-event";
 import { cx } from "@/utils/cx";
 import { compareByOrder, pluginIdFromRegistryKey, statusBarRegistry, useRegistry } from "@ccgui/plugin-sdk";
@@ -18,21 +17,9 @@ import { useReleaseNotesTabStore } from "@/features/update/notes-tab";
 import { registerShortcutHandler } from "@/features/shortcuts/runtime";
 import { PerformanceDiagnosticsDialog } from "@/features/settings/PerformanceDiagnostics";
 
-const ZOOM_KEY = "ccgui-next.zoom:v1";
-const ZOOM_MIN = 50;
-const ZOOM_MAX = 200;
-const ZOOM_STEP = 10;
+import { applyZoom, changeZoom, onZoomChange, readZoomPct, ZOOM_STEP } from "@/lib/zoom";
+
 const METRICS_POLL_MS = 3000;
-
-function readZoomPct(): number {
-  const raw = readStoredNumber(ZOOM_KEY, 100);
-  return raw >= ZOOM_MIN && raw <= ZOOM_MAX ? raw : 100;
-}
-
-function applyZoom(pct: number) {
-  writeStored(ZOOM_KEY, pct);
-  setWebviewZoom(pct / 100);
-}
 
 function formatMb(bytes: number): number {
   return Math.round(bytes / (1024 * 1024));
@@ -64,11 +51,9 @@ export function AppStatusBar() {
   // Re-apply the persisted zoom on startup; Tauri does not restore it.
   useEffect(() => applyZoom(readZoomPct()), []);
 
-  const changeZoom = useCallback((next: number) => {
-    const clamped = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.round(next / ZOOM_STEP) * ZOOM_STEP));
-    setZoomPct(clamped);
-    applyZoom(clamped);
-  }, []);
+  // Follow zoom changes from every entry point (shortcuts below, Settings →
+  // 通用 → 外观 → 界面缩放) so the percent label never goes stale.
+  useEffect(() => onZoomChange(setZoomPct), []);
   // Zoom keys live in the shortcut runtime (defaults ⌘= / ⌘- / ⌘0,
   // configurable in Settings → Shortcuts). Web mode skips registration:
   // browsers own ⌘± natively. readZoomPct() keeps handlers stale-free.
@@ -82,7 +67,7 @@ export function AppStatusBar() {
       unOut();
       unReset();
     };
-  }, [changeZoom]);
+  }, []);
 
   useEffect(() => {
     void getAppVersion().then((v) => {

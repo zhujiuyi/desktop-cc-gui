@@ -25,7 +25,7 @@ export function PiFamilyOauthSection({
   const { t } = useTranslation();
   return (
     <div className="flex w-full flex-col gap-2">
-      <SettingsSectionLabel>
+      <SettingsSectionLabel anchor="piAuthOauth">
         {t("settings.piAuthOauthTitle")}
         <span className="ml-2 text-body-2-regular font-normal text-text-tertiary">
           {t("settings.piAuthOauthHint")}

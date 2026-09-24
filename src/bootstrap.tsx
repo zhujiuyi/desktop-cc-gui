@@ -4,10 +4,12 @@ import App from "./App";
 import i18n from "./lib/i18n";
 import { ipc } from "./lib/ipc";
 import { applyTheme, THEME_STORAGE_KEY } from "./features/settings/theme";
+import { applyFontPreferences, readCachedFontPreferences } from "./features/settings/font";
 import { hydrateBetaFeatures } from "./features/settings/beta-features";
 import { initializePerformancePreference } from "./lib/performance-preference";
 import { sessionKey, useChatStore } from "./features/chat/store";
 import { getAppVersion } from "./lib/platform";
+import { installTauriUnlistenGuard } from "./lib/tauri-unlisten-guard";
 import {
   installGlobalCrashHandlers,
   setCrashAppVersion,
@@ -20,6 +22,11 @@ import { AppCrashBoundary } from "./components/crash/AppCrashBoundary";
  * imports React, so it must never be pulled in statically by the entry.
  */
 export function startApp() {
+  // Tauri 2.11's generated unlisten script throws when the registration eval
+  // for the id has not reached the webview yet (tauri#15799). Patch it before
+  // any component/effect can tear a listener down.
+  installTauriUnlistenGuard();
+
   const stopPerformanceMonitor = initializePerformancePreference(() => {
     const state = useChatStore.getState();
     const sessions = Object.values(state.bySession);
@@ -53,6 +60,9 @@ export function startApp() {
   // window never flashes the wrong color scheme while settings load.
   const cachedTheme = window.localStorage.getItem(THEME_STORAGE_KEY);
   if (cachedTheme) applyTheme(cachedTheme);
+  // Same for the font preferences: set the root font variables before first
+  // paint so custom UI/code fonts don't swap in visibly after settings load.
+  applyFontPreferences(readCachedFontPreferences());
 
   // Kick off the authoritative settings fetch at module scope (shared cached
   // promise in ipc.ts); apply theme/language as soon as it resolves. Rendering
@@ -61,6 +71,12 @@ export function startApp() {
     .getAppSettings()
     .then((settings) => {
       applyTheme(settings.theme);
+      applyFontPreferences({
+        fontFamily: settings.fontFamily,
+        codeFontFamily: settings.codeFontFamily,
+        fontFile: settings.fontFile,
+        codeFontFile: settings.codeFontFile,
+      });
       if (settings.language && settings.language !== i18n.language) {
         void i18n.changeLanguage(settings.language);
       }

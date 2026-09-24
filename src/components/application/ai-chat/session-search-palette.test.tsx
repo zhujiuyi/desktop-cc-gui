@@ -1,7 +1,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { SessionSearchPalette } from "./session-search-palette";
+import { SessionSearchPalette, formatSearchDuration } from "./session-search-palette";
 import type { AiChatRepo } from "./sidebar-types";
 import { ipc, type MessageSearchHit, type MessageSearchPage } from "@/lib/ipc";
 
@@ -32,6 +32,17 @@ function contentHit(overrides: Partial<MessageSearchHit>): MessageSearchHit {
       { text: "命中词", marked: true },
       { text: " 后缀…", marked: false },
     ],
+    ...overrides,
+  };
+}
+/** A full search page with only the fields under test overridden. */
+function page(overrides: Partial<MessageSearchPage>): MessageSearchPage {
+  return {
+    hits: [],
+    hasMore: false,
+    pending: 0,
+    elapsedUs: 0,
+    totalMessages: 0,
     ...overrides,
   };
 }
@@ -68,7 +79,7 @@ let root: Root;
 beforeEach(() => {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
   vi.mocked(ipc.searchMessages).mockReset();
-  vi.mocked(ipc.searchMessages).mockResolvedValue({ hits: [], hasMore: false, pending: 0 });
+  vi.mocked(ipc.searchMessages).mockResolvedValue(page({}));
   node = document.createElement("div");
   document.body.append(node);
   root = createRoot(node);
@@ -90,6 +101,11 @@ function chip(key: string): HTMLButtonElement {
   );
   if (!el) throw new Error(`no chip ${key}`);
   return el;
+}
+
+/** The content-lane stats strip between the search box and the results. */
+function searchStats(): HTMLElement | null {
+  return document.querySelector("dialog [role='status']");
 }
 
 async function render(open: boolean, onThreadSelect = vi.fn(), repoList = repos) {
@@ -154,11 +170,9 @@ it("Enter selects the active row and Escape closes", async () => {
 it("shows debounced message-content hits with highlighted snippets", async () => {
   vi.useFakeTimers();
   try {
-    vi.mocked(ipc.searchMessages).mockResolvedValue({
-      hits: [contentHit({ sessionId: "s-9", title: "版本记录" })],
-      hasMore: false,
-      pending: 0,
-    });
+    vi.mocked(ipc.searchMessages).mockResolvedValue(
+      page({ hits: [contentHit({ sessionId: "s-9", title: "版本记录" })] }),
+    );
     const { onThreadSelect } = await render(true);
     await type("已生成");
     // Debounce: nothing fires before the 300ms pause.
@@ -182,11 +196,7 @@ it("shows debounced message-content hits with highlighted snippets", async () =>
 it("shows the remaining-index count while the indexer has pending sessions", async () => {
   vi.useFakeTimers();
   try {
-    vi.mocked(ipc.searchMessages).mockResolvedValue({
-      hits: [],
-      hasMore: false,
-      pending: 3,
-    });
+    vi.mocked(ipc.searchMessages).mockResolvedValue(page({ pending: 3 }));
     await render(true);
     await type("关键词检索");
     await act(async () => {
@@ -199,14 +209,61 @@ it("shows the remaining-index count while the indexer has pending sessions", asy
   }
 });
 
+it("shows the content query's speed and corpus in a stats strip", async () => {
+  vi.useFakeTimers();
+  try {
+    vi.mocked(ipc.searchMessages).mockResolvedValue(
+      page({ elapsedUs: 4280, totalMessages: 123_456 }),
+    );
+    await render(true);
+    await type("关键词检索");
+    // Debounce window: the strip reports a running search, not a stale
+    // number from the previous query.
+    expect(searchStats()?.textContent).toBe("chat.searchStatsLoading");
+    await act(async () => {
+      vi.advanceTimersByTime(350);
+    });
+    expect(searchStats()?.textContent).toBe(
+      'chat.searchStats:{"time":"4.3 ms","total":"123,456"}',
+    );
+
+    // Turning the content lane off takes the strip with it.
+    await act(async () => chip("chat.searchScopeContent").click());
+    expect(searchStats()).toBeNull();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("reports a failed content query instead of quoting stale stats", async () => {
+  vi.useFakeTimers();
+  try {
+    vi.mocked(ipc.searchMessages).mockRejectedValue(new Error("boom"));
+    await render(true);
+    await type("关键词检索");
+    await act(async () => {
+      vi.advanceTimersByTime(350);
+    });
+    expect(searchStats()?.textContent).toBe("chat.searchStatsFailed");
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("formats the stats duration from microseconds", () => {
+  expect(formatSearchDuration(0)).toBe("0 ms");
+  expect(formatSearchDuration(420)).toBe("0.4 ms");
+  expect(formatSearchDuration(4_280)).toBe("4.3 ms");
+  expect(formatSearchDuration(42_000)).toBe("42 ms");
+  expect(formatSearchDuration(1_420_000)).toBe("1.42 s");
+});
+
 it("filter chips narrow the title and content lanes inclusively", async () => {
   vi.useFakeTimers();
   try {
-    vi.mocked(ipc.searchMessages).mockResolvedValue({
-      hits: [contentHit({ sessionId: "s-9", title: "版本记录" })],
-      hasMore: false,
-      pending: 0,
-    });
+    vi.mocked(ipc.searchMessages).mockResolvedValue(
+      page({ hits: [contentHit({ sessionId: "s-9", title: "版本记录" })] }),
+    );
     await render(true);
     // Both chips pressed by default: title row first, then the content hit.
     await type("流水线");
@@ -248,11 +305,9 @@ it("content-only reveals a hit for a session whose title row is hidden", async (
         threads: [{ id: "claude/s-1", label: "版本记录会话", time: "1h" }],
       },
     ];
-    vi.mocked(ipc.searchMessages).mockResolvedValue({
-      hits: [contentHit({ sessionId: "s-1", title: "版本记录会话" })],
-      hasMore: false,
-      pending: 0,
-    });
+    vi.mocked(ipc.searchMessages).mockResolvedValue(
+      page({ hits: [contentHit({ sessionId: "s-1", title: "版本记录会话" })] }),
+    );
     await render(true, vi.fn(), titled);
     await type("版本记录");
     await act(async () => {
@@ -312,11 +367,9 @@ it("drops a stale content response that lands after a newer one", async () => {
     });
     vi.mocked(ipc.searchMessages)
       .mockImplementationOnce(() => first)
-      .mockResolvedValue({
-        hits: [contentHit({ sessionId: "s-new", title: "新查询结果" })],
-        hasMore: false,
-        pending: 0,
-      });
+      .mockResolvedValue(
+        page({ hits: [contentHit({ sessionId: "s-new", title: "新查询结果" })] }),
+      );
     await render(true);
     await type("查询一");
     await act(async () => {
@@ -330,11 +383,9 @@ it("drops a stale content response that lands after a newer one", async () => {
 
     // The first request resolves late; its hits must not overwrite.
     await act(async () => {
-      resolveFirst({
-        hits: [contentHit({ sessionId: "s-old", title: "旧查询结果" })],
-        hasMore: false,
-        pending: 0,
-      });
+      resolveFirst(
+        page({ hits: [contentHit({ sessionId: "s-old", title: "旧查询结果" })] }),
+      );
     });
     expect(options()).toHaveLength(1);
     expect(options()[0].textContent).toContain("新查询结果");

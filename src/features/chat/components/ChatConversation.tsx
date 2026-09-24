@@ -22,7 +22,8 @@ import {
 import { MessageTimeline } from "./MessageTimeline";
 import { ConversationFooter } from "./ConversationFooter";
 import { useComposerActions } from "./use-composer-actions";
-import { filterEngineOptions } from "./engine-options";
+import { filterEngineOptions, orderEngineOptions } from "./engine-options";
+import { useCliNavOrder } from "@/lib/cli-nav-order";
 import { ErrorBanner } from "./ErrorBanner";
 import { useBranchSwitcher } from "./use-branch-switcher";
 import { useComposerImages } from "./use-composer-images";
@@ -160,9 +161,12 @@ function useConversationMenus({
   // Disabled-in-settings CLIs leave the picker entirely. 接管工作区下:
   // 列表只留桥给的允许表,可用态按列表内与否而不是本机 `command -v` ——
   // 否则本机没装的 CLI 在接管工作区里永远灰点。
+  // 顺序跟随设置页 CLI 管理栏的拖拽排序(同一份 localStorage);设置页里
+  // 拖动时这里通过 useCliNavOrder 的 change 事件同步更新。
+  const cliNavOrder = useCliNavOrder();
   const cliOptions = useMemo(
-    () => filterEngineOptions(engines, allowedEngines, t),
-    [engines, allowedEngines, t],
+    () => orderEngineOptions(filterEngineOptions(engines, allowedEngines, t), cliNavOrder),
+    [engines, allowedEngines, t, cliNavOrder],
   );
   // Every CLI is switched off in settings: swap the picker for a placeholder
   // that deep-links to the CLI config page.
@@ -320,6 +324,7 @@ export const ChatConversation = memo(function ChatConversation({
     pinModels,
     loadEarlier,
     removeQueued,
+    moveQueued,
     sendQueuedNow,
     clearQueue,
   } = useChatStore(
@@ -333,6 +338,7 @@ export const ChatConversation = memo(function ChatConversation({
       pinModels: s.pinModels,
       loadEarlier: s.loadEarlier,
       removeQueued: s.removeQueued,
+      moveQueued: s.moveQueued,
       sendQueuedNow: s.sendQueuedNow,
       clearQueue: s.clearQueue,
     })),
@@ -493,6 +499,7 @@ export const ChatConversation = memo(function ChatConversation({
         workspaces={workspaces}
         queue={queue}
         onRemoveQueued={removeQueued}
+        onMoveQueued={moveQueued}
         onSendQueuedNow={sendQueuedNow}
         onClearQueued={clearQueue}
         imageError={imageError}

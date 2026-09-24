@@ -94,7 +94,7 @@ export function WebDevicesCard() {
 
   return (
     <SettingsCard>
-      <SettingsRow label={t("settings.webDevices")} />
+      <SettingsRow anchor="webDevices" label={t("settings.webDevices")} />
       {devices.length === 0 ? (
         <p className="pt-3 pr-3 pb-3 text-body-2-regular text-text-secondary">
           {t("settings.webDevicesEmpty")}

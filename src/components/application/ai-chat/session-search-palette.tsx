@@ -24,6 +24,24 @@ const CONTENT_MIN_CHARS = 2;
 const EMPTY_MATCHES: SessionMatch[] = [];
 const EMPTY_HITS: MessageSearchHit[] = [];
 
+/** Backend stats for the strip under the input: the query's own wall time
+ *  (microseconds) and the message count it searched. */
+interface SearchStats {
+  elapsedUs: number;
+  totalMessages: number;
+}
+
+/** Duration chip for the stats line: sub-10ms keeps one decimal so a
+ *  sub-millisecond FTS query does not collapse to "0 ms", whole ms below a
+ *  second, seconds with two decimals past that. */
+export function formatSearchDuration(elapsedUs: number): string {
+  if (!Number.isFinite(elapsedUs) || elapsedUs <= 0) return "0 ms";
+  const ms = elapsedUs / 1000;
+  if (ms >= 1000) return `${(ms / 1000).toFixed(2)} s`;
+  if (ms >= 10) return `${Math.round(ms)} ms`;
+  return `${ms.toFixed(1)} ms`;
+}
+
 interface SessionMatch {
   id: string;
   label: string;
@@ -37,10 +55,12 @@ interface SessionMatch {
  * Session quick-search palette (sidebar strip icon / ⌘L). Two lanes: title
  * matches are instant and local; message-content hits come from the
  * backend's FTS5 trigram index (debounced, stale responses dropped by a
- * request counter). The 标题 / 内容 chips are inclusive lane filters — both
- * pressed shows both lanes, un-pressing one narrows to the other. Empty
- * query lists the most recent sessions in sidebar order. Enter/click jumps
- * to the session; Esc or a backdrop press closes.
+ * request counter). A stats strip under the input reports the backend
+ * query's own wall time and the indexed-message corpus it ran against.
+ * The 标题 / 内容 chips are inclusive lane filters — both pressed shows both
+ * lanes, un-pressing one narrows to the other. Empty query lists the most
+ * recent sessions in sidebar order. Enter/click jumps to the session; Esc
+ * or a backdrop press closes.
  *
  * Dialog mechanics (native <dialog>, backdrop press-to-close, window-level
  * key navigation) mirror the ⌘K command palette.
@@ -67,6 +87,12 @@ export function SessionSearchPalette({
   const [showContent, setShowContent] = useState(true);
   const [contentHits, setContentHits] = useState<MessageSearchHit[]>([]);
   const [contentPending, setContentPending] = useState(0);
+  // Stats strip state: the last completed query's numbers, whether a query
+  // is being awaited, and whether the last one failed. Cleared with the
+  // lane so a leftover number can never label a query it did not run.
+  const [contentStats, setContentStats] = useState<SearchStats | null>(null);
+  const [contentLoading, setContentLoading] = useState(false);
+  const [contentFailed, setContentFailed] = useState(false);
   // Invalidate in-flight content responses: Tauri invoke cannot be
   // aborted, so a monotonically increasing request id drops late arrivals
   // (agentsview's requestVersion — the AbortController equivalent here).
@@ -120,9 +146,16 @@ export function SessionSearchPalette({
       requestSeq.current += 1;
       setContentHits(EMPTY_HITS);
       setContentPending(0);
+      setContentStats(null);
+      setContentLoading(false);
+      setContentFailed(false);
       return;
     }
     const seq = ++requestSeq.current;
+    // Debounce window included: from the first keystroke the strip says a
+    // search is running, not what the previous query found.
+    setContentLoading(true);
+    setContentFailed(false);
     const timer = setTimeout(() => {
       ipc
         .searchMessages(trimmedQuery, CONTENT_LIMIT, 0)
@@ -130,10 +163,18 @@ export function SessionSearchPalette({
           if (requestSeq.current !== seq) return;
           setContentHits(page.hits);
           setContentPending(page.pending);
+          setContentStats({
+            elapsedUs: page.elapsedUs,
+            totalMessages: page.totalMessages,
+          });
+          setContentLoading(false);
         })
         .catch(() => {
           if (requestSeq.current !== seq) return;
           setContentHits([]);
+          setContentStats(null);
+          setContentLoading(false);
+          setContentFailed(true);
         });
     }, CONTENT_DEBOUNCE_MS);
     return () => clearTimeout(timer);
@@ -246,6 +287,19 @@ export function SessionSearchPalette({
   // The filtered list can shrink under the cursor; clamp the active row.
   const active = Math.min(activeIndex, Math.max(0, rowCount - 1));
 
+  // Content-lane status line under the input box. Running / failed / stats
+  // share one fixed row, so results never jump when it changes state.
+  const statsLine = contentLoading
+    ? t("chat.searchStatsLoading")
+    : contentFailed
+      ? t("chat.searchStatsFailed")
+      : contentStats
+        ? t("chat.searchStats", {
+            time: formatSearchDuration(contentStats.elapsedUs),
+            total: contentStats.totalMessages.toLocaleString(),
+          })
+        : "";
+
   // Keep the keyboard-highlighted row visible while arrowing through a
   // scrolled list. Section headers sit between option rows, so address by
   // role, not child index.
@@ -278,7 +332,7 @@ export function SessionSearchPalette({
             }}
             placeholder={t("chat.searchSessions")}
             aria-label={t("chat.searchSessions")}
-            className="h-11 w-full bg-transparent text-body-medium text-text-primary outline-none placeholder:text-text-placeholder"
+            className="palette-search-field h-11 w-full bg-transparent text-body-medium text-text-primary outline-none placeholder:text-text-placeholder"
           />
           {filtersLive && (
             <div className="flex shrink-0 items-center gap-1">
@@ -306,6 +360,17 @@ export function SessionSearchPalette({
             </div>
           )}
         </div>
+        {filtersLive && showContent && (
+          <div
+            role="status"
+            className={cx(
+              "border-b border-separator-border px-3 py-1.5 text-caption-1-medium",
+              contentFailed ? "text-text-error-primary" : "text-text-tertiary",
+            )}
+          >
+            {statsLine}
+          </div>
+        )}
         <PaletteResults
           listRef={listRef}
           matches={titleRows}

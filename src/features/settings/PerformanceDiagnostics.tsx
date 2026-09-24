@@ -262,7 +262,10 @@ export function PerformanceDiagnosticsSection() {
         <p className="text-body-regular text-text-secondary">{t("diagnostics.description")}</p>
         <Button size="small" variant="secondary" leadingIcon={Activity} onClick={() => setOpen(true)}>{t("diagnostics.open")}</Button>
       </div>
-      <div className="flex items-center justify-between gap-4 rounded-xl border border-separator-border p-3">
+      <div
+        data-setting-anchor="renderScan"
+        className="flex items-center justify-between gap-4 rounded-xl border border-separator-border p-3"
+      >
         <div className="flex min-w-0 flex-col gap-0.5">
           <p className="text-body-regular text-text-primary">{t("diagnostics.renderPanelTitle")}</p>
           <p className="text-body-2-regular text-text-secondary">{t("diagnostics.renderPanelDescription")}</p>

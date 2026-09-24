@@ -52,6 +52,7 @@ export function BetaFeaturesSection() {
           {BETA_FEATURES.map((feature) => (
             <SettingsRow
               key={feature.id}
+              anchor={feature.id}
               label={t(feature.labelKey)}
               description={t(feature.descriptionKey)}
             >

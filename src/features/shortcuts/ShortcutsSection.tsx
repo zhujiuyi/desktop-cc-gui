@@ -205,6 +205,7 @@ export function ShortcutsSection() {
               return (
                 <SettingsRow
                   key={action.id}
+                  anchor={action.id}
                   label={t(action.labelKey)}
                   description={conflict || undefined}
                 >

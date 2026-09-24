@@ -45,7 +45,7 @@ export function GrantedRootsCard({
     <>
       {!isWeb && grantedRoots && grantedRoots.length > 0 && (
         <div className="flex w-full flex-col gap-2">
-          <SettingsSectionLabel>
+          <SettingsSectionLabel anchor="grantedRoots">
             {t("settings.grantedRoots")}
             <span className="ml-2 text-body-2-regular font-normal text-text-tertiary">
               {t("settings.grantedRootsDesc")}

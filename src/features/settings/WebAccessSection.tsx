@@ -120,6 +120,7 @@ export function WebAccessSection() {
           <button
             key={id}
             type="button"
+            data-setting-anchor={id === "lan" ? "webLanTab" : "webWanTab"}
             aria-pressed={pane === id}
             onClick={() => {
               // 内网访问 is upstream's LAN behaviour and needs no warning; the

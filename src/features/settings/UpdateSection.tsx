@@ -60,12 +60,12 @@ export function UpdateSection() {
       <div className="flex w-full flex-col gap-2">
         <SettingsSectionLabel>{t("settings.checkUpdates")}</SettingsSectionLabel>
         <SettingsCard>
-          <SettingsRow label="CC GUI" description={t("settings.aboutDesc")}>
+          <SettingsRow anchor="appVersion" label="CC GUI" description={t("settings.aboutDesc")}>
             <span className="text-body-regular text-text-secondary">
               {version ? `v${version}` : "…"}
             </span>
           </SettingsRow>
-          <SettingsRow label={t("settings.checkUpdates")} description={updateDescription}>
+          <SettingsRow anchor="checkUpdates" label={t("settings.checkUpdates")} description={updateDescription}>
             <UpdateControls
               stage={updateStage}
               inFlight={updateInFlight}

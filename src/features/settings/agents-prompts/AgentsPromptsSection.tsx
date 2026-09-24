@@ -22,6 +22,7 @@ export function AgentsPromptsSection() {
         <PillTab
           variant="gray"
           icon={Bot}
+          anchor="agents"
           isSelected={tab === "agents"}
           onSelect={() => setTab("agents")}
         >
@@ -30,6 +31,7 @@ export function AgentsPromptsSection() {
         <PillTab
           variant="gray"
           icon={FileText}
+          anchor="prompts"
           isSelected={tab === "prompts"}
           onSelect={() => setTab("prompts")}
         >

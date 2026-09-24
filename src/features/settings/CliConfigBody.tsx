@@ -87,7 +87,7 @@ export function CliConfigBody({ cli }: { cli: CliConfigState }) {
 
         <div className="flex w-full flex-col gap-2">
           <div className="flex items-center justify-between gap-3">
-            <SettingsSectionLabel>
+            <SettingsSectionLabel anchor="cliChannels">
               {t("settings.cliChannels")}
               <span className="ml-2 text-body-2-regular font-normal text-text-tertiary">
                 {t("settings.cliChannelsHint")}

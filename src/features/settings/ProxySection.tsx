@@ -141,6 +141,7 @@ export function ProxySection() {
         </p>
         <SettingsCard>
           <SettingsRow
+            anchor="proxyEnabled"
             label={t("settings.proxyEnabled")}
             description={t("settings.proxyEnabledDesc")}
           >
@@ -152,7 +153,7 @@ export function ProxySection() {
               onChange={onToggle}
             />
           </SettingsRow>
-          <SettingsRow label={t("settings.proxyAddress")}>
+          <SettingsRow anchor="proxyAddress" label={t("settings.proxyAddress")}>
             <Input
               aria-label={t("settings.proxyAddress")}
               size="small"

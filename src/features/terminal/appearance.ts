@@ -1,6 +1,13 @@
 import type { ITheme } from "@xterm/xterm";
+import { codeFontStack, readCachedFontPreferences } from "@/features/settings/font";
 
 export const TERMINAL_FONT_FAMILY = 'Menlo, Monaco, "Courier New", monospace';
+/** Terminal font: follows 设置 → 通用 → 外观 → 代码字体 ("" keeps the
+ *  legacy Menlo stack so the default experience is unchanged). Read from the
+ *  localStorage mirror — the terminal has no settings prop chain. */
+export function terminalFontFamily(): string {
+  return codeFontStack(readCachedFontPreferences().codeFontFamily) ?? TERMINAL_FONT_FAMILY;
+}
 
 /**
  * Palettes keyed off the app's `.dark` class rather than read from CSS

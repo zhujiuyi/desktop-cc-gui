@@ -49,6 +49,7 @@ function Fixture() {
         workspaces={[]}
         queue={[]}
         onRemoveQueued={() => {}}
+        onMoveQueued={() => {}}
         onSendQueuedNow={() => {}}
         imageError={null}
         branchError={null}

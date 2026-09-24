@@ -4,6 +4,7 @@
  *  - 接管工作区(allowedEngines 非 null,由 workspace-ui 桥提供)只留列表内
  *    的 CLI,可用态按列表内与否,不按本机 `command -v`。 */
 import type { EngineInfo } from "@/lib/ipc";
+import { orderByStoredKeys } from "@/lib/cli-nav-order";
 
 export interface EngineOption {
   id: string;
@@ -34,4 +35,17 @@ export function filterEngineOptions(
       },
     ];
   });
+}
+
+/** Picker order follows the settings CLI 管理 rail's drag order (same
+ *  localStorage list, keyed "cli:<engineId>"); engines missing from the
+ *  stored list keep their registry order at the end. */
+export function orderEngineOptions(
+  options: EngineOption[],
+  cliNavOrder: string[],
+): EngineOption[] {
+  return orderByStoredKeys(
+    options.map((option) => ({ key: `cli:${option.id}`, option })),
+    cliNavOrder,
+  ).map((entry) => entry.option);
 }

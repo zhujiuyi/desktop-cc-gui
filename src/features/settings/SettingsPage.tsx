@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import {
@@ -15,8 +15,14 @@ import { pluginSettingsNavIcon } from "@/features/plugins/hub/PluginSettingsNavI
 import { useChatStore } from "@/features/chat/store";
 import { ENGINE_IDS, type EngineId } from "./providers";
 import { CliHeaderActions } from "./CliHeaderActions";
-import { readStoredJson, writeStored } from "@/lib/storage";
-// Side-effect import: registers all builtin sections into settingsRegistry.
+import {
+  orderByStoredKeys,
+  useCliNavOrder,
+  writeCliNavOrder,
+} from "@/lib/cli-nav-order";
+import { settingsSearchEntries } from "./settings-search";
+// Side-effect import: registers all builtin sections into settingsRegistry
+// (and their page-internal search rows, see ./sections).
 import "./sections";
 
 /** Rail meta for known nav groups (label + rail order). A group the SDK adds
@@ -34,28 +40,8 @@ const GROUP_META: Record<string, { labelKey: string; order: number }> = {
   misc: { labelKey: "settings.groupMisc", order: 5 },
 };
 const KNOWN_GROUP_COUNT = Object.keys(GROUP_META).length;
-/** localStorage key for the user's CLI 管理 rail order (section keys). */
-const CLI_NAV_ORDER_KEY = "ccgui-next.settingsCliNavOrder:v1";
-
-const readCliNavOrder = (): string[] =>
-  readStoredJson(CLI_NAV_ORDER_KEY, (value) =>
-    Array.isArray(value) && value.every((k) => typeof k === "string")
-      ? (value as string[])
-      : null,
-  ) ?? [];
-
-/** Items in the user's stored order; keys absent from the stored list (new
- *  engines) keep their registry order at the end — Array.sort is stable. */
-const orderByStoredKeys = <T extends { key: string }>(
-  items: T[],
-  keys: string[],
-): T[] => {
-  const rank = new Map(keys.map((key, index) => [key, index]));
-  return [...items].sort(
-    (a, b) =>
-      (rank.get(a.key) ?? keys.length) - (rank.get(b.key) ?? keys.length),
-  );
-};
+// The rail order lives in @/lib/cli-nav-order, shared with the composer CLI
+// picker so both surfaces follow the same drag order.
 
 /** Unknown page params fall back to General. */
 const renderPage = (key: string) => {
@@ -98,7 +84,7 @@ export default function SettingsPage() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const sections = useRegistry(settingsRegistry);
-  const [cliNavOrder, setCliNavOrder] = useState<string[]>(readCliNavOrder);
+  const cliNavOrder = useCliNavOrder();
   /** Engine enable states; the chat store refreshes them on every CLI config
    *  change, so toggling a CLI's enable switch moves its rail row live. An
    *  empty list (probe still running or failed) means "don't split" — never
@@ -225,8 +211,7 @@ export default function SettingsPage() {
                 ...disabledItems.map((item) => item.key),
                 ...uninstalledItems.map((item) => item.key),
               ];
-              setCliNavOrder(next);
-              writeStored(CLI_NAV_ORDER_KEY, JSON.stringify(next));
+              writeCliNavOrder(next);
             },
             dragHandleLabel: t("settings.cliDrag"),
           },
@@ -278,6 +263,7 @@ export default function SettingsPage() {
       titles={titles}
       renderPage={renderPage}
       renderHeaderActions={renderHeaderActions}
+      searchEntries={settingsSearchEntries()}
     />
   );
 }

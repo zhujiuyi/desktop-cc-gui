@@ -99,6 +99,7 @@ export function WebRelayDeployCard({
   return (
     <SettingsCard>
       <SettingsRow
+        anchor="webRelayDeploy"
         label={t("settings.webRelayDeploy")}
         labelAdornment={
           // One trigger for both jobs: the hint before anything happened,

@@ -17,7 +17,7 @@ export function DshHostSection() {
 
   return (
     <div className="flex w-full flex-col gap-3">
-      <SettingsSectionLabel>{t("settings.dshLocalHost")}</SettingsSectionLabel>
+      <SettingsSectionLabel anchor="dshHost">{t("settings.dshLocalHost")}</SettingsSectionLabel>
 
       {cliError && (
         <p role="alert" className="text-body-regular text-text-error-primary">

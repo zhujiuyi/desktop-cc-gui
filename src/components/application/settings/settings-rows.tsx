@@ -1,4 +1,4 @@
-import type { ComponentType, ReactNode } from "react";
+import { createContext, useContext, type ComponentType, type ReactNode } from "react";
 import { cx } from "@/utils/cx";
 
 /**
@@ -14,6 +14,14 @@ import { cx } from "@/utils/cx";
  *          grey blocks).
  *   row    py 10 pr 10, min-height 52, 1px border/button/default under
  *          every row except the last, label left / control right.
+ *   anchor optional `anchor` for the settings search: the shell scrolls the
+ *          row into view and flashes it after a search hit opens the page
+ *          (`settings-shell.tsx`), so the row carries `data-setting-anchor`
+ *          and matches the hit's `anchor` (see `settings-search.ts`). A row
+ *          renders its own highlight because the shell cannot know when an
+ *          async page (通用 reads its settings first) finally paints it.
+ *          `SettingsSectionLabel` takes the same anchor for the sections that
+ *          are themselves the setting (供应商渠道).
  *   label  Body 1/Medium text/primary above a card (14px, near-black, like
  *          the reference); row labels Body 1/Regular text/primary with an
  *          optional Body 2/Regular text/secondary description underneath.
@@ -25,6 +33,35 @@ type IconComponent = ComponentType<{
   className?: string;
   "aria-hidden"?: boolean | "true" | "false";
 }>;
+
+/** Anchor of the row a search hit just revealed (`null` = nothing flashing).
+ *  The settings shell owns the state and the scrolling; rows only consult the
+ *  context to draw their own ring, which keeps async pages correct — 通用
+ *  renders its rows long after the click, and each row flashes with the value
+ *  that is current when it finally mounts. */
+const SettingsAnchorFlashContext = createContext<string | null>(null);
+
+export function SettingsAnchorFlashProvider({
+  anchor,
+  children,
+}: {
+  anchor: string | null;
+  children: ReactNode;
+}) {
+  return (
+    <SettingsAnchorFlashContext.Provider value={anchor}>
+      {children}
+    </SettingsAnchorFlashContext.Provider>
+  );
+}
+
+/** Whether the element carrying `anchor` is the row a search just revealed.
+ *  Shared by `SettingsRow`, `SettingsSectionLabel` and the pages with their
+ *  own row chrome (the CLI engine cards). */
+export function useSettingsAnchorFlash(anchor?: string): boolean {
+  const flashingAnchor = useContext(SettingsAnchorFlashContext);
+  return anchor !== undefined && anchor === flashingAnchor;
+}
 
 /** Grouped card — rows divide themselves with borders that respect pl-12. */
 export function SettingsCard({ className, children }: { className?: string; children: ReactNode }) {
@@ -42,10 +79,30 @@ export function SettingsCard({ className, children }: { className?: string; chil
 
 /** 14px near-black section heading above a card ("Pull Requests",
  *  "Notifications") — the reference's label hierarchy: cards and rows carry
- *  the dark text, section headings around them do not shrink to mute grey. */
-export function SettingsSectionLabel({ className, children }: { className?: string; children: ReactNode }) {
+ *  the dark text, section headings around them do not shrink to mute grey.
+ *  A heading can carry a search `anchor` of its own: some sections *are* the
+ *  setting (供应商渠道, 订阅授权) and their rows are user data. */
+export function SettingsSectionLabel({
+  className,
+  anchor,
+  children,
+}: {
+  className?: string;
+  /** Search anchor (plain identifier, unique per page). */
+  anchor?: string;
+  children: ReactNode;
+}) {
+  const flashing = useSettingsAnchorFlash(anchor);
   return (
-    <p className={cx("w-full px-3 text-body-medium text-text-primary", className)}>{children}</p>
+    <p
+      data-setting-anchor={anchor}
+      className={cx(
+        "w-full px-3 text-body-medium text-text-primary",
+        flashing && "rounded-2lg ring-2 ring-inset ring-border-focus-ring",
+        className,
+      )}
+    >      {children}
+    </p>
   );
 }
 
@@ -54,19 +111,28 @@ export function SettingsRow({
   label,
   labelAdornment,
   description,
+  anchor,
   children,
 }: {
   label: string;
   /** Rendered right after the label text (hint icon, badge, …). */
   labelAdornment?: ReactNode;
   description?: string;
+  /** Search anchor (plain identifier, unique per page): the settings search
+   *  jumps to this row and flashes it. */
+  anchor?: string;
   children?: ReactNode;
 }) {
+  const flashing = useSettingsAnchorFlash(anchor);
   return (
     <div
+      data-setting-anchor={anchor}
       className={cx(
         "flex min-h-[52px] w-full items-center justify-between gap-4 py-2.5 pr-2.5",
         "border-b border-separator-border last:border-b-0",
+        // Reveal ring for a search hit: inside the row, so the highlight
+        // never bleeds into the neighbouring rows of the card.
+        flashing && "rounded-2lg ring-2 ring-inset ring-border-focus-ring",
       )}
     >
       <div className="flex min-w-0 flex-col">

@@ -29,4 +29,25 @@ describe("plugin-ui token contract", () => {
   it("contract has no duplicate entries", () => {
     expect(new Set(PLUGIN_UI_TOKEN_CONTRACT).size).toBe(PLUGIN_UI_TOKEN_CONTRACT.length);
   });
+
+  /** 插件 bundle 样式注入在 `@layer ccgui-plugins`，层序在 `theme` 之后：
+   *  自带 Tailwind 构建的插件会输出 `@layer theme { :root { --font-sans:
+   *  var(--font-sans-host), …; --default-font-family: … } }`，而它自己又声明
+   *  `--font-sans-host: var(--font-sans, …)`，两者构成自定义属性循环 → 计算值
+   *  变为 guaranteed-invalid，宿主 preflight 回退到 `-apple-system, …`，设置页
+   *  的界面/代码字体会静默失效（kimi-lb 插件实测）。修法是宿主在 :root 里以
+   *  **无层**声明重推 `--font-sans` / `--font-mono` / `--default-font-family` /
+   *  `--default-mono-font-family`（无层声明胜过所有 @layer）。此守卫防止未来
+   *  重构把它们挪回 @theme 或删掉。
+   */
+  it("re-asserts the font stacks unlayered so plugin layers cannot clobber them", () => {
+    const rootBlocks = [...themeCss.matchAll(/^:root\s*\{([\s\S]*?)^\}/gm)].map(
+      (match) => match[1] ?? "",
+    );
+    const fontRoot = rootBlocks.find((block) => block.includes("--font-inter")) ?? "";
+    expect(fontRoot).toMatch(/--font-sans:\s*var\(--font-inter\)/);
+    expect(fontRoot).toMatch(/--font-mono:\s*var\(--font-mono-source\)/);
+    expect(fontRoot).toMatch(/--default-font-family:\s*var\(--font-sans\)/);
+    expect(fontRoot).toMatch(/--default-mono-font-family:\s*var\(--font-mono\)/);
+  });
 });

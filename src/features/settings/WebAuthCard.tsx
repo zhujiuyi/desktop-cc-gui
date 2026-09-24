@@ -90,6 +90,7 @@ export function WebAuthCard() {
   return (
     <SettingsCard>
       <SettingsRow
+        anchor="webAuth"
         label={t("settings.webAuth")}
         labelAdornment={<InfoTip label={t("settings.webAuthKeyHint")} icon={CircleAlert} />}
       >

@@ -165,6 +165,24 @@
    * --font-mono in @theme above. */
   --font-inter: "Inter Variable", ui-sans-serif, system-ui, sans-serif;
   --font-mono-source: "JetBrains Mono Variable", ui-monospace, monospace;
+  /* Re-assert the theme font stacks UNLAYERED (values must stay in sync with
+   * the @theme block above). Plugin bundles are injected in `@layer
+   * ccgui-plugins`, which outranks the `theme` layer, and a plugin built with
+   * its own Tailwind ships `@layer theme { :root { --font-sans: var(--font-
+   * sans-host), …; --default-font-family: … } }` — combined with its
+   * `--font-sans-host: var(--font-sans, …)` that is a custom-property cycle:
+   * both compute to the guaranteed-invalid value, preflight falls back to
+   * `-apple-system, …` and the 界面字体/代码字体 settings silently stop
+   * working. Unlayered host declarations outrank every layer, so the app's
+   * font stack (and the settings override of --font-inter / --font-mono-
+   * source) always wins. */
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif,
+               "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol",
+               "Noto Color Emoji";
+  --font-mono: var(--font-mono-source), ui-monospace, "SFMono-Regular", Menlo,
+               Consolas, "Liberation Mono", monospace;
+  --default-font-family: var(--font-sans);
+  --default-mono-font-family: var(--font-mono);
 
   /* Foreground (icons + on-fill content) */
   --color-foreground-full:               var(--color-white);

@@ -1,25 +1,34 @@
 import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { Key, KeyboardEvent } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import Upload from "lucide-react/dist/esm/icons/upload";
 
 import { Select, SelectItem } from "@/components/base/select/select";
 import { Input } from "@/components/base/input/input";
 import { Button } from "@/components/base/buttons/button";
 import { Switch } from "@/components/base/switch/switch";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   SettingsCard,
   SettingsRow,
   SettingsSectionLabel,
 } from "@/components/application/settings/settings-rows";
-import { ConfirmDialog } from "@/components/dialogs";
-import { ipc, type AppSettings, type PetSummary } from "@/lib/ipc";
-import { petErrorMessage } from "@/features/pet/pet-errors";
-import { IS_WINDOWS, pickDirectory } from "@/lib/platform";
+import { ipc, type AppSettings } from "@/lib/ipc";
+import { IS_WINDOWS, isWeb, pickFile } from "@/lib/platform";
 import { applyTheme } from "./theme";
+import {
+  applyFontPreferences,
+  CUSTOM_FONT_VALUE,
+  ensureCustomFontLoaded,
+  fontErrorMessage,
+  fontRole,
+  normalizeFontMode,
+  type FontField,
+  type FontPreferences,
+} from "./font";
+import { changeZoom, onZoomChange, readZoomPct, ZOOM_MAX, ZOOM_MIN, ZOOM_STEP } from "@/lib/zoom";
 import { PromptHistoryManager, PromptHistoryToggleRow } from "./PromptHistorySettings";
 import { useChatStore } from "@/features/chat/store";
-import { PET_SCALE_OPTIONS, normalizePetScale } from "@/features/pet/pet-scale";
 
 export const LANGUAGE_STORAGE_KEY = "ccgui-next.language";
 
@@ -29,6 +38,24 @@ const SELECT_TRIGGER = "h-8 w-auto gap-1 rounded-lg px-2 py-1.5";
 const THREAD_LIMIT_MIN = 1;
 const THREAD_LIMIT_MAX = 30;
 const THREAD_LIMIT_DEFAULT = 5;
+/** Interface zoom presets: every step between the bounds so a percent set
+ *  from the status bar or a shortcut always matches a select item. */
+const ZOOM_PRESETS: number[] = [];
+for (let v = ZOOM_MIN; v <= ZOOM_MAX; v += ZOOM_STEP) ZOOM_PRESETS.push(v);
+
+/** Extensions offered by the font file dialog; the backend additionally
+ *  checks the first bytes, so a renamed file still fails with a clear error. */
+const FONT_FILE_EXTENSIONS = ["ttf", "otf", "ttc", "woff", "woff2"];
+
+/** AppSettings → the four font fields applyFontPreferences persists. */
+function fontPreferencesOf(settings: AppSettings): FontPreferences {
+  return {
+    fontFamily: settings.fontFamily,
+    codeFontFamily: settings.codeFontFamily,
+    fontFile: settings.fontFile,
+    codeFontFile: settings.codeFontFile,
+  };
+}
 
 /** App-settings state + persistence for the General page. Kept JSX-free so
  *  the component below only composes the cards. */
@@ -38,12 +65,10 @@ function useGeneralSettingsState() {
   const [error, setError] = useState<string | null>(null);
   // Raw digits while editing the thread limit; null = show the saved value.
   const [limitText, setLimitText] = useState<string | null>(null);
+  // 正在读取/注册上传字体的行；null = 空闲，用于禁用再次点选。
+  const [fontBusy, setFontBusy] = useState<FontField | null>(null);
   // 窗口当前是否有系统装饰（isDecorated）；null = 还没读回来。
   const [decorated, setDecorated] = useState<boolean | null>(null);
-  const [pets, setPets] = useState<PetSummary[]>([]);
-  const [petBusy, setPetBusy] = useState(false);
-  // Pet pending destructive confirmation; null = no dialog open.
-  const [removingPet, setRemovingPet] = useState<PetSummary | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -57,10 +82,6 @@ function useGeneralSettingsState() {
       .catch((e) => {
         if (!cancelled) setError(String(e));
       });
-    void ipc
-      .listPets()
-      .then(setPets)
-      .catch((e) => console.warn("[settings] pet list failed", e));
     return () => {
       cancelled = true;
     };
@@ -165,92 +186,54 @@ function useGeneralSettingsState() {
     useChatStore.getState().setThinkingAutoCollapse(autoCollapse);
     void save({ thinkingAutoCollapse: autoCollapse });
   };
-  const onPetEnabledChange = (enabled: boolean) => {
+  /** Font mode commits (默认 / 系统 / 自定义): apply to the document root at
+   *  once (bootstrap re-reads the mirror on the next launch) and persist.
+   *  Entering 自定义 with an uploaded file re-applies that file right away;
+   *  without one the row keeps the mode open until a file is picked. */
+  const onFontModeChange = (field: FontField, value: string) => {
     if (!settings) return;
-    if (enabled && !pets.some((pet) => pet.id === settings.petId)) {
-      setError(t("settings.petImportRequired"));
-      return;
-    }
-    setSettings({ ...settings, petEnabled: enabled });
-    void save({ petEnabled: enabled }).then((ok) => {
-      if (ok) void ipc.setPetVisible(enabled).catch((e) => setError(petErrorMessage(e, t)));
-    });
-  };
-  const onPetScaleChange = async (key: Key | null) => {
-    if (!settings || key == null) return;
-    const next = normalizePetScale(Number(key));
-    const previous = normalizePetScale(settings.petScale);
-    if (next === previous) return;
-    setSettings({ ...settings, petScale: next });
-    try {
-      const applied = await ipc.setPetScale(next);
-      setSettings((current) => (current ? { ...current, petScale: normalizePetScale(applied) } : current));
-      setError(null);
-    } catch (e) {
-      setSettings((current) => (current ? { ...current, petScale: previous } : current));
-      setError(petErrorMessage(e, t));
+    const next = { ...settings, [field]: value };
+    setSettings(next);
+    applyFontPreferences(fontPreferencesOf(next));
+    void save({ [field]: value });
+    const path = value === "custom" ? next[field === "fontFamily" ? "fontFile" : "codeFontFile"] : "";
+    if (path) {
+      void ensureCustomFontLoaded(fontRole(field), path).catch((e) =>
+        setError(fontErrorMessage(e, t)),
+      );
     }
   };
-  const onPetChange = async (key: Key | null) => {
-    if (!settings || key == null) return;
-    const petId = String(key);
-    setSettings({ ...settings, petId });
-    const saved = await save({ petId });
-    if (!saved) return;
-    // Recreate the overlay so the selected package is loaded immediately.
-    try {
-      await ipc.setPetVisible(false);
-      await ipc.setPetVisible(settings.petEnabled ?? false);
-    } catch (e) {
-      setError(petErrorMessage(e, t));
-    }
-  };
-  const importPet = async () => {
-    const path = await pickDirectory(t("settings.petImportHint"));
-    if (!path) return;
-    setPetBusy(true);
-    try {
-      const imported = await ipc.importPet(path);
-      setPets((current) => [...current.filter((pet) => pet.id !== imported.id), imported]);
-      setSettings((current) => (current ? { ...current, petId: imported.id } : current));
-      const saved = await save({ petId: imported.id });
-      if (saved && settings?.petEnabled) {
-        await ipc.setPetVisible(false);
-        await ipc.setPetVisible(true);
-      }
-    } catch (e) {
-      setError(`${t("settings.petImportFailed")}: ${petErrorMessage(e, t)}`);
-    } finally {
-      setPetBusy(false);
-    }
-  };
-  const removePet = async (pet: PetSummary) => {
-    try {
-      await ipc.removePet(pet.id);
-      setPets((current) => current.filter((item) => item.id !== pet.id));
-      if (settings?.petId === pet.id) {
-        if (settings.petEnabled) await ipc.setPetVisible(false).catch(() => {});
-        await save({ petId: "", petEnabled: false });
-      }
-    } catch (e) {
-      setError(petErrorMessage(e, t));
-    }
-  };
-  const selectedPetId = settings?.petId?.trim() ?? "";
-  const selectedPet = pets.find((pet) => pet.id === selectedPetId);
 
+  /** 上传字体：读取并注册成功后才落设置（失败保留原选择并报错）。 */
+  const onFontFilePick = async (field: FontField): Promise<boolean> => {
+    if (!settings) return false;
+    const path = await pickFile(t("settings.fontPickTitle"), [
+      { name: t("settings.fontFileFilter"), extensions: FONT_FILE_EXTENSIONS },
+    ]);
+    if (!path) return false;
+    setFontBusy(field);
+    try {
+      await ensureCustomFontLoaded(fontRole(field), path, { force: true });
+      const fileField = field === "fontFamily" ? "fontFile" : "codeFontFile";
+      const next = { ...settings, [field]: "custom", [fileField]: path };
+      setSettings(next);
+      applyFontPreferences(fontPreferencesOf(next));
+      void save({ [field]: "custom", [fileField]: path });
+      setError(null);
+      return true;
+    } catch (e) {
+      setError(fontErrorMessage(e, t));
+      return false;
+    } finally {
+      setFontBusy(null);
+    }
+  };
   return {
     settings,
     error,
     limitText,
     decorated,
-    pets,
-    petBusy,
-    removingPet,
-    setRemovingPet,
-    removePet,
-    selectedPetId,
-    selectedPet,
+    fontBusy,
     onThemeChange,
     onTitlebarChange,
     onLanguageChange,
@@ -259,10 +242,8 @@ function useGeneralSettingsState() {
     onThreadLimitKeyDown,
     onSendShortcutChange,
     onThinkingAutoCollapseChange,
-    onPetEnabledChange,
-    onPetScaleChange,
-    onPetChange,
-    importPet,
+    onFontModeChange,
+    onFontFilePick,
   };
 }
 
@@ -271,9 +252,12 @@ function AppearanceCard({
   settings,
   limitText,
   decorated,
+  fontBusy,
   onThemeChange,
   onTitlebarChange,
   onLanguageChange,
+  onFontModeChange,
+  onFontFilePick,
   onThreadLimitChange,
   onThreadLimitCommit,
   onThreadLimitKeyDown,
@@ -281,9 +265,12 @@ function AppearanceCard({
   settings: AppSettings;
   limitText: string | null;
   decorated: boolean | null;
+  fontBusy: FontField | null;
   onThemeChange: (key: Key | null) => void;
   onTitlebarChange: (key: Key | null) => void;
   onLanguageChange: (key: Key | null) => void;
+  onFontModeChange: (field: FontField, value: string) => void;
+  onFontFilePick: (field: FontField) => Promise<boolean>;
   onThreadLimitChange: (value: string) => void;
   onThreadLimitCommit: () => void;
   onThreadLimitKeyDown: (event: KeyboardEvent) => void;
@@ -293,7 +280,7 @@ function AppearanceCard({
     <div className="flex w-full flex-col gap-2">
       <SettingsSectionLabel>{t("settings.appearance")}</SettingsSectionLabel>
       <SettingsCard>
-        <SettingsRow label={t("settings.theme")}>
+        <SettingsRow anchor="theme" label={t("settings.theme")}>
           <Select
             aria-label={t("settings.theme")}
             selectedKey={settings.theme}
@@ -307,6 +294,7 @@ function AppearanceCard({
         </SettingsRow>
         {IS_WINDOWS && (
           <SettingsRow
+            anchor="titlebar"
             label={t("settings.titlebar")}
             description={t("settings.titlebarRestartHint")}
           >
@@ -333,7 +321,7 @@ function AppearanceCard({
             </div>
           </SettingsRow>
         )}
-        <SettingsRow label={t("settings.language")}>
+        <SettingsRow anchor="language" label={t("settings.language")}>
           <Select
             aria-label={t("settings.language")}
             selectedKey={settings.language}
@@ -344,7 +332,27 @@ function AppearanceCard({
             <SelectItem id="en">{t("settings.langEn")}</SelectItem>
           </Select>
         </SettingsRow>
-        <SettingsRow label={t("settings.sidebarThreadLimit")}>
+        <ZoomRow />
+        <FontFamilyRow
+          anchor="fontFamily"
+          label={t("settings.fontFamily")}
+          value={settings.fontFamily ?? ""}
+          filePath={settings.fontFile ?? ""}
+          busy={fontBusy === "fontFamily"}
+          onModeChange={(mode) => onFontModeChange("fontFamily", mode)}
+          onPickFile={() => onFontFilePick("fontFamily")}
+        />
+        <FontFamilyRow
+          anchor="codeFontFamily"
+          label={t("settings.codeFontFamily")}
+          description={t("settings.codeFontFamilyDesc")}
+          value={settings.codeFontFamily ?? ""}
+          filePath={settings.codeFontFile ?? ""}
+          busy={fontBusy === "codeFontFamily"}
+          onModeChange={(mode) => onFontModeChange("codeFontFamily", mode)}
+          onPickFile={() => onFontFilePick("codeFontFamily")}
+        />
+        <SettingsRow anchor="sidebarThreadLimit" label={t("settings.sidebarThreadLimit")}>
           <Input
             aria-label={t("settings.sidebarThreadLimit")}
             size="small"
@@ -365,100 +373,118 @@ function AppearanceCard({
   );
 }
 
-/** Pet card: overlay toggle, package select/import/remove, and scale. */
-function PetCard({
-  settings,
-  pets,
-  petBusy,
-  selectedPetId,
-  selectedPet,
-  onPetEnabledChange,
-  onPetScaleChange,
-  onPetChange,
-  onImportPet,
-  onRemovePet,
+/** Interface zoom select; shares the status bar's stored percent via the
+ *  zoom-change event, so ± buttons, shortcuts and this row never disagree. */
+function ZoomRow() {
+  const { t } = useTranslation();
+  const [pct, setPct] = useState(readZoomPct);
+  useEffect(() => onZoomChange(setPct), []);
+  return (
+    <SettingsRow
+      anchor="uiZoom"
+      label={t("settings.uiZoom")}
+      description={t("settings.uiZoomDesc")}
+    >
+      <Select
+        aria-label={t("settings.uiZoom")}
+        selectedKey={String(pct)}
+        onSelectionChange={(key) => {
+          if (key != null) changeZoom(Number(key));
+        }}
+        triggerClassName={SELECT_TRIGGER}
+      >
+        {ZOOM_PRESETS.map((value) => (
+          <SelectItem key={value} id={String(value)} textValue={`${value}%`}>
+            {value}%
+          </SelectItem>
+        ))}
+      </Select>
+    </SettingsRow>
+  );
+}
+
+/** One font row (界面字体 / 代码字体): 系统默认 / 自定义 select. 自定义 shows
+ *  a file picker instead of a family list — the picked file is read through
+ *  the backend, registered as this row's custom family (font.ts) and applied
+ *  at once; the path stays in settings, so returning to 自定义 re-applies it
+ *  without uploading again. `customActive` pins the mode select on 自定义
+ *  while no file has been picked yet (the stored value is still the old
+ *  mode). Web access has no native dialog (and no local file to read), so the
+ *  custom option only exists on desktop. */
+function FontFamilyRow({
+  anchor,
+  label,
+  description,
+  value,
+  filePath,
+  busy,
+  onModeChange,
+  onPickFile,
 }: {
-  settings: AppSettings;
-  pets: PetSummary[];
-  petBusy: boolean;
-  selectedPetId: string;
-  selectedPet: PetSummary | undefined;
-  onPetEnabledChange: (enabled: boolean) => void;
-  onPetScaleChange: (key: Key | null) => void;
-  onPetChange: (key: Key | null) => void;
-  onImportPet: () => Promise<void>;
-  onRemovePet: (pet: PetSummary) => Promise<void>;
+  anchor: string;
+  label: string;
+  description?: string;
+  value: string;
+  filePath: string;
+  busy: boolean;
+  onModeChange: (value: string) => void;
+  onPickFile: () => Promise<boolean>;
 }) {
   const { t } = useTranslation();
+  const [customActive, setCustomActive] = useState(false);
+  const canCustomize = !isWeb;
+  const isCustomValue = canCustomize && normalizeFontMode(value) === CUSTOM_FONT_VALUE;
+  const custom = customActive || isCustomValue;
+  const mode = custom ? "custom" : "default";
+
   return (
-    <div className="flex w-full flex-col gap-2">
-      <SettingsSectionLabel>{t("settings.pet")}</SettingsSectionLabel>
-      <SettingsCard>
-        <SettingsRow
-          label={t("settings.petEnabled")}
-          description={t("settings.petEnabledDesc")}
+    <SettingsRow anchor={anchor} label={label} description={description}>
+      <div className="flex items-center gap-2">
+        <Select
+          aria-label={label}
+          selectedKey={mode}
+          onSelectionChange={(key) => {
+            if (key == null) return;
+            const next = String(key);
+            if (next === "custom") {
+              setCustomActive(true);
+              // 已上传过文件：直接重新应用，不必再选一次。
+              if (filePath) onModeChange("custom");
+              return;
+            }
+            setCustomActive(false);
+            onModeChange("");
+          }}
+          triggerClassName={SELECT_TRIGGER}
         >
-          <Switch
-            size="sm"
-            aria-label={t("settings.petEnabled")}
-            isSelected={settings.petEnabled ?? false}
-            isDisabled={!selectedPet || petBusy}
-            onChange={onPetEnabledChange}
-          />
-        </SettingsRow>
-        {!selectedPet && (
-          <p className="px-3 pb-2 text-body-2-regular text-text-tertiary">
-            {t("settings.petImportRequired")}
-          </p>
-        )}
-        <SettingsRow label={t("settings.petCharacter")}>
-          <div className="flex items-center gap-2">
-            <Select
-              aria-label={t("settings.petCharacter")}
-              selectedKey={selectedPetId || null}
-              isDisabled={pets.length === 0 || petBusy}
-              onSelectionChange={onPetChange}
-              triggerClassName={SELECT_TRIGGER}
-            >
-              {pets.map((pet) => (
-                <SelectItem key={pet.id} id={pet.id} textValue={pet.displayName}>
-                  {pet.displayName}
-                </SelectItem>
-              ))}
-            </Select>
-            <Button size="small" variant="secondary" onClick={() => void onImportPet()} disabled={petBusy}>
-              {t("settings.petImport")}
-            </Button>
-            {selectedPet && (
-              <Button
-                size="small"
-                variant="ghost"
-                onClick={() => void onRemovePet(selectedPet)}
-              >
-                {t("settings.petRemove")}
-              </Button>
-            )}
-          </div>
-        </SettingsRow>
-        <SettingsRow
-          label={t("settings.petScale")}
-        >
-          <Select
-            aria-label={t("settings.petScale")}
-            selectedKey={String(normalizePetScale(settings.petScale))}
-            onSelectionChange={onPetScaleChange}
-            triggerClassName={SELECT_TRIGGER}
+          <SelectItem id="default">{t("settings.fontDefault")}</SelectItem>
+          {canCustomize && <SelectItem id="custom">{t("settings.fontCustom")}</SelectItem>}
+        </Select>
+        {custom && (
+          <Button
+            size="small"
+            variant="secondary"
+            leadingIcon={Upload}
+            disabled={busy}
+            onClick={() => {
+              void onPickFile().then((picked) => {
+                if (picked) setCustomActive(false);
+              });
+            }}
           >
-            {PET_SCALE_OPTIONS.map((value) => (
-              <SelectItem key={value} id={String(value)} textValue={`${value * 100}%`}>
-                {t("settings.petScaleValue", { percent: value * 100 })}
-              </SelectItem>
-            ))}
-          </Select>
-        </SettingsRow>
-      </SettingsCard>
-    </div>
+            <span className="block max-w-56 truncate" title={filePath || undefined}>
+              {filePath ? fileName(filePath) : t("settings.fontChooseFile")}
+            </span>
+          </Button>
+        )}
+      </div>
+    </SettingsRow>
   );
+}
+
+/** Last path segment for the picker button label (both separators). */
+function fileName(path: string): string {
+  return path.split(/[\\/]/).filter(Boolean).pop() ?? path;
 }
 
 /** Behavior card: composer send shortcut, thinking auto-collapse, prompt
@@ -477,7 +503,7 @@ function BehaviorCard({
     <div className="flex w-full flex-col gap-2">
       <SettingsSectionLabel>{t("settings.behavior")}</SettingsSectionLabel>
       <SettingsCard>
-        <SettingsRow label={t("settings.sendShortcut")}>
+        <SettingsRow anchor="sendShortcut" label={t("settings.sendShortcut")}>
           <Select
             aria-label={t("settings.sendShortcut")}
             selectedKey={settings.composerSendShortcut ?? "enter"}
@@ -496,6 +522,7 @@ function BehaviorCard({
         </SettingsRow>
 
         <SettingsRow
+          anchor="thinkingAutoCollapse"
           label={t("settings.thinkingAutoCollapse")}
           description={t("settings.thinkingAutoCollapseDesc")}
         >
@@ -521,13 +548,6 @@ export function GeneralSection() {
     error,
     limitText,
     decorated,
-    pets,
-    petBusy,
-    removingPet,
-    setRemovingPet,
-    removePet,
-    selectedPetId,
-    selectedPet,
     onThemeChange,
     onTitlebarChange,
     onLanguageChange,
@@ -536,10 +556,9 @@ export function GeneralSection() {
     onThreadLimitKeyDown,
     onSendShortcutChange,
     onThinkingAutoCollapseChange,
-    onPetEnabledChange,
-    onPetScaleChange,
-    onPetChange,
-    importPet,
+    fontBusy,
+    onFontModeChange,
+    onFontFilePick,
   } = useGeneralSettingsState();
 
   return (
@@ -557,26 +576,15 @@ export function GeneralSection() {
           settings={settings}
           limitText={limitText}
           decorated={decorated}
+          fontBusy={fontBusy}
           onThemeChange={onThemeChange}
           onTitlebarChange={onTitlebarChange}
           onLanguageChange={onLanguageChange}
+          onFontModeChange={onFontModeChange}
+          onFontFilePick={onFontFilePick}
           onThreadLimitChange={onThreadLimitChange}
           onThreadLimitCommit={commitThreadLimitText}
           onThreadLimitKeyDown={onThreadLimitKeyDown}
-        />
-      )}
-      {settings && (
-        <PetCard
-          settings={settings}
-          pets={pets}
-          petBusy={petBusy}
-          selectedPetId={selectedPetId}
-          selectedPet={selectedPet}
-          onPetEnabledChange={onPetEnabledChange}
-          onPetScaleChange={onPetScaleChange}
-          onPetChange={onPetChange}
-          onImportPet={importPet}
-          onRemovePet={removePet}
         />
       )}
       {settings && (
@@ -587,18 +595,6 @@ export function GeneralSection() {
         />
       )}
       {settings && <PromptHistoryManager />}
-      {removingPet && (
-        <ConfirmDialog
-          danger
-          message={t("settings.petRemoveConfirm", { name: removingPet.displayName })}
-          onCancel={() => setRemovingPet(null)}
-          onConfirm={() => {
-            const pet = removingPet;
-            setRemovingPet(null);
-            void removePet(pet);
-          }}
-        />
-      )}
     </div>
   );
 }

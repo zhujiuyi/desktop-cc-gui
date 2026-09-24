@@ -33,6 +33,7 @@ export function PromptHistoryToggleRow() {
   const [enabled, setEnabled] = useState(isPromptHistoryEnabled);
   return (
     <SettingsRow
+      anchor="promptHistory"
       label={t("settings.promptHistory")}
       description={t("settings.promptHistoryDesc")}
     >
@@ -67,6 +68,7 @@ export function PromptHistoryManager() {
       <SettingsSectionLabel>{t("settings.promptHistoryManage")}</SettingsSectionLabel>
       <SettingsCard>
         <div
+          data-setting-anchor="promptHistoryManage"
           className={cx(
             "flex min-h-[52px] w-full cursor-pointer items-center justify-between gap-4 py-2.5 pr-2.5",
             open && entries.length > 0 && "border-b border-separator-border",

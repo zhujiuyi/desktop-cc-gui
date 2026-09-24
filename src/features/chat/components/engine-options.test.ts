@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { filterEngineOptions } from "./engine-options";
+import { filterEngineOptions, orderEngineOptions } from "./engine-options";
 import type { EngineInfo } from "@/lib/ipc";
 
 function engine(id: string, over: Partial<EngineInfo> = {}): EngineInfo {
@@ -37,5 +37,23 @@ describe("filterEngineOptions", () => {
     expect(out.map((o) => o.id)).toEqual(["omp"]);
     expect(out[0]?.available).toBe(true);
     expect(out[0]?.disabled).toBe(false);
+  });
+});
+
+describe("orderEngineOptions", () => {
+  const options = (ids: string[]) =>
+    filterEngineOptions(ids.map((id) => engine(id)), null, t);
+
+  it("follows the settings rail drag order, keyed cli:<id>", () => {
+    const out = orderEngineOptions(options(["claude", "omp", "kimi"]), [
+      "cli:kimi",
+      "cli:claude",
+    ]);
+    expect(out.map((o) => o.id)).toEqual(["kimi", "claude", "omp"]);
+  });
+
+  it("keeps registry order when no preference is stored", () => {
+    const out = orderEngineOptions(options(["omp", "claude"]), []);
+    expect(out.map((o) => o.id)).toEqual(["omp", "claude"]);
   });
 });

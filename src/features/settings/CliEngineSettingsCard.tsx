@@ -26,7 +26,7 @@ import { Button } from "@/components/base/buttons/button";
 import { Input } from "@/components/base/input/input";
 import { Switch } from "@/components/base/switch/switch";
 import { InfoTip } from "@/components/base/tooltip/tooltip";
-import { SettingsCard } from "@/components/application/settings/settings-rows";
+import { SettingsCard, useSettingsAnchorFlash } from "@/components/application/settings/settings-rows";
 import { ModalShell } from "@/components/dialogs";
 import { CLI_DISPLAY_NAMES } from "@/components/foundations/icons/engine-brands";
 import { ipc, type AppSettings } from "@/lib/ipc";
@@ -76,19 +76,28 @@ function RowShell({
   title,
   desc,
   onClick,
+  anchor,
   children,
 }: {
   title: React.ReactNode;
   desc?: string;
   onClick?: () => void;
+  /** Settings-search anchor for this row (see `settings-search.ts`). */
+  anchor?: string;
   children?: React.ReactNode;
 }) {
   const interactive = Boolean(onClick);
+  const flashing = useSettingsAnchorFlash(anchor);
   return (
     <div
+      data-setting-anchor={anchor}
       role={interactive ? "button" : undefined}
       tabIndex={interactive ? 0 : undefined}
-      className={cx(ROW, interactive && "cursor-pointer")}
+      className={cx(
+        ROW,
+        interactive && "cursor-pointer",
+        flashing && "rounded-2lg ring-2 ring-inset ring-border-focus-ring",
+      )}
       onClick={onClick}
       onKeyDown={(e) => {
         if (!interactive || e.target !== e.currentTarget) return;
@@ -145,6 +154,7 @@ function OfficialRow({
   );
   return (
     <RowShell
+      anchor="cliOfficial"
       title={
         <>
           <ChannelAvatar fallbackEngine={engine} />
@@ -182,6 +192,7 @@ function BinPathRow({ engine }: { engine: BinEngine }) {
   return (
     <>
       <RowShell
+        anchor="cliBinPath"
         title={
           <>
             <span className="truncate">
@@ -298,6 +309,7 @@ function CodexHomeRow() {
   return (
     <>
       <RowShell
+        anchor="cliHomePath"
         title={
           <>
             <span className="truncate">{t("settings.cliCustomHome", { name: CLI_DISPLAY_NAMES.codex })}</span>
@@ -409,6 +421,7 @@ function CustomModelsRow({ engine }: { engine: EngineId }) {
   return (
     <>
       <RowShell
+        anchor="cliCustomModels"
         title={<span className="truncate">{t("settings.cliCustomModels")}</span>}
         desc={t("settings.cliCustomModelsDesc")}
         onClick={() => setOpen(true)}

@@ -120,7 +120,7 @@ export function FileSearchOverlay({ searchRoot }: { searchRoot: string }) {
             setActiveIndex(0);
           }}
           placeholder={t("files.searchPlaceholder")}
-          className="h-9 w-full bg-transparent text-body-medium text-text-primary outline-none placeholder:text-text-placeholder"
+          className="palette-search-field h-9 w-full bg-transparent text-body-medium text-text-primary outline-none placeholder:text-text-placeholder"
         />
       </div>
       <div

@@ -77,6 +77,14 @@ pub struct MessageSearchPage {
     /// Sessions still awaiting (re)indexing at query time. While >0 the hit
     /// list can grow without the query changing.
     pub pending: i64,
+    /// Microseconds spent on the query itself (FTS/LIKE scan + snippet
+    /// build). The bookkeeping counts (pending sessions, corpus size) run
+    /// outside this clock: they measure the index, not the search, and the
+    /// palette's stats line quotes this number as the search time.
+    pub elapsed_us: u64,
+    /// Messages in the content index — the corpus the query ran against.
+    /// Paired with `elapsed_us` in the palette's "searched N messages" line.
+    pub total_messages: i64,
 }
 
 // ==================== Indexer ====================
@@ -137,6 +145,14 @@ fn pending_count(db: &crate::db::Db) -> Result<i64, String> {
         |r| r.get(0),
     )
     .map_err(|e| e.to_string())
+}
+
+/// Messages currently in the content index: the corpus a query runs
+/// against, reported next to the search duration.
+fn message_count(db: &crate::db::Db) -> Result<i64, String> {
+    let conn = db.0.lock();
+    conn.query_row("SELECT COUNT(*) FROM session_messages", [], |r| r.get(0))
+        .map_err(|e| e.to_string())
 }
 
 /// Write the fts_state row shared by the success and failure paths.
@@ -601,13 +617,19 @@ pub fn search(
     let trimmed = query.trim();
     let limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let offset = offset.unwrap_or(0);
+    // Reporting, not searching: the corpus count happens before the elapsed
+    // clock starts (same for the pending count after it stops).
+    let total_messages = message_count(db)?;
     if trimmed.is_empty() {
         return Ok(MessageSearchPage {
             hits: vec![],
             has_more: false,
             pending: pending_count(db)?,
+            elapsed_us: 0,
+            total_messages,
         });
     }
+    let started = std::time::Instant::now();
     let tokens: Vec<&str> = trimmed.split_whitespace().collect();
     let needles: Vec<Vec<char>> = tokens.iter().map(|t| lower_chars(t)).collect();
     let raw = if fts_safe(&tokens) {
@@ -639,10 +661,13 @@ pub fn search(
             }
         })
         .collect();
+    let elapsed_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
     Ok(MessageSearchPage {
         hits,
         has_more,
         pending: pending_count(db)?,
+        elapsed_us,
+        total_messages,
     })
 }
 
@@ -722,6 +747,7 @@ mod tests {
         let page = search(&db, "已生成 v1.0.5 版本记录", None, None).unwrap();
         assert_eq!(page.hits.len(), 1);
         assert_eq!(page.hits[0].session_id, "s1");
+        assert_eq!(page.total_messages, 1, "corpus count the query ran against");
         assert!(marked_text(&page.hits[0]).contains("已生成"));
         // Substring across punctuation is a trigram strength.
         let page = search(&db, "1.0.5", None, None).unwrap();
@@ -743,6 +769,7 @@ mod tests {
         let page = search(&db, "提交 代码", None, None).unwrap();
         let ids: Vec<&str> = page.hits.iter().map(|h| h.session_id.as_str()).collect();
         assert_eq!(ids, ["s2", "s1"], "recency order, both tokens required");
+        assert_eq!(page.total_messages, 3);
         assert!(page.hits[0]
             .snippet
             .iter()
@@ -781,6 +808,7 @@ mod tests {
             .unwrap();
         let page = search(&db, "删除后不可见", None, None).unwrap();
         assert!(page.hits.is_empty());
+        assert_eq!(page.total_messages, 0, "cascade emptied the corpus too");
         let count: i64 =
             db.0.lock()
                 .query_row("SELECT COUNT(*) FROM session_messages", [], |r| r.get(0))

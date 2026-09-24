@@ -2,6 +2,7 @@
 
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { ComponentType, HTMLAttributes, ReactNode, Ref } from "react";
+import { useSettingsAnchorFlash } from "@/components/application/settings/settings-rows";
 import { cx, sortCx } from "@/utils/cx";
 
 const useIsomorphicLayoutEffect = typeof window !== "undefined" ? useLayoutEffect : useEffect;
@@ -163,6 +164,7 @@ export function PillTab({
   isSelected,
   onSelect,
   title,
+  anchor,
   children,
   className,
 }: {
@@ -173,13 +175,18 @@ export function PillTab({
   /** Accessible name + hover hint for the icon-only form (`aria-label` +
    *  `title`); omitted when the label is visible. */
   title?: string;
+  /** Settings-search anchor: a pill that *is* the setting (a settings page
+   *  tab) can be found and revealed by search. */
+  anchor?: string;
   /** Visible label; omit for an icon-only pill. */
   children?: ReactNode;
   className?: string;
 }) {
+  const flashing = useSettingsAnchorFlash(anchor);
   return (
     <button
       type="button"
+      data-setting-anchor={anchor}
       aria-pressed={isSelected}
       aria-label={title}
       title={title}
@@ -191,6 +198,7 @@ export function PillTab({
         styles.radius[variant],
         "outline-none transition-colors duration-150 ease",
         "focus-visible:ring-2 focus-visible:ring-border-focus-ring",
+        flashing && "ring-2 ring-inset ring-border-focus-ring",
         className,
       )}
     >

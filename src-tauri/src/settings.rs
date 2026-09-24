@@ -88,6 +88,23 @@ pub struct AppSettings {
     /// behind a "show more" row.
     #[serde(default = "default_sidebar_thread_limit")]
     pub sidebar_thread_limit: u32,
+    /// UI font (设置 → 外观): "" = 系统默认 (bundled stack + system fallback;
+    /// the legacy "system" value is normalized to it frontend-side),
+    /// "custom" = the uploaded file in `font_file`.
+    #[serde(default)]
+    pub font_family: String,
+    /// Absolute path of the uploaded UI font file; only read while
+    /// `font_family == "custom"` (the frontend registers it as a FontFace).
+    #[serde(default)]
+    pub font_file: String,
+    /// Code font for chat code blocks and the built-in terminal: "" = 系统默认,
+    /// "custom" = the uploaded file in `code_font_file`.
+    #[serde(default)]
+    pub code_font_family: String,
+    /// Absolute path of the uploaded code font file (same contract as
+    /// `font_file`, for the code row).
+    #[serde(default)]
+    pub code_font_file: String,
     /// Composer send gesture: "enter" (Enter sends, Shift+Enter newline) or
     /// "cmdEnter" (Cmd/Ctrl+Enter sends, Enter newline).
     #[serde(default = "default_composer_send_shortcut")]
@@ -314,6 +331,10 @@ impl Default for AppSettings {
             codex_service_tier: None,
             codex_home: None,
             sidebar_thread_limit: default_sidebar_thread_limit(),
+            font_family: String::new(),
+            font_file: String::new(),
+            code_font_family: String::new(),
+            code_font_file: String::new(),
             composer_send_shortcut: default_composer_send_shortcut(),
             new_session_shortcut: default_new_session_shortcut(),
             interrupt_shortcut: None,
@@ -1123,6 +1144,28 @@ mod tests {
         assert!(serde_json::to_string(&mac)
             .unwrap()
             .contains("\"titlebar\":\"mac\""));
+    }
+    #[test]
+    fn font_fields_default_to_bundled_and_round_trip_camel_case() {
+        let parsed: AppSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            parsed.font_family, "",
+            "旧设置文件没有 fontFamily 字段 → 视为内置字体，不能崩"
+        );
+        assert_eq!(parsed.font_file, "");
+        assert_eq!(parsed.code_font_family, "");
+        assert_eq!(parsed.code_font_file, "");
+        let custom: AppSettings = serde_json::from_str(
+            r#"{"fontFamily":"custom","fontFile":"/tmp/My Font.ttf","codeFontFamily":"system"}"#,
+        )
+        .unwrap();
+        assert_eq!(custom.font_family, "custom");
+        assert_eq!(custom.font_file, "/tmp/My Font.ttf");
+        assert_eq!(custom.code_font_family, "system");
+        let json = serde_json::to_string(&custom).unwrap();
+        assert!(json.contains("\"fontFamily\":\"custom\""));
+        assert!(json.contains("\"fontFile\":\"/tmp/My Font.ttf\""));
+        assert!(json.contains("\"codeFontFamily\":\"system\""));
     }
 
     #[test]

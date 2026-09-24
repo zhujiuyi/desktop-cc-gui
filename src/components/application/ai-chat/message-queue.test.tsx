@@ -52,6 +52,39 @@ describe("MessageQueue", () => {
     expect(onSendNow).toHaveBeenCalledWith("q-2");
   });
 
+  it("moves a row one step in the direction its arrow names", async () => {
+    const onMove = vi.fn();
+    await render({ onMove });
+
+    const up = [...container.querySelectorAll<HTMLButtonElement>("button[aria-label='上移']")];
+    const down = [...container.querySelectorAll<HTMLButtonElement>("button[aria-label='下移']")];
+    expect(up).toHaveLength(2);
+    expect(down).toHaveLength(2);
+
+    // Newest first: the top row cannot go up, the bottom row cannot go down.
+    expect(up[0].disabled).toBe(true);
+    expect(down[0].disabled).toBe(false);
+    expect(up[1].disabled).toBe(false);
+    expect(down[1].disabled).toBe(true);
+
+    await act(async () => {
+      down[0].dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(onMove).toHaveBeenCalledWith("q-2", "down");
+
+    await act(async () => {
+      up[1].dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(onMove).toHaveBeenLastCalledWith("q-1", "up");
+  });
+
+  it("leaves the reorder arrows out when a single message is queued", async () => {
+    await render({ onMove: () => {}, queue: [QUEUE[0]] });
+
+    expect(container.querySelectorAll("button[aria-label='上移']")).toHaveLength(0);
+    expect(container.querySelectorAll("button[aria-label='下移']")).toHaveLength(0);
+  });
+
   it("leaves the row actions out when the caller cannot send now", async () => {
     await render();
 

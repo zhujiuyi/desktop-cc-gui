@@ -37,6 +37,7 @@ export function SkillsSection() {
           <PillTab
             key={id}
             variant="gray"
+            anchor={id}
             isSelected={tab === id}
             onSelect={() => setTab(id)}
           >

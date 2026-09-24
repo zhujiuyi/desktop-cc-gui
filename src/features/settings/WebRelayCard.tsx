@@ -124,6 +124,7 @@ export function WebRelayCard({
   return (
     <SettingsCard>
       <SettingsRow
+        anchor="webRelay"
         label={t("settings.webRelay")}
         labelAdornment={
           <Tooltip delay={150}>

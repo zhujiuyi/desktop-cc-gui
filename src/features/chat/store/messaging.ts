@@ -91,6 +91,7 @@ export function createMessagingActions(
   | "resendLastUser"
   | "queueMessage"
   | "removeQueued"
+  | "moveQueued"
   | "clearQueue"
   | "sendQueuedNow"
   | "interrupt"
@@ -584,6 +585,35 @@ export function createMessagingActions(
               ...prev,
               queue: prev.queue.filter((item) => item.id !== id),
             },
+          },
+        };
+      });
+    },
+    /** Reorder one queued message a single step. The card paints newest
+     *  first, so "up" walks the row toward the end of the send order (sent
+     *  later) and "down" toward the head (sent sooner); a move past either
+     *  end is a no-op. */
+    moveQueued: (id, direction) => {
+      const { active } = get();
+      if (!active) return;
+      const key = sessionKey(
+        active.engine,
+        active.sessionId,
+        active.workspacePath,
+      );
+      set((s) => {
+        const prev = s.bySession[key];
+        if (!prev) return {};
+        const index = prev.queue.findIndex((item) => item.id === id);
+        if (index < 0) return {};
+        const target = direction === "up" ? index + 1 : index - 1;
+        if (target < 0 || target >= prev.queue.length) return {};
+        const queue = [...prev.queue];
+        [queue[index], queue[target]] = [queue[target], queue[index]];
+        return {
+          bySession: {
+            ...s.bySession,
+            [key]: { ...prev, queue },
           },
         };
       });

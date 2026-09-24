@@ -159,7 +159,7 @@ export function CommandPalette() {
             }}
             placeholder={t("commands.placeholder")}
             aria-label={t("commands.placeholder")}
-            className="h-11 w-full bg-transparent text-body-medium text-text-primary outline-none placeholder:text-text-placeholder"
+            className="palette-search-field h-11 w-full bg-transparent text-body-medium text-text-primary outline-none placeholder:text-text-placeholder"
           />
         </div>
         <div ref={listRef} role="listbox" className="max-h-[320px] overflow-y-auto p-2">

@@ -407,6 +407,11 @@ function WorktreeChildRow({
   const missing = useWorktreeStore((s) =>
     repo.path ? s.missingPaths[repo.path] === true : false,
   );
+  // 收起时把线程运行状态聚合到本行（展开时各线程行自己带状态点）：任一
+  // 线程流式中即显示呼吸点；全部流式线程都在退避重试时降为静态点，与会
+  // 话行 / 页签同一套 `sidebar-thread-status` 视觉语言。
+  const running = repo.threads.some((th) => th.streaming);
+  const retrying = running && repo.threads.every((th) => !th.streaming || th.retrying);
   return (
     <div
       onContextMenu={onContextMenu}
@@ -431,6 +436,9 @@ function WorktreeChildRow({
           )}
         />
         <GitBranch aria-hidden className="size-3.5 shrink-0 text-foreground-icon-tertiary" />
+        {!expanded && running && (
+          <ThreadStatusDot streaming retrying={retrying} unseen={false} />
+        )}
         <span className="min-w-0 flex-1 truncate text-body-2-medium text-text-secondary">
           {repo.label}
         </span>

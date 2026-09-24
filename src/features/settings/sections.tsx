@@ -1,6 +1,7 @@
 import { lazy, Suspense, type ComponentType } from "react";
 import { useTranslation } from "react-i18next";
 import Settings from "lucide-react/dist/esm/icons/settings";
+import PawPrint from "lucide-react/dist/esm/icons/paw-print";
 import Keyboard from "lucide-react/dist/esm/icons/keyboard";
 import Globe from "lucide-react/dist/esm/icons/globe";
 import FolderSymlink from "lucide-react/dist/esm/icons/folder-symlink";
@@ -23,6 +24,7 @@ import { CLI_DISPLAY_NAMES } from "@/components/foundations/icons/engine-brands"
 import { settingsRegistry } from "@ccgui/plugin-sdk";
 import { cx } from "@/utils/cx";
 import { GeneralSection } from "./GeneralSection";
+import { PetSection } from "./PetSection";
 import { ProxySection } from "./ProxySection";
 import { WorkspacesSection } from "./WorkspacesSection";
 import { ArchivedSessionsSection } from "./ArchivedSessionsSection";
@@ -36,6 +38,8 @@ import { WebAccessSection } from "./WebAccessSection";
 import { UsageSection } from "./UsageSection";
 import { ShortcutsSection } from "@/features/shortcuts/ShortcutsSection";
 import { ENGINE_IDS, type EngineId } from "./providers";
+import { builtinSearchEntries } from "./builtin-search";
+import { registerSettingsSearchEntries } from "./settings-search";
 
 /**
  * Builtin settings sections, registered through the same extension-point
@@ -70,6 +74,9 @@ settingsRegistry.register({
   order: 0,
   component: GeneralSection,
 });
+// 页面内部的搜索行索引（settings-search.ts）：跟页面一起注册。覆盖了哪些页
+// 在 builtin-search.ts 里一眼能看全（每页一段）。
+registerSettingsSearchEntries(builtinSearchEntries);
 settingsRegistry.register({
   id: "proxy",
   key: "proxy",
@@ -203,6 +210,15 @@ settingsRegistry.register({
 //   order: 2,
 //   component: LazyComputerUseSection,
 // });
+settingsRegistry.register({
+  id: "pet",
+  key: "pet",
+  label: () => i18n.t("settings.pet"),
+  icon: PawPrint,
+  group: "misc",
+  order: 4,
+  component: PetSection,
+});
 settingsRegistry.register({
   id: "update",
   key: "update",

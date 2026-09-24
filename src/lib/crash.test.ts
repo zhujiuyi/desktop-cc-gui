@@ -99,4 +99,32 @@ describe("crash store", () => {
     expect(getCrashSnapshot()?.benign).toBeUndefined();
     expect(getCrashReports()).toHaveLength(2);
   });
+
+  it("records failed background network requests without surfacing a crash", () => {
+    installGlobalCrashHandlers();
+    const rejectWith = (reason: unknown) => {
+      // jsdom has no PromiseRejectionEvent; the handler only reads `reason`.
+      const event = new Event("unhandledrejection") as Event & { reason: unknown };
+      event.reason = reason;
+      window.dispatchEvent(event);
+    };
+
+    // The updater check failing while offline (reqwest's exact wording) is an
+    // environment condition, not an app crash.
+    rejectWith(
+      "error sending request for url (https://github.com/zhukunpenglinyutong/desktop-cc-gui/releases/latest/download/latest.json)",
+    );
+    rejectWith(new TypeError("Load failed"));
+
+    expect(getCrashReports()).toHaveLength(2);
+    expect(getCrashReports()[0]).toMatchObject({ source: "unhandledrejection", benign: true });
+    expect(getCrashReports()[1]).toMatchObject({ source: "unhandledrejection", benign: true });
+    expect(getCrashSnapshot()).toBeNull();
+    expect(localStorage.getItem(LAST_CRASH_STORAGE_KEY)).toBeNull();
+
+    // A real rejection still puts up the crash screen.
+    rejectWith(new Error("boom"));
+    expect(getCrashSnapshot()?.message).toBe("boom");
+    expect(getCrashSnapshot()?.benign).toBeUndefined();
+  });
 });
