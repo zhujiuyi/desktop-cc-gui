@@ -7,7 +7,8 @@ const mission = (runs: Record<string, unknown>) => ({ runs }) as never;
 const firstStatus = (
   chatState: Parameters<typeof derivePetStates>[0],
   missionState: Parameters<typeof derivePetStates>[1],
-) => derivePetStates(chatState, missionState)[0]?.status;
+  now?: number,
+) => derivePetStates(chatState, missionState, now)[0]?.status;
 
 describe("pet state aggregation", () => {
   it("works on the v1.0.8 session shape without PR #1266 task signals", () => {
@@ -270,5 +271,120 @@ describe("pet state aggregation", () => {
       ["claude/session-a", "会话 A"],
       ["claude/session-b", "会话 B"],
     ]);
+  });
+});
+
+describe("failure flash and round scoping", () => {
+  // 显式"现在"：暂显窗口按时间判定，用真实时钟会漂移。
+  const NOW = 1_800_000_000_000;
+  const failedTask = (updatedAt: number) => ({ status: "failed", updatedAt });
+
+  it("flashes a fresh failure even while the round keeps working", () => {
+    expect(
+      firstStatus(
+        chat({
+          error: null,
+          streaming: true,
+          backgroundActive: true,
+          awaitingTasks: false,
+          messages: [],
+          tasks: [failedTask(NOW - 1_000)],
+        }),
+        mission({}),
+        NOW,
+      ),
+    ).toBe("failed");
+  });
+
+  it("hands back to the remaining work once the flash window passes", () => {
+    expect(
+      firstStatus(
+        chat({
+          error: null,
+          streaming: false,
+          backgroundActive: true,
+          awaitingTasks: false,
+          messages: [],
+          tasks: [failedTask(NOW - 6_000)],
+        }),
+        mission({}),
+        NOW,
+      ),
+    ).toBe("running");
+  });
+
+  it("hands back to waiting while the round still awaits its tasks", () => {
+    expect(
+      firstStatus(
+        chat({
+          error: null,
+          streaming: false,
+          backgroundActive: false,
+          awaitingTasks: true,
+          messages: [],
+          tasks: [failedTask(NOW - 6_000)],
+        }),
+        mission({}),
+        NOW,
+      ),
+    ).toBe("waiting");
+  });
+
+  it("keeps the failure after the round only when nothing followed it", () => {
+    expect(
+      firstStatus(
+        chat({
+          error: null,
+          streaming: false,
+          backgroundActive: false,
+          awaitingTasks: false,
+          messages: [],
+          tasks: [failedTask(NOW - 60_000)],
+        }),
+        mission({}),
+        NOW,
+      ),
+    ).toBe("failed");
+  });
+
+  it("drops the old failure once a later task settles", () => {
+    expect(
+      derivePetStates(
+        chat({
+          error: null,
+          streaming: false,
+          backgroundActive: false,
+          awaitingTasks: false,
+          messages: [],
+          tasks: [failedTask(NOW - 60_000), { status: "completed", updatedAt: NOW - 10_000 }],
+        }),
+        mission({}),
+        NOW,
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("drops the old failure once the conversation moved on", () => {
+    expect(
+      derivePetStates(
+        chat({
+          error: null,
+          streaming: false,
+          backgroundActive: false,
+          awaitingTasks: false,
+          tasks: [failedTask(NOW - 60_000)],
+          messages: [
+            {
+              role: "assistant",
+              text: "那个任务失败了，我换条路继续。",
+              ts: new Date(NOW - 5_000).toISOString(),
+              seq: 1,
+            },
+          ],
+        }),
+        mission({}),
+        NOW,
+      ),
+    ).toHaveLength(0);
   });
 });

@@ -33,6 +33,7 @@ interface PetTaskSignal {
   progress?: string;
   lastTool?: string;
   ambient?: boolean;
+  updatedAt?: number;
 }
 
 interface PetSessionCompatibility {
@@ -98,18 +99,36 @@ function missionPetStatus(runs: Record<string, MissionRun>): PetStatus | null {
   return null;
 }
 
-/** The freshest non-ambient task outcome is a failure. "Freshest" is array
- *  order (tasks only ever append or update in place), so a later task's
- *  settlement supersedes an earlier failure — the pet never pins 任务失败
- *  once newer work has had the last word. `interrupted`/`stopped` are not
- *  failures — a stop the user asked for must not read as one — and ambient
- *  monitors never drive the session-facing state. */
-function latestTaskFailed(tasks: PetTaskSignal[]): boolean {
-  for (let i = tasks.length - 1; i >= 0; i--) {
-    if (tasks[i].ambient) continue;
-    return tasks[i].status === "failed";
+/** 失败暂显时长：与 PetRuntime 的「已完成」暂显（5.4s）同节奏。 */
+const FAILURE_FLASH_MS = 5400;
+
+function taskTime(task: PetTaskSignal): number {
+  return typeof task.updatedAt === "number" ? task.updatedAt : Number.NEGATIVE_INFINITY;
+}
+
+/** Newest non-ambient task by last update time (array order breaks ties).
+ *  Ambient monitors never drive the session-facing state. */
+function newestNonAmbientTask(tasks: PetTaskSignal[]): PetTaskSignal | null {
+  let newest: PetTaskSignal | null = null;
+  for (const task of tasks) {
+    if (task.ambient) continue;
+    if (!newest || taskTime(task) >= taskTime(newest)) newest = task;
   }
-  return false;
+  return newest;
+}
+
+/** Parsed timestamp of the conversation's latest dated message; null when no
+ *  message carries one (engine-dependent). ts is RFC3339 or epoch millis as
+ *  a string. */
+function lastMessageTime(session: SessionState): number | null {
+  const messages = session.messages ?? [];
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const ts = messages[i]?.ts;
+    if (!ts) continue;
+    const ms = /^\d+$/.test(ts) ? Number(ts) : Date.parse(ts);
+    if (Number.isFinite(ms)) return ms;
+  }
+  return null;
 }
 
 function sessionNameFromState(session: SessionState): string | null {
@@ -124,6 +143,7 @@ function stateForSession(
   key: string,
   session: SessionState,
   sessionName: string | null,
+  now: number,
 ): PetStateSnapshot | null {
   const base = {
     sessionKey: key,
@@ -131,6 +151,18 @@ function stateForSession(
     lookDirection: 0,
   } as const;
   const signals = petSignals(session);
+  const newest = newestNonAmbientTask(signals.tasks ?? []);
+  const failedAt =
+    newest && newest.status === "failed" ? taskTime(newest) : Number.NEGATIVE_INFINITY;
+
+  if (session.error) {
+    return { ...base, status: "failed", activity: "failed" };
+  }
+  // ① 失败即显示：刚结算的失败先置顶暂显——即便本轮仍在进行也先露脸；
+  // ② 暂显过后让位给该会话的实时状态（后续任务/思考/等待），失败不锁屏。
+  if (Number.isFinite(failedAt) && now >= failedAt && now - failedAt <= FAILURE_FLASH_MS) {
+    return { ...base, status: "failed", activity: "failed" };
+  }
   if (session.streaming || signals.backgroundActive === true) {
     return { ...base, status: "running", activity: runningActivity([session]) };
   }
@@ -139,16 +171,27 @@ function stateForSession(
   if (signals.awaitingTasks === true) {
     return { ...base, status: "waiting", activity: "waiting" };
   }
-  if (session.error || latestTaskFailed(signals.tasks ?? [])) {
-    return { ...base, status: "failed", activity: "failed" };
+  // ③ 收尾持续：会话已结束，且失败之后该会话再无任何活动（没有更新的任务
+  // 结算——newest 已是失败；也没有更晚的消息）时，失败作为本轮的最后一个
+  // 状态持续显示；此后任何新一轮活动都会把它清掉。`interrupted`/`stopped`
+  // 不算失败：用户主动停止不是失败。
+  if (newest && newest.status === "failed") {
+    const lastAt = lastMessageTime(session);
+    // 完全没有时间戳时（旧引擎/夹具）＝没有"后续活动"的证据，保守地按
+    // 持续失败处理（与引入时间戳前的行为一致）。
+    if (lastAt === null || !Number.isFinite(failedAt) || lastAt <= failedAt) {
+      return { ...base, status: "failed", activity: "failed" };
+    }
   }
   return null;
 }
 
-/** Derive one status per active session so the overlay can distinguish them. */
+/** Derive one status per active session so the overlay can distinguish them.
+ *  `now` exists for tests: the failure flash window is time-based. */
 export function derivePetStates(
   chat: PetChatState,
   mission: { runs: Record<string, MissionRun> },
+  now: number = Date.now(),
 ): PetStateSnapshot[] {
   const metadataByKey = new Map(
     (chat.sessions ?? []).map((meta) => [
@@ -170,7 +213,7 @@ export function derivePetStates(
     const meta = metadataByKey.get(key);
     const sessionName =
       meta?.customTitle?.trim() || meta?.title?.trim() || sessionNameFromState(session);
-    const state = stateForSession(key, session, sessionName || null);
+    const state = stateForSession(key, session, sessionName || null, now);
     if (state) states.push(state);
   }
 
