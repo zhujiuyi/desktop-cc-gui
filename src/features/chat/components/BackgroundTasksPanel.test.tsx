@@ -67,16 +67,49 @@ describe("BackgroundTasksPanel", () => {
     // Group header carries the turn time, one per run.
     expect(text).toContain("回合");
     expect(text.match(/回合/g)).toHaveLength(2);
-    // Labels fall back through workflowName → subagentType → description.
+    // Labels fall back through workflowName → description → subagentType.
     expect(text).toContain("ccgui-full-parse");
-    expect(text).toContain("general-purpose");
+    expect(text).toContain("读文档");
     // One badge per task, keyed off its status.
     expect(text).toContain("运行中");
     expect(text).toContain("已完成");
     // Live activity line renders under the row.
     expect(text).toContain("Running Wait 590 seconds");
     // The running run floats above the newer settled one.
-    expect(text.indexOf("ccgui-full-parse")).toBeLessThan(text.indexOf("general-purpose"));
+    expect(text.indexOf("ccgui-full-parse")).toBeLessThan(text.indexOf("读文档"));
+  });
+
+  /** 回合组头跨天不能只给时分：今天 HH:mm，今年 MM-dd HH:mm，更早全日期
+   *  （与 MessageTimeline 的 formatMessageTime 同一模式）。 */
+  it("dates a turn group header once it is not from today", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date(2026, 8, 24, 10, 0));
+      seed([
+        task({
+          id: "today", status: "completed",
+          startedAt: new Date(2026, 8, 24, 9, 5).getTime(),
+          updatedAt: new Date(2026, 8, 24, 9, 6).getTime(),
+        }),
+        task({
+          id: "this-year", runId: "r2", status: "completed",
+          startedAt: new Date(2026, 8, 20, 8, 30).getTime(),
+          updatedAt: new Date(2026, 8, 20, 8, 31).getTime(),
+        }),
+        task({
+          id: "last-year", runId: "r3", status: "completed",
+          startedAt: new Date(2025, 11, 31, 23, 40).getTime(),
+          updatedAt: new Date(2025, 11, 31, 23, 41).getTime(),
+        }),
+      ]);
+      await renderPanel();
+      const text = container.textContent ?? "";
+      expect(text).toContain("回合 09:05");
+      expect(text).toContain("回合 09-20 08:30");
+      expect(text).toContain("回合 2025-12-31 23:40");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("shows the empty state when the session has no tasks", async () => {
@@ -140,5 +173,15 @@ describe("BackgroundTasksPanel", () => {
       root.render(<BackgroundTasksLine count={2} />);
     });
     expect(container.textContent).toContain("后台任务运行中 · 2 个");
+  });
+
+  /** Reduced-motion 降级：脉冲点必须静止。 */
+  it("stills the BackgroundTasksLine pulse under reduced motion", async () => {
+    await act(async () => {
+      root.render(<BackgroundTasksLine count={1} />);
+    });
+    const dot = container.querySelector(".animate-pulse");
+    expect(dot).not.toBeNull();
+    expect(dot!.className).toContain("motion-reduce:animate-none");
   });
 });

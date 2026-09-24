@@ -41,10 +41,58 @@ describe("background task helpers", () => {
       task({ id: "f", status: "failed", description: "挂了" }),
     ], null);
     expect(steps).toEqual([
-      { key: "w", label: "ccgui-full-parse", state: "active" },
-      { key: "a", label: "general-purpose", state: "complete" },
-      { key: "f", label: "挂了", state: "failed" },
+      { key: "w", label: "ccgui-full-parse", state: "active", subagentType: undefined, detail: "d" },
+      { key: "a", label: "读文档", state: "complete", subagentType: "general-purpose", detail: "读文档" },
+      { key: "f", label: "挂了", state: "failed", subagentType: undefined, detail: "挂了" },
     ]);
+  });
+
+  /** The brief (description) names a task better than its bare type: two
+   *  general-purpose subagents stay distinguishable. The type chip still
+   *  gets subagentType, and the detail overlay the brief. */
+  it("labels a step by its brief before its type, localizing the bare-type fallback", () => {
+    const steps = stepsFromTasks([
+      task({ id: "brief", description: "读文档", subagentType: "general-purpose" }),
+      task({ id: "typed", description: "", subagentType: "code-reviewer" }),
+      task({ id: "bare", taskType: "local_bash", description: "" }),
+    ], null, (type) => (type === "local_bash" ? "后台命令" : type));
+    expect(steps.map((s) => [s.label, s.subagentType, s.detail])).toEqual([
+      ["读文档", "general-purpose", "读文档"],
+      ["code-reviewer", "code-reviewer", undefined],
+      ["后台命令", undefined, undefined],
+    ]);
+  });
+
+  /** stopped/interrupted are NOT "completed": the pill must not show a green
+   *  已完成 where the panel shows 已停止/已中断. */
+  it("keeps stopped and interrupted distinct from completed", () => {
+    const steps = stepsFromTasks([
+      task({ id: "s", status: "stopped" }),
+      task({ id: "i", status: "interrupted" }),
+      task({ id: "c", status: "completed" }),
+    ], null);
+    expect(steps.map((s) => s.state)).toEqual(["stopped", "interrupted", "complete"]);
+  });
+
+  /** A fresh run's id is written optimistically on send, BEFORE its first
+   *  task frame: scoping to it would empty the pill mid-gap (blinking it
+   *  away and collapsing an open panel). Freeze on the settled table until
+   *  the new run actually reports a task. */
+  it("freezes on the settled table while a fresh run has reported no tasks", () => {
+    const history = [
+      task({ id: "old-1", runId: "r1", status: "completed" }),
+      task({ id: "old-2", runId: "r1", status: "failed" }),
+      task({ id: "amb", runId: "r1", ambient: true }),
+    ];
+    const frozen = stepsFromTasks(history, "r2");
+    expect(frozen.map((s) => s.key)).toEqual(["old-1", "old-2"]);
+    // The new run's first task frame switches the pill to the new turn.
+    const live = stepsFromTasks([...history, task({ id: "new-1", runId: "r2" })], "r2");
+    expect(live.map((s) => s.key)).toEqual(["new-1"]);
+  });
+
+  it("shows nothing for a fresh run when history holds only ambient tasks", () => {
+    expect(stepsFromTasks([task({ id: "amb", ambient: true })], "r2")).toEqual([]);
   });
 
   /** The pill is a turn-level surface: ambient housekeeping never belongs to

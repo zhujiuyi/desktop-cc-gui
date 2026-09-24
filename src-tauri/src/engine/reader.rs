@@ -45,6 +45,13 @@ const BACKGROUND_GRACE: std::time::Duration = std::time::Duration::from_secs(30)
 /// sweep live tasks (stdin stays open while they run), so this is the only
 /// lever left on a task that wedges without ever emitting a final frame.
 const BACKGROUND_STALL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// Absolute wall-clock bound on one background phase, measured from its
+/// first pending task. BACKGROUND_STALL re-arms on every task/content frame
+/// — deliberately, so live work is never cut — but a CLI that wedges into a
+/// heartbeat loop must not pin stdin, the process, and a concurrency slot
+/// forever. Four hours is far past any task the CLI reports (before this
+/// lifecycle change its own wind-down swept them at ~10 minutes).
+const BACKGROUND_ABS_CAP: std::time::Duration = std::time::Duration::from_secs(4 * 60 * 60);
 /// Hard cap on one NDJSON line from an engine. Real events are kilobytes;
 /// `BufReader::lines` has no limit, so a runaway engine writing without
 /// newlines would buffer the line whole and OOM the host.
@@ -187,6 +194,17 @@ pub(crate) struct TurnState {
     pub(crate) awaiting_tasks: bool,
     /// When set, the read loop closes stdin once this instant passes.
     pub(crate) close_deadline: Option<tokio::time::Instant>,
+    /// Pending tasks inserted from a `task_started` frame that no
+    /// `background_tasks_changed` level frame has vouched for yet. The start
+    /// frame carries no ambient flag, so a session-scoped task can sit here
+    /// until the next REPLACE evicts it; while an id is in this set its
+    /// progress frames do NOT re-arm the stall bound, or a stranded ambient
+    /// heartbeat would defer stdin closure forever.
+    pub(crate) pending_unconfirmed: std::collections::HashSet<String>,
+    /// First instant of the current background phase (its first pending
+    /// task). Caps every re-armed deadline at BACKGROUND_ABS_CAP from this
+    /// point; reset when the pending set empties.
+    pub(crate) bg_phase_started: Option<tokio::time::Instant>,
 }
 impl TurnState {
     pub(crate) fn new(preassigned: Option<String>) -> Self {
@@ -206,6 +224,8 @@ impl TurnState {
             pending_tasks: std::collections::HashMap::new(),
             awaiting_tasks: false,
             close_deadline: None,
+            pending_unconfirmed: std::collections::HashSet::new(),
+            bg_phase_started: None,
         }
     }
 
@@ -353,19 +373,31 @@ fn suppressed_after_terminal(state: &TurnState, event: &EngineEvent) -> bool {
     !(state.awaiting_tasks && continues_after_done(event))
 }
 
-/// Next stdin-close deadline for the current background state: 30s once
-/// nothing is running (leave room for the completion turn), a 30-minute
-/// silence bound while tasks are live (re-armed by every task frame), and
-/// `None` when not awaiting.
-fn next_close_deadline(
-    pending: usize,
-    awaiting: bool,
-    now: tokio::time::Instant,
-) -> Option<tokio::time::Instant> {
-    if !awaiting {
-        return None;
+/// Recompute the stdin-close deadline from the run's current phase:
+/// - settled reply still awaiting its background phase (`saw_done &&
+///   awaiting`): the 30s grace once nothing is pending — room for the CLI's
+///   completion turn to start — and the 30-minute silence bound while tasks
+///   are live;
+/// - a turn still open with live background tasks: the 30-minute silence
+///   bound, re-armed by task frames AND by the turn's own content frames,
+///   so a long follow-up/user turn is never EOF'd mid-generation;
+/// - anything else (an active turn with nothing pending): no deadline, the
+///   pre-background lifecycle behavior.
+/// A deadline is never set past BACKGROUND_ABS_CAP from the phase's first
+/// task, so a heartbeat-looping CLI cannot pin the run forever.
+fn refresh_close_deadline(state: &mut TurnState, now: tokio::time::Instant) {
+    if state.pending_tasks.is_empty() {
+        state.bg_phase_started = None;
+        state.close_deadline = if state.saw_done && state.awaiting_tasks {
+            Some(now + BACKGROUND_GRACE)
+        } else {
+            None
+        };
+        return;
     }
-    Some(now + if pending == 0 { BACKGROUND_GRACE } else { BACKGROUND_STALL })
+    let phase_start = *state.bg_phase_started.get_or_insert(now);
+    state.close_deadline =
+        Some((now + BACKGROUND_STALL).min(phase_start + BACKGROUND_ABS_CAP));
 }
 /// Final level frame for a run that dies with tasks still pending. `saw_done`
 /// is already true (the reply settled, its background phase was still open), so
@@ -436,19 +468,22 @@ impl TurnCore {
             // reach here: suppressed_after_terminal drops them above.)
             state.saw_done = false;
             state.awaiting_tasks = false;
-            // The follow-up turn may wedge before its done. With tasks still
-            // pending, re-arm the stall bound (not the 30s grace — that would
-            // EOF stdin into the turn's preamble) so a silent CLI cannot pin
-            // this run's stdin, process, and concurrency slot forever.
-            state.close_deadline = if state.pending_tasks.is_empty() {
-                None
+            if state.pending_tasks.is_empty() {
+                // Nothing left to bound this phase — but a lone preamble
+                // frame (a late SessionId racing the done, a usage tail) is
+                // not proof a real turn follows. Keep a bounded fallback: the
+                // turn's first content frame clears it via the renewal below,
+                // while a stray frame lets the stall bound close stdin
+                // instead of stranding the run open forever.
+                state.close_deadline =
+                    Some(tokio::time::Instant::now() + BACKGROUND_STALL);
             } else {
-                next_close_deadline(
-                    state.pending_tasks.len(),
-                    true,
-                    tokio::time::Instant::now(),
-                )
-            };
+                // Tasks still pending: re-arm the (capped) stall bound — not
+                // the 30s grace, which would EOF stdin into the turn's
+                // preamble. A follow-up turn that wedges before its done must
+                // not pin stdin, the process, and its concurrency slot.
+                refresh_close_deadline(state, tokio::time::Instant::now());
+            }
         }
         // Track content per turn: the Done arm uses it to tell a real reply
         // ending from a queued notification-only turn (see `saw_content`).
@@ -457,6 +492,15 @@ impl TurnCore {
             EngineEvent::Delta(_) | EngineEvent::Thinking(_) | EngineEvent::Message { .. }
         ) {
             state.saw_content = true;
+            // A turn that keeps producing content is alive: re-arm the
+            // silence bound (or drop it once nothing is pending) so a long
+            // follow-up/user turn is never EOF'd mid-generation — the
+            // deadline exists to bound silence, never speech.
+            if !state.saw_done
+                && (state.close_deadline.is_some() || !state.pending_tasks.is_empty())
+            {
+                refresh_close_deadline(state, tokio::time::Instant::now());
+            }
         }
         match event {
             EngineEvent::Delta(text) => {
@@ -752,9 +796,12 @@ impl TurnCore {
             } => {
                 // task_started carries no ambient flag (known gap): a
                 // session-scoped task inserted here is corrected by the next
-                // background_tasks_changed REPLACE. Until then it can hold the
-                // run open, so only a genuinely new entry may move the
-                // deadline — duplicates must not re-arm it.
+                // background_tasks_changed REPLACE. Until that level frame
+                // vouches for the entry it stays `pending_unconfirmed`: it may
+                // hold the run open, but its progress frames do NOT re-arm the
+                // stall bound — a stranded ambient heartbeat must not defer
+                // stdin closure forever. Only a genuinely new entry may move
+                // the deadline — duplicates must not re-arm it.
                 let inserted = state
                     .pending_tasks
                     .insert(
@@ -768,11 +815,8 @@ impl TurnCore {
                     )
                     .is_none();
                 if inserted {
-                    state.close_deadline = next_close_deadline(
-                        state.pending_tasks.len(),
-                        state.awaiting_tasks || state.close_deadline.is_some(),
-                        tokio::time::Instant::now(),
-                    );
+                    state.pending_unconfirmed.insert(id.clone());
+                    refresh_close_deadline(state, tokio::time::Instant::now());
                 }
                 state.push(
                     &self.sink,
@@ -803,13 +847,14 @@ impl TurnCore {
                 // task wedged without a final frame. A frame for a task that is
                 // not pending is deliberately left alone even when nothing else
                 // is pending: that is exactly the ambient case, and recomputing
-                // there would hand out the 30s grace at every heartbeat.
-                if state.pending_tasks.contains_key(&id) {
-                    state.close_deadline = next_close_deadline(
-                        state.pending_tasks.len(),
-                        state.awaiting_tasks || state.close_deadline.is_some(),
-                        tokio::time::Instant::now(),
-                    );
+                // there would hand out the 30s grace at every heartbeat. The
+                // same holds for an entry no level frame has confirmed yet
+                // (pending_unconfirmed): it entered through the task_started
+                // ambient gap, so its heartbeats must not re-arm either.
+                if state.pending_tasks.contains_key(&id)
+                    && !state.pending_unconfirmed.contains(&id)
+                {
+                    refresh_close_deadline(state, tokio::time::Instant::now());
                 }
                 state.push(
                     &self.sink,
@@ -828,13 +873,13 @@ impl TurnCore {
                 // Only a notification that actually settles a pending task may
                 // move the deadline: a notification about an ambient (or
                 // otherwise untracked) task arriving during the 30s grace
-                // must not hand out another 30s each time.
+                // must not hand out another 30s each time. Where the deadline
+                // lands afterwards is refresh_close_deadline's call: a settled
+                // reply gets the grace, an active turn gets the deadline
+                // dropped — never a grace ticking under streaming output.
                 if state.pending_tasks.remove(&id).is_some() {
-                    state.close_deadline = next_close_deadline(
-                        state.pending_tasks.len(),
-                        state.awaiting_tasks || state.close_deadline.is_some(),
-                        tokio::time::Instant::now(),
-                    );
+                    state.pending_unconfirmed.remove(&id);
+                    refresh_close_deadline(state, tokio::time::Instant::now());
                 }
                 state.push(
                     &self.sink,
@@ -865,12 +910,11 @@ impl TurnCore {
                 let changed = next.len() != state.pending_tasks.len()
                     || next.keys().any(|k| !state.pending_tasks.contains_key(k));
                 state.pending_tasks = next;
+                // Every surviving entry is vouched for by this level frame:
+                // nothing stays unconfirmed (see `pending_unconfirmed`).
+                state.pending_unconfirmed.clear();
                 if changed {
-                    state.close_deadline = next_close_deadline(
-                        state.pending_tasks.len(),
-                        state.awaiting_tasks || state.close_deadline.is_some(),
-                        tokio::time::Instant::now(),
-                    );
+                    refresh_close_deadline(state, tokio::time::Instant::now());
                 }
                 let wire: Vec<serde_json::Value> = tasks
                     .iter()
@@ -900,6 +944,14 @@ impl TurnCore {
                 // and marking the run terminal here would suppress that
                 // follow-up turn's frames. Keep the run open — its own done
                 // (or the process-exit path) settles it.
+                // Heuristic, with two known blind spots: (a) a reconciliation
+                // turn that carries a whitespace-only content frame reads as a
+                // real reply ending (saw_done=true) and the follow-up frames
+                // stay suppressed — the "reply never shows" shape returns;
+                // (b) a real turn with zero text frames (pure tool calls)
+                // reads as run_continues, deferring its usage accounting to
+                // the synthesized done at process exit. Both depend on CLI
+                // frame shapes we cannot observe better from here.
                 let run_continues = !state.saw_content;
                 state.saw_content = false;
                 state.saw_done = !run_continues;
@@ -921,13 +973,13 @@ impl TurnCore {
                     self.registry.close_stdin(&self.run_id);
                     state.awaiting_tasks = false;
                     state.close_deadline = None;
+                    state.bg_phase_started = None;
                 } else {
                     // Background tasks outlive the turn. EOF now would make the
                     // CLI wind them down (its print-teardown sweep); keep stdin
                     // open and let the completion turn and task frames stream.
                     state.awaiting_tasks = true;
-                    state.close_deadline =
-                        next_close_deadline(pending, true, tokio::time::Instant::now());
+                    refresh_close_deadline(state, tokio::time::Instant::now());
                 }
                 state.push_with_gen_ms(
                     &self.sink,
@@ -1352,7 +1404,34 @@ pub(crate) async fn run_reader(stdout: ChildStdout, ctx: RunContext) {
         );
     }
 
+    // The process is gone: whatever it still owed this run's task list is
+    // never coming. Close the list out FIRST so any terminal done synthesized
+    // below honestly reports backgroundTasks: 0 — reporting the pre-death
+    // count would park the frontend in an awaiting phase no later frame can
+    // resolve. Terminal events are staged until confirm_exit, so on the wire
+    // this tasks frame still lands before the done it enables.
+    push_final_task_frame(&mut state, &ctx.core);
+    if !state.saw_error && state.saw_done && state.awaiting_tasks {
+        // The reply settled but the run died inside its background phase
+        // (stall deadline, user stop, natural wind-down): the frontend is in
+        // the awaiting phase that only a terminal done(backgroundTasks: 0)
+        // resolves — without it the session's awaitingTasks hangs until its
+        // 30-minute orphan sweep.
+        state.push(
+            &ctx.core.sink,
+            &ctx.core.run_id,
+            &ctx.core.engine_id,
+            "done",
+            serde_json::json!({
+                "usage": null,
+                "backgroundTasks": 0,
+                "runContinues": false,
+            }),
+        );
+    }
     if !state.saw_done && !state.saw_error {
+        // The task list was closed out above, so the backgroundTasks count
+        // these synthesized settles report is 0.
         let killed = ctx.killed.load(std::sync::atomic::Ordering::SeqCst);
         if killed {
             // User-initiated stop: commit whatever streamed so far as a
@@ -1417,12 +1496,8 @@ pub(crate) async fn run_reader(stdout: ChildStdout, ctx: RunContext) {
             );
         }
     }
-    // The process is gone: whatever it still owed this run's task list is never
-    // coming. Close the list out so the panel does not show running rows until
-    // the frontend's orphan sweep (see push_final_task_frame).
-    push_final_task_frame(&mut state, &ctx.core);
-    // Flush the task-list settlement before releasing a deferred terminal
-    // event, so the final run event remains the last lifecycle transition.
+    // Release a deferred terminal event only after the task-list settlement
+    // is out, so the final run event remains the last lifecycle transition.
     if status.is_some() {
         state.confirm_exit(&ctx.core);
     }
@@ -1522,9 +1597,9 @@ mod staging_tests {
     }
 
     /// 后台期静默死亡（这里用「写完一帧任务帧就退出的假 CLI」表示，例如它带走的
-    /// 那个后台任务）：saw_done 已真，不会合成终局帧，前端只剩 30 分钟的 orphan
-    /// sweep，期间尾部一直「运行中」。退出路径必须补一帧空 level 帧（REPLACE
-    /// 语义），让面板当场把该 run 的 running 行收敛为 stopped。
+    /// 那个后台任务）：退出路径先补一帧空 level 帧（REPLACE 语义）让面板当场把
+    /// running 行收敛，再合成终局 done——它必须如实报告 backgroundTasks: 0，
+    /// 报死亡前的计数会把前端挂进没有任何后续帧能解开的等待相位。
     #[tokio::test]
     async fn a_run_that_dies_mid_background_phase_closes_its_task_list() {
         let frame = std::env::temp_dir()
@@ -1577,15 +1652,91 @@ mod staging_tests {
             .collect();
         assert_eq!(
             kinds,
-            ["task_started", "done", "tasks"],
-            "the exit path must close the task list after the terminal frame"
+            ["task_started", "tasks", "done"],
+            "the exit path closes the task list before the terminal frame"
         );
-        let last = events.last().unwrap();
+        let settle = &events[1];
         assert_eq!(
-            last["data"]["tasks"].as_array().map(Vec::len),
+            settle["data"]["tasks"].as_array().map(Vec::len),
             Some(0),
             "the final level frame must be the empty live set"
         );
+        let done = events.last().unwrap();
+        assert_eq!(
+            done["data"]["backgroundTasks"], 0,
+            "a dead process owes nothing: the count must not resurrect an awaiting phase"
+        );
+        assert_eq!(done["data"]["runContinues"], false);
+    }
+
+    /// 回复已结算（held done 已发）但 run 死在后台期：前端正等一帧
+    /// done(backgroundTasks: 0) 来收敛 awaitingTasks 相位——退出尾部必须补它，
+    /// 且帧序恒为 tasks:[] 在前、终局 done 在后。
+    #[tokio::test]
+    async fn a_run_dying_while_awaiting_tasks_gets_a_terminal_done() {
+        let frame = std::env::temp_dir()
+            .join(format!("ccgui-reader-awaitdie-{}.ndjson", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &frame,
+            concat!(
+                "{\"type\":\"system\",\"subtype\":\"task_started\",\"task_id\":\"t1\",",
+                "\"task_type\":\"local_bash\",\"description\":\"sleep 60\"}\n",
+                "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",",
+                "\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"reply\"}}}\n",
+                "{\"type\":\"result\",\"session_id\":\"s1\"}\n",
+            ),
+        )
+        .unwrap();
+        let mut command = Command::new(if cfg!(windows) { "cmd.exe" } else { "sh" });
+        if cfg!(windows) {
+            command.args(["/c", "type"]).arg(&frame);
+        } else {
+            command.args(["-c", &format!("cat '{}'", frame.display())]);
+        }
+        command.stdout(std::process::Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let log = Arc::new(EventLog::default());
+        let ctx = RunContext {
+            core: TurnCore {
+                sink: event_sink::EventSink::new(log.clone()),
+                registry: Arc::new(ProcessRegistry::default()),
+                engine_id: "claude".into(),
+                run_id: "exit-awaiting-tasks".into(),
+            },
+            engine_impl: Box::new(crate::engine::claude::ClaudeEngine::new()),
+            pid: 0,
+            preassigned_session_id: None,
+            initial_model: None,
+            initial_effort: None,
+            child: Arc::new(TokioMutex::new(child)),
+            killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cleanup_files: Vec::new(),
+            mcp_restore: None,
+            stderr_buf: Arc::new(Mutex::new(String::new())),
+            stdout_plain_buf: Arc::new(Mutex::new(String::new())),
+            #[cfg(windows)]
+            _tree_guard: None,
+        };
+
+        run_reader(stdout, ctx).await;
+        let _ = std::fs::remove_file(&frame);
+
+        let events = log.0.lock().unwrap();
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            ["task_started", "delta", "done", "tasks", "done"],
+            "held done first, then the task close-out, then the terminal done"
+        );
+        assert_eq!(events[2]["data"]["backgroundTasks"], 1, "the held done counts the live task");
+        let terminal = events.last().unwrap();
+        assert_eq!(terminal["data"]["backgroundTasks"], 0);
+        assert_eq!(terminal["data"]["runContinues"], false);
+        assert_eq!(terminal["data"]["usage"], serde_json::Value::Null);
     }
 
     /// Slot accounting must survive a reader that dies without reaching
@@ -2068,11 +2219,170 @@ mod terminal_event_tests {
     }
 
     #[test]
-    fn close_deadline_tracks_pending_tasks() {
+    fn close_deadline_tracks_run_phase() {
         let now = tokio::time::Instant::now();
-        assert_eq!(next_close_deadline(0, false, now), None);
-        assert_eq!(next_close_deadline(0, true, now), Some(now + BACKGROUND_GRACE));
-        assert_eq!(next_close_deadline(3, true, now), Some(now + BACKGROUND_STALL));
+        let mut state = TurnState::new(None);
+
+        // Active turn, nothing pending: no deadline (pre-background behavior).
+        refresh_close_deadline(&mut state, now);
+        assert_eq!(state.close_deadline, None);
+
+        // Settled reply awaiting its background phase, nothing pending: grace.
+        state.saw_done = true;
+        state.awaiting_tasks = true;
+        refresh_close_deadline(&mut state, now);
+        assert_eq!(state.close_deadline, Some(now + BACKGROUND_GRACE));
+
+        // A live task bounds either phase with the stall length…
+        state
+            .pending_tasks
+            .insert("task-1".into(), task_summary("task-1", false));
+        refresh_close_deadline(&mut state, now);
+        assert_eq!(state.close_deadline, Some(now + BACKGROUND_STALL));
+
+        // …including an open turn (hollow-done resume or reopened follow-up).
+        state.saw_done = false;
+        state.awaiting_tasks = false;
+        refresh_close_deadline(&mut state, now);
+        assert_eq!(state.close_deadline, Some(now + BACKGROUND_STALL));
+    }
+
+    /// L1 回归：停滞上限的每次续期都不超过自首个任务起的绝对上限——心跳
+    /// 循环的失控 CLI 不能把 run 的 stdin、进程与并发槽永远钉住。
+    #[test]
+    fn rearmed_deadlines_never_pass_the_absolute_cap() {
+        let mut state = TurnState::new(None);
+        state
+            .pending_tasks
+            .insert("task-1".into(), task_summary("task-1", false));
+        let start = tokio::time::Instant::now();
+        state.bg_phase_started = Some(start);
+
+        // A re-arm 3.5 hours into the phase clamps to the 4-hour cap.
+        let late = start + std::time::Duration::from_secs(3 * 60 * 60 + 30 * 60);
+        refresh_close_deadline(&mut state, late);
+        assert_eq!(state.close_deadline, Some(start + BACKGROUND_ABS_CAP));
+    }
+
+    /// C1 回归：补完回合流式期间最后一个任务结算，不得武装 30s 宽限——
+    /// 回合活跃时 pending→0 必须清掉期限，否则宽限到点会 EOF 截断生成。
+    #[tokio::test]
+    async fn task_settling_during_an_active_turn_drops_the_deadline() {
+        let (core, _collector) = core_for("settle-during-turn");
+        let mut state = TurnState::new(None);
+        state
+            .pending_tasks
+            .insert("task-1".into(), task_summary("task-1", false));
+        // Content done with a live task: settled, awaiting the completion turn.
+        core.dispatch_event(&mut state, EngineEvent::Delta("reply".into()));
+        core.dispatch_event(&mut state, EngineEvent::Done { session_id: None, usage: None });
+        assert!(state.saw_done && state.awaiting_tasks);
+
+        // The completion turn starts: its first content frame reopens the run.
+        core.dispatch_event(&mut state, EngineEvent::Delta("completion".into()));
+        assert!(!state.saw_done && !state.awaiting_tasks);
+
+        // The last task settles mid-stream: no grace may tick under the turn.
+        core.dispatch_event(
+            &mut state,
+            EngineEvent::TaskNotification { id: "task-1".into(), status: "completed".into() },
+        );
+        assert_eq!(
+            state.close_deadline, None,
+            "an active turn with nothing pending must have no deadline"
+        );
+    }
+
+    /// C1 回归（通知轮形态）：resume 的空 done 之后，用户回合流式期间旧任务
+    /// 全部结算，同样不得留下会在回合中段触发的宽限；且内容帧本身要顺延
+    /// 停滞上限，长回答不会被 30 分钟静默误判。
+    #[tokio::test]
+    async fn hollow_done_then_user_turn_is_never_grace_bounded() {
+        let (core, _collector) = core_for("hollow-then-user-turn");
+        let mut state = TurnState::new(None);
+        state
+            .pending_tasks
+            .insert("task-1".into(), task_summary("task-1", false));
+        // The CLI's queued reconciliation turn closes with no content.
+        core.dispatch_event(&mut state, EngineEvent::Done { session_id: None, usage: None });
+        assert!(!state.saw_done, "a content-free done leaves the run open");
+        assert!(state.awaiting_tasks);
+        let armed = state.close_deadline.expect("live tasks arm the stall bound");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // The queued user turn streams: content re-arms the silence bound…
+        core.dispatch_event(&mut state, EngineEvent::Delta("real reply".into()));
+        assert!(
+            state.close_deadline > Some(armed),
+            "streaming content re-arms the silence bound"
+        );
+
+        // …and the old tasks settling mid-turn drop the deadline outright.
+        core.dispatch_event(
+            &mut state,
+            EngineEvent::TaskNotification { id: "task-1".into(), status: "completed".into() },
+        );
+        assert_eq!(state.close_deadline, None);
+    }
+
+    /// H2 回归：经 task_started 缺口进入 pending 的条目，未经 level 帧确认前
+    /// 其进度心跳不得顺延停滞上限；level 帧确认后恢复顺延。
+    #[tokio::test]
+    async fn unconfirmed_task_progress_does_not_rearm_the_stall() {
+        let (core, _collector) = core_for("unconfirmed-progress");
+        let mut state = TurnState::new(None);
+        state.saw_done = true;
+        state.awaiting_tasks = true;
+
+        core.dispatch_event(
+            &mut state,
+            EngineEvent::TaskStarted {
+                id: "task-gap".into(),
+                task_type: "local_agent".into(),
+                description: "monitor".into(),
+                subagent_type: None,
+                is_backgrounded: None,
+                spawn_depth: None,
+                workflow_name: None,
+            },
+        );
+        let armed = state.close_deadline.expect("a new task arms the stall bound");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        core.dispatch_event(
+            &mut state,
+            EngineEvent::TaskProgress {
+                id: "task-gap".into(),
+                description: Some("heartbeat".into()),
+                last_tool: None,
+                usage: None,
+            },
+        );
+        assert_eq!(
+            state.close_deadline,
+            Some(armed),
+            "an unconfirmed (ambient-gap) heartbeat must not re-arm the stall bound"
+        );
+
+        // The level frame vouches for the task: progress re-arms again.
+        core.dispatch_event(
+            &mut state,
+            EngineEvent::TasksChanged { tasks: vec![task_summary("task-gap", false)] },
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        core.dispatch_event(
+            &mut state,
+            EngineEvent::TaskProgress {
+                id: "task-gap".into(),
+                description: Some("heartbeat".into()),
+                last_tool: None,
+                usage: None,
+            },
+        );
+        assert!(
+            state.close_deadline > Some(armed),
+            "a level-frame-confirmed task re-arms the bound on progress"
+        );
     }
 
     /// The core of the stdin policy: a done with a live task must NOT EOF the
@@ -2234,9 +2544,11 @@ mod terminal_event_tests {
         }
     }
 
-    /// 重开时已无待办任务（宽限期内的通知轮）：什么都不用留，期限清空。
+    /// 重开时已无待办任务（宽限期内的通知轮）：保留一个有界的兜底期限——
+    /// 孤立前导帧（如与 done 竞态迟到的 SessionId）不是真实回合的证据，清空
+    /// 期限会让 run 永久挂在打开状态；真实回合的第一个内容帧会把它清掉。
     #[tokio::test]
-    async fn reopen_with_no_pending_tasks_drops_the_deadline() {
+    async fn reopen_with_no_pending_tasks_keeps_a_bounded_fallback() {
         let (core, _collector) = core_for("grace-cancel-empty");
         let mut state = awaiting_state();
         state.pending_tasks.clear();
@@ -2247,9 +2559,19 @@ mod terminal_event_tests {
         );
 
         assert!(!state.saw_done && !state.awaiting_tasks);
+        let fallback = state
+            .close_deadline
+            .expect("a stray frame must not strand the run: keep a bounded fallback");
         assert!(
-            state.close_deadline.is_none(),
-            "nothing pending, nothing to bound"
+            fallback > tokio::time::Instant::now() + BACKGROUND_GRACE,
+            "the fallback is the stall length, not the grace"
+        );
+
+        // A real turn's first content frame drops the fallback outright.
+        core.dispatch_event(&mut state, EngineEvent::Delta("completion".into()));
+        assert_eq!(
+            state.close_deadline, None,
+            "streaming content clears the fallback"
         );
     }
 

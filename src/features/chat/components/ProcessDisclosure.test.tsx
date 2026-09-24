@@ -2,7 +2,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/lib/i18n";
-import { ProcessDisclosure } from "./ProcessDisclosure";
+import { ProcessDisclosure, liveThinkingWindow } from "./ProcessDisclosure";
 import type { ProcessItem } from "./timeline-rows";
 import { StepRow } from "@/components/application/task-list/task-list";
 import { findTimelineMatches } from "./timeline-search";
@@ -96,6 +96,40 @@ async function clickButton(label: string) {
   expect(button, label).toBeTruthy();
   await act(async () => button!.click());
 }
+
+describe("liveThinkingWindow", () => {
+  it("returns text within the budget untouched", () => {
+    expect(liveThinkingWindow("abc")).toEqual({ body: "abc", truncated: false });
+  });
+
+  it("snaps the cut to a line boundary when the window keeps its budget", () => {
+    // 100 short lines (~32 chars each): the first newline after the char cut
+    // is a whole-row slide-out, well within the window.
+    const text = Array.from({ length: 100 }, (_, i) => `line-${i}-${"x".repeat(24)}`).join("\n");
+    const { body, truncated } = liveThinkingWindow(text);
+    expect(truncated).toBe(true);
+    expect(body.startsWith("line-")).toBe(true);
+    expect(body.length).toBeLessThanOrEqual(2000);
+    expect(body.length).toBeGreaterThanOrEqual(1000);
+  });
+
+  /** 一行超 2000 字符且其后还有内容：行边界截断会把窗口塌缩到巨行之后的
+   *  几字符，必须退回字符截断保住窗口。 */
+  it("falls back to the char cut when a giant line would collapse the window", () => {
+    const text = `${"x".repeat(2900)}\nshort tail`;
+    const { body, truncated } = liveThinkingWindow(text);
+    expect(truncated).toBe(true);
+    expect(body).toHaveLength(2000);
+    expect(body).toBe(text.slice(text.length - 2000));
+  });
+
+  it("keeps the char cut when the window holds no newline at all", () => {
+    const text = "x".repeat(3000);
+    const { body, truncated } = liveThinkingWindow(text);
+    expect(truncated).toBe(true);
+    expect(body).toHaveLength(2000);
+  });
+});
 
 describe("ProcessDisclosure bounded history", () => {
   it.each([120, 500])("mounts at most 40 of %i tools and visits every history page", async (count) => {

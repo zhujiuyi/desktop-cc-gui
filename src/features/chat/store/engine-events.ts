@@ -61,6 +61,9 @@ export interface EngineEventDeps {
   upsertSessionMeta: (meta: SessionMeta) => void;
   /** Re-fetch the latest token usage from session history for the given session key. */
   refreshSessionUsage?: (key: string) => Promise<void>;
+  /** Re-read the session's transcript and merge rows the live view missed
+   *  (a foreign run's dropped completion turn) into the open session. */
+  reloadTranscript?: (key: string) => void;
 }
 
 /** Collapse whitespace and cap a prompt for use as a session title. */
@@ -513,9 +516,11 @@ function ownsTurn(cur: SessionState | undefined, key: string, runId: string): bo
  *  Degraded same-session-dual-run rule: while a session streams run B, the
  *  still-routed run A of the same session can keep talking (its own completion
  *  turn after A's background phase). A's text is dropped instead of merged;
- *  the run's transcript is re-read by rescanSessions, so the note still lands
- *  on screen through history. Task frames and done/error/session keep routing:
- *  they belong to their own run's surface (panel, task settle, run wrap-up). */
+ *  when A reaches its terminal done/error the session's transcript is re-read
+ *  and the missing rows are merged into the open session (reloadTranscript —
+ *  rescanSessions only refreshes the sidebar list). Task frames and
+ *  done/error/session keep routing: they belong to their own run's surface
+ *  (panel, task settle, run wrap-up). */
 const FOREIGN_CONTENT_KINDS = new Set<EngineEventPayload["kind"]>([
   "delta",
   "thinking",
@@ -536,6 +541,13 @@ function isForeignContent(
   const owner = turnOwner(cur, key);
   return owner !== null && owner !== runId;
 }
+/** Runs whose content frames were dropped by the foreign-content gate: their
+ *  completion-turn text never streamed, so their terminal done/error triggers
+ *  a targeted transcript merge (EngineEventDeps.reloadTranscript) that brings
+ *  the missing rows into the open session. Entries are dropped when the run
+ *  settles or is reaped, so the set tracks only live runs. Exported like
+ *  settledRuns so tests can reset it. */
+export const droppedContentRuns = new Set<string>();
 
 /** Re-derive the fields the task list owns from the list itself, then trim it
  *  back to TASK_LIMIT: a running task must never be dropped by retention, so
@@ -590,7 +602,26 @@ function applyTaskEvent(event: EngineEventPayload, key: string, deps: EngineEven
         // session ended") — a false terminal for work that is still running.
         // The owning run's own frames (progress, its real notification, and
         // the reader's closing empty `tasks` frame) keep full control.
-        if (tasks[idx].runId !== event.runId) return;
+        if (tasks[idx].runId !== event.runId) {
+          // Ambient rows are the exception: they are session-scoped
+          // housekeeping, so whichever run is alive reports them in its
+          // authoritative `tasks` frame. Let that frame adopt the row from a
+          // run that already settled — otherwise the dead run's settle marks
+          // it interrupted and the ownership guard keeps it that way forever
+          // while the task is in fact still running.
+          if (
+            event.kind !== "tasks" ||
+            !(tasks[idx].ambient === true || patch.ambient === true)
+          ) {
+            return;
+          }
+          tasks = tasks.map((t, i) =>
+            i === idx
+              ? { ...t, ...patch, runId: event.runId, status: "running" as const, updatedAt: now }
+              : t,
+          );
+          return;
+        }
         tasks = tasks.map((t, i) => (i === idx ? { ...t, ...patch, updatedAt: now } : t));
       } else {
         tasks = [
@@ -651,7 +682,29 @@ function applyTaskEvent(event: EngineEventPayload, key: string, deps: EngineEven
         break;
       }
     }
-    return { bySession: { ...s.bySession, [key]: withTaskDerived({ ...cur, tasks }) } };
+    // Fallback convergence: a process that dies in its background phase now
+    // always gets a terminal done from the Rust exit tail (which clears
+    // awaitingTasks), and that done is staged behind the closing REPLACE.
+    // If the done is ever lost, the wait still converges here: once the
+    // run has no non-ambient running rows left, nothing remains to wait
+    // for. (Ambient rows outlive turns; they never keep a turn waiting.)
+    const clearsWait =
+      event.kind === "tasks" &&
+      cur.awaitingTasks &&
+      !cur.streaming &&
+      !tasks.some(
+        (t) => t.runId === event.runId && t.status === "running" && !t.ambient,
+      );
+    return {
+      bySession: {
+        ...s.bySession,
+        [key]: withTaskDerived({
+          ...cur,
+          tasks,
+          ...(clearsWait ? { awaitingTasks: false } : {}),
+        }),
+      },
+    };
   });
 }
 
@@ -680,7 +733,10 @@ export function settleOrphanedRuns(
   orphaned: Array<[string, string]>,
 ) {
   if (orphaned.length === 0) return;
-  for (const [runId] of orphaned) dropRunUsage(runId);
+  for (const [runId] of orphaned) {
+    dropRunUsage(runId);
+    droppedContentRuns.delete(runId);
+  }
   set((s) => {
     let streamingByKey = s.streamingByKey;
     let retryingByKey = s.retryingByKey;
@@ -816,6 +872,10 @@ function onError(
   key: string,
   deps: EngineEventDeps,
 ) {
+  // An error is terminal for its run regardless of turn ownership: a run
+  // whose content frames were dropped as foreign (dual-run) gets the rows
+  // the open session missed merged back from its transcript.
+  if (droppedContentRuns.delete(event.runId)) deps.reloadTranscript?.(key);
   const prev = deps.get().bySession[key] ?? EMPTY_SESSION;
   const ownTurn = ownsTurn(prev, key, event.runId);
   if (ownTurn) {
@@ -1294,7 +1354,22 @@ function onDone(event: EngineEventPayload, key: string, deps: EngineEventDeps) {
   // A continuing done books nothing: its usage is the reconciliation turn's,
   // and holding `liveLedgerRuns` would make the real reply's done skip the
   // booking. The real turn's own done books as usual.
-  const booked = runContinues ? false : recordTurnUsage(deps, event, key, finalUsage);
+  //
+  // Book only when the turn actually reported usage (live reports or this
+  // done's own payload). A done with `usage: null` and no live reports has
+  // nothing of its own to book — without the gate, `finalUsage` falls back
+  // to the session's stale usage snapshot and books those (already counted)
+  // tokens as a new row. This is what keeps a run's second, terminal done
+  // (usage: null, after a held done) from double-booking.
+  const hasTurnUsage = turnTotals != null || data.usage != null;
+  const booked =
+    runContinues || !hasTurnUsage ? false : recordTurnUsage(deps, event, key, finalUsage);
+  // A run whose content frames were dropped as foreign (dual-run) never
+  // streamed its completion turn: once the run is terminal, merge the rows
+  // the open session missed back from its transcript.
+  if (backgroundTasks === 0 && !runContinues && droppedContentRuns.delete(event.runId)) {
+    deps.reloadTranscript?.(key);
+  }
 
   if (!ownTurn) {
     // 同会话双 run：这个 run 不认领会话（会话在流另一个更晚的 run），它的 done
@@ -1331,6 +1406,7 @@ function onDone(event: EngineEventPayload, key: string, deps: EngineEventDeps) {
     }
     runRouting.delete(event.runId);
     untrackRun(event.runId);
+    dropRunUsage(event.runId);
     void ipc.rescanSessions().catch(() => {});
     return;
   }
@@ -1366,20 +1442,29 @@ function onDone(event: EngineEventPayload, key: string, deps: EngineEventDeps) {
           // continues, so its rows are not orphaned work.
           cur.tasks
         : settleRunTasks(cur.tasks ?? EMPTY_TASKS, event.runId, "interrupted");
-    // Stamp usage, durationMs, effort, and model onto the turn's last assistant message.
+    // Stamp usage, durationMs, effort, and model onto the turn's last
+    // assistant message — but only when the row provably belongs to this
+    // run. A done that arrived with no live claim (this run's own
+    // background-phase done already stamped the row, or — dual-run — the
+    // session's owning run already settled and this late done merely
+    // degenerated to ownTurn because the claim was cleared) must not
+    // overwrite a row that already carries another run's usage stamp.
+    const claimed = turnOwner(cur, key) === event.runId;
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i].role === "assistant") {
-        messages = [
-          ...messages.slice(0, i),
-          {
-            ...messages[i],
-            ...(finalUsage ? { usage: finalUsage } : {}),
-            ...(durationMs != null ? { durationMs } : {}),
-            ...(effort ? { effort } : {}),
-            ...(model ? { model } : {}),
-          },
-          ...messages.slice(i + 1),
-        ];
+        if (claimed || messages[i].usage == null) {
+          messages = [
+            ...messages.slice(0, i),
+            {
+              ...messages[i],
+              ...(finalUsage ? { usage: finalUsage } : {}),
+              ...(durationMs != null ? { durationMs } : {}),
+              ...(effort ? { effort } : {}),
+              ...(model ? { model } : {}),
+            },
+            ...messages.slice(i + 1),
+          ];
+        }
         break;
       }
     }
@@ -1426,6 +1511,7 @@ function onDone(event: EngineEventPayload, key: string, deps: EngineEventDeps) {
   // The run is over: drop its routing entry so the map cannot grow forever.
   runRouting.delete(event.runId);
   untrackRun(event.runId);
+  dropRunUsage(event.runId);
   // Native file changed; refresh list cache in background.
   void ipc.rescanSessions().catch(() => {});
   deps.markUnseenIfBackground(key);
@@ -1491,6 +1577,16 @@ function adoptObservedRun(
   // restart the segment timer, or make the session read as streaming again
   // (the composer would start queueing while the user should be able to send).
   if (cur?.awaitingTasks && taskFrame) return;
+  // Task frames route (above) but never adopt: they are panel state, not
+  // turn content, so they prove nothing about which run owns the session's
+  // reply. A bare task frame must not claim the turn, flip the session to
+  // streaming, or restart its segment timer.
+  if (taskFrame) return;
+  // Claiming a session that already streams without an owner is reserved
+  // for content frames: only proof the run is producing the reply may take
+  // the turn over.
+  const contentFrame =
+    event.kind === "delta" || event.kind === "thinking" || event.kind === "message";
   if (!cur?.streaming) {
     // A completion turn reopens the run after its background phase: its text
     // is a fresh segment, so the elapsed timer restarts and the background
@@ -1503,7 +1599,7 @@ function adoptObservedRun(
       currentRunId: event.runId,
       ...(reopen ? { awaitingTasks: false } : {}),
     });
-  } else if (!cur.awaitingTasks && turnOwner(cur, key) === null) {
+  } else if (contentFrame && !cur.awaitingTasks && turnOwner(cur, key) === null) {
     // Streaming without a claimed run (a session restored without one): the
     // run now talking owns the turn. A session still awaiting its background
     // tasks is NOT claimed here — its live run already owns it, and the
@@ -1600,11 +1696,20 @@ export function handleEngineEvents(
         if (settledRuns.size > MAX_SETTLED_RUNS) {
           settledRuns.delete(settledRuns.keys().next().value!);
         }
+        // The computer-use global Esc-to-stop is disarmed only by the
+        // terminal event of the computer-use session's own turn. A held
+        // done (background tasks still running — excluded above) and a
+        // foreign run's done/error must not kill a system-wide hotkey out
+        // from under the run that is still driving the machine. Arming is
+        // per computer-use send (messaging.ts); the call is idempotent.
+        const settleSession = state.bySession[key];
+        if (
+          settleSession?.activeComputerUse === true &&
+          ownsTurn(settleSession, key, event.runId)
+        ) {
+          void ipc.computerUseSetActive?.(false)?.catch(() => {});
+        }
       }
-      // Every turn funnels through here: drop the computer-use global
-      // Esc-to-stop so a system-wide hotkey never outlives its run. Arming
-      // is per computer-use send (messaging.ts); the call is idempotent.
-      void ipc.computerUseSetActive?.(false)?.catch(() => {});
     }
     if (state.bySession[key]?.settledRunIds?.includes(event.runId)) {
       // A usage report trailing the terminal event carries the turn's final
@@ -1626,12 +1731,15 @@ export function handleEngineEvents(
 
     // 同会话双 run 的降级口径：会话正在流 run B 时，同会话另一个仍在路由中的
     // run A（后台任务尚未收尾）还会说它自己的通知轮。A 的内容帧不并入 B 的 live
-    // 行——A 的文本靠 rescanSessions 之后的历史重读补显；任务帧与
-    // done/error/session 仍照常路由（见 FOREIGN_CONTENT_KINDS）。
+    // 行——按 run 记入 droppedContentRuns，待 A 的终局 done/error 到达时对该
+    // 会话做定向 transcript 重读合并补显（reloadTranscript；rescanSessions 只
+    // 刷侧栏列表，不会补消息）；任务帧与 done/error/session 仍照常路由（见
+    // FOREIGN_CONTENT_KINDS）。
     if (
       FOREIGN_CONTENT_KINDS.has(event.kind) &&
       isForeignContent(deps.get().bySession[key], key, event.runId)
     ) {
+      droppedContentRuns.add(event.runId);
       continue;
     }
 

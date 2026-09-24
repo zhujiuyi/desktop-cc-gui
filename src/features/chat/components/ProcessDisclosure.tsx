@@ -179,15 +179,17 @@ const FrozenStepRow = memo(function FrozenStepRow({
 /** Live thinking window: the last ~2000 chars, cut at a LINE boundary so a
  *  row slides out as a whole instead of dissolving character by character.
  *  `truncated` tells the surface to fade its top edge, hinting at the
- *  content above the window. */
-function liveThinkingWindow(text: string): { body: string; truncated: boolean } {
+ *  content above the window. Exported for tests. */
+export function liveThinkingWindow(text: string): { body: string; truncated: boolean } {
   const WINDOW_CHARS = 2000;
   if (text.length <= WINDOW_CHARS) return { body: text, truncated: false };
   const cut = text.length - WINDOW_CHARS;
   const newline = text.indexOf("\n", cut);
-  // No newline inside the window (one enormous line): keep the char cut —
-  // there is no line boundary to honor.
-  const start = newline === -1 ? cut : newline + 1;
+  // Keep the char cut when there is no newline inside the window (one
+  // enormous line) — and when the first newline sits so close to the tail
+  // that snapping to it would collapse the window to the few characters
+  // after a giant line. Half the budget is the least a snapped window keeps.
+  const start = newline === -1 || text.length - newline - 1 < WINDOW_CHARS / 2 ? cut : newline + 1;
   return { body: text.slice(start), truncated: true };
 }
 

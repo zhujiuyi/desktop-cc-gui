@@ -569,12 +569,97 @@ describe("RunStatusStrip", () => {
 
     const overlay = container.querySelector("[data-testid='subagent-detail-overlay']");
     expect(overlay).not.toBeNull();
-    // The step's label is its subagentType (the chain prefers it over the
-    // description); the row that opened this overlay read the same text.
+    // The step's label is its brief (the chain prefers the description over
+    // the bare type); the subagentType rides along as the type chip, and the
+    // row that opened this overlay read the same text.
     const label = overlay!.querySelector(".text-caption-1-medium");
-    expect(label?.textContent).toContain("code-reviewer");
+    expect(label?.textContent).toContain("审查");
     expect(label?.className).toContain("text-text-secondary");
     expect(label?.className).not.toContain("text-text-primary");
+    expect(overlay!.textContent).toContain("code-reviewer");
+  });
+
+  /** 新回合的 runId 在发送时被乐观写入，先于该 run 的首个任务帧到达：
+   *  pill 不得闪烁消失，已打开的面板不得收起；新 run 的首个任务帧到达后
+   *  才切换为新回合的计数。 */
+  it("freezes the pill over the turn gap instead of blinking away", async () => {
+    const history = [
+      task({ id: "old-1", runId: "r1", status: "completed", description: "旧任务一" }),
+      task({ id: "old-2", runId: "r1", status: "completed", description: "旧任务二" }),
+    ];
+    seedTasks(history, undefined, false, "r1");
+    await renderStrip("claude");
+    expect(pill("子代理").textContent).toContain("2/2");
+    await click(pill("子代理"));
+    expect(container.querySelector("[data-testid='run-status-subagents']")?.textContent).toContain(
+      "旧任务一",
+    );
+
+    // 发送新消息：currentRunId 切到 r2，任务表里还没有 r2 的任何帧。
+    await act(async () => {
+      useChatStore.setState({
+        bySession: {
+          [KEY]: {
+            messages: [msg(1, "user", "跑一下"), msg(2, "user", "再来一轮")],
+            streaming: true,
+            tasks: history,
+            currentRunId: "r2",
+            backgroundActive: false,
+          } as never,
+        },
+      });
+    });
+    // Pill 冻结在上一回合的计数上，面板保持打开。
+    expect(pill("子代理").textContent).toContain("2/2");
+    expect(container.querySelector("[data-testid='run-status-subagents']")?.textContent).toContain(
+      "旧任务一",
+    );
+
+    // r2 的首个任务帧到达：pill 切换为新回合的计数与内容。
+    await act(async () => {
+      useChatStore.setState({
+        bySession: {
+          [KEY]: {
+            messages: [msg(1, "user", "跑一下"), msg(2, "user", "再来一轮")],
+            streaming: true,
+            tasks: [...history, task({ id: "new-1", runId: "r2", description: "新任务" })],
+            currentRunId: "r2",
+            backgroundActive: true,
+          } as never,
+        },
+      });
+    });
+    expect(pill("子代理").textContent).toContain("0/1");
+    const panel = container.querySelector("[data-testid='run-status-subagents']")?.textContent;
+    expect(panel).toContain("新任务");
+    expect(panel).not.toContain("旧任务一");
+  });
+
+  /** stopped/interrupted 不是「已完成」：pill 面板与后台任务面板用同一份
+   *  i18n 状态文案（灰「已停止」/红「已中断」），不得显示绿勾已完成。 */
+  it("names stopped and interrupted tasks instead of reading them as done", async () => {
+    seedTasks([
+      task({ id: "s", status: "stopped", description: "被停下的" }),
+      task({ id: "i", status: "interrupted", description: "被中断的" }),
+    ]);
+    await renderStrip("claude");
+    // Both settled: they count toward the numerator, but nothing breathes
+    // and nothing claims completion.
+    expect(pill("子代理").textContent).toContain("2/2");
+    expect(container.querySelector(".animate-ping")).toBeNull();
+
+    await click(pill("子代理"));
+    const panelEl = container.querySelector("[data-testid='run-status-subagents']")!;
+    const panel = panelEl.textContent ?? "";
+    expect(panel).toContain("已停止");
+    expect(panel).toContain("已中断");
+    expect(panel).not.toContain("已完成");
+    // interrupted goes red like failed; stopped stays gray.
+    const rows = [...panelEl.querySelectorAll<HTMLButtonElement>("[data-agent-step-key]")];
+    const stoppedRow = rows.find((r) => r.textContent?.includes("已停止"))!;
+    const interruptedRow = rows.find((r) => r.textContent?.includes("已中断"))!;
+    expect(stoppedRow.querySelector(".text-text-error-primary")).toBeNull();
+    expect(interruptedRow.querySelector(".text-text-error-primary")).not.toBeNull();
   });
 
   it("correctly maps TaskCreate and subsequent TaskUpdate by taskId to complete status", async () => {

@@ -495,18 +495,22 @@ function TodoRows({ items, live }: { items: TodoItem[]; live: boolean }) {
   );
 }
 
-/** One step's status text. `failed` reuses the background-task status key so
- *  the report panel and the pill panel name the same state the same way. */
+/** One step's status text. The settled-without-success states reuse the
+ *  background-task status keys so the report panel and the pill panel name
+ *  the same state the same way. */
 function agentStatusText(t: TFunction, state: AgentTaskStepState): string {
-  if (state === "failed") return t("chat.tasks.status.failed");
-  return state === "complete" ? t("chat.agentStatusDone") : t("chat.agentStatusRunning");
+  if (state === "complete") return t("chat.agentStatusDone");
+  if (state === "active") return t("chat.agentStatusRunning");
+  return t(`chat.tasks.status.${state}`);
 }
 /** One agent's full assignment, overlaid on the list inside the same panel:
  *  task briefs run long, and leaving the strip to read one loses the panel. */
 function SubagentDetail({ step, onBack }: { step: AgentTaskStep; onBack: () => void }) {
   const { t } = useTranslation();
-  const complete = step.state === "complete";
-  const failed = step.state === "failed";
+  // Settled steps step down so their name does not fight the status beside
+  // it; a dead run (failed/interrupted) goes red, a stopped one gray.
+  const settled = step.state !== "active";
+  const dead = step.state === "failed" || step.state === "interrupted";
   // The row that opened this overlay unmounted with the list; move focus
   // into the overlay instead of dropping it on document.body.
   const backRef = useRef<HTMLButtonElement>(null);
@@ -533,10 +537,7 @@ function SubagentDetail({ step, onBack }: { step: AgentTaskStep; onBack: () => v
           <span
             className={cx(
               "truncate text-caption-1-medium",
-              // Same tone rule as the list row this overlay was opened from:
-              // a failed (or finished) step steps down so its name does not
-              // fight the red status beside it.
-              failed || complete ? "text-text-secondary" : "text-text-primary",
+              settled ? "text-text-secondary" : "text-text-primary",
             )}
           >
             {step.label}
@@ -545,11 +546,13 @@ function SubagentDetail({ step, onBack }: { step: AgentTaskStep; onBack: () => v
         <span
           className={cx(
             "ml-auto shrink-0 text-caption-2-medium",
-            failed
+            dead
               ? "font-medium text-text-error-primary"
-              : complete
-                ? "text-[var(--color-status-unseen)]"
-                : "font-medium text-blue-500",
+              : step.state === "stopped"
+                ? "text-text-tertiary"
+                : step.state === "complete"
+                  ? "text-[var(--color-status-unseen)]"
+                  : "font-medium text-blue-500",
           )}
         >
           {agentStatusText(t, step.state)}
@@ -596,7 +599,11 @@ function SubagentRows({ steps }: { steps: AgentTaskStep[] }) {
       <ul className="flex flex-col gap-0.5 p-1">
         {steps.map((step) => {
           const complete = step.state === "complete";
-          const failed = step.state === "failed";
+          // A dead run (failed/interrupted) gets the static error dot the
+          // blocked todo row uses; a stopped one a gray dot — breathing
+          // means "still working".
+          const dead = step.state === "failed" || step.state === "interrupted";
+          const stopped = step.state === "stopped";
           return (
             <li key={step.key}>
               <button
@@ -607,11 +614,13 @@ function SubagentRows({ steps }: { steps: AgentTaskStep[] }) {
                 className="grid w-full cursor-pointer grid-cols-[14px_minmax(0,1fr)_auto] items-center gap-2 rounded px-2 py-1.5 text-left transition-colors hover:bg-background-tertiary-default/50"
               >
                 <div className="flex items-center justify-center">
-                  {/* A dead task gets the same static error dot the blocked
-                      todo row uses: breathing means "still working". */}
-                  {failed ? (
+                  {dead ? (
                     <span className="grid size-3.5 place-items-center">
                       <span className="size-1.5 rounded-full bg-text-error-primary" />
+                    </span>
+                  ) : stopped ? (
+                    <span className="grid size-3.5 place-items-center">
+                      <span className="size-1.5 rounded-full bg-foreground-icon-tertiary" />
                     </span>
                   ) : (
                     <BreathingDot active={!complete} />
@@ -626,9 +635,9 @@ function SubagentRows({ steps }: { steps: AgentTaskStep[] }) {
                   <span
                     className={cx(
                       "truncate text-caption-1-medium",
-                      // A failed step is as settled as a finished one: the
-                      // brightest text would fight the red status beside it.
-                      complete || failed ? "text-text-secondary" : "text-text-primary",
+                      // A settled step is as dim as a finished one: the
+                      // brightest text would fight the status beside it.
+                      step.state !== "active" ? "text-text-secondary" : "text-text-primary",
                     )}
                   >
                     {step.label}
@@ -637,11 +646,13 @@ function SubagentRows({ steps }: { steps: AgentTaskStep[] }) {
                 <span
                   className={cx(
                     "text-caption-2-medium flex shrink-0 items-center gap-1",
-                    failed
+                    dead
                       ? "font-medium text-text-error-primary"
-                      : complete
-                        ? "text-[var(--color-status-unseen)]"
-                        : "font-medium text-blue-500",
+                      : stopped
+                        ? "text-text-tertiary"
+                        : complete
+                          ? "text-[var(--color-status-unseen)]"
+                          : "font-medium text-blue-500",
                   )}
                 >
                   {agentStatusText(t, step.state)}

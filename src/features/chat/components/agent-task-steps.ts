@@ -1,9 +1,10 @@
 import type { Message, TodoItem, TodosPayload } from "@/lib/ipc";
 
-/** `failed` is real task data only: the message-derived fold below never
- *  produces it (`agentState` reads a failed subagent as complete), so steps
- *  built from the task table are the only source of a third state. */
-export type AgentTaskStepState = "active" | "complete" | "failed";
+/** The settled-without-success states (`failed`, `stopped`, `interrupted`)
+ *  are real task data only: the message-derived fold below never produces
+ *  them (`agentState` reads a dead subagent as complete), so steps built
+ *  from the task table are their only source. */
+export type AgentTaskStepState = "active" | "complete" | "failed" | "stopped" | "interrupted";
 
 export interface AgentTaskStep {
   /** Stable identity across renders (steps only append within a run). */

@@ -69,13 +69,27 @@ function TaskRow({ task, now }: { task: BackgroundTask; now: number }) {
   );
 }
 
+/** Turn-group header timestamp: HH:mm today, MM-dd HH:mm this year, full
+ *  date beyond — MessageTimeline's formatMessageTime pattern, because a
+ *  bare clock time misreads once a run crosses midnight. */
+function formatTurnTime(startedAt: number): string {
+  const d = new Date(startedAt);
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  if (d.toDateString() === now.toDateString()) return hm;
+  if (d.getFullYear() === now.getFullYear())
+    return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hm}`;
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hm}`;
+}
+
 /** Right-panel tab: background tasks of this session, grouped by turn. */
 export function BackgroundTasksPanel({ workspacePath }: { workspacePath: string }) {
   // The tab registry hands every panel the active workspace, but tasks belong
   // to a *session*: two tabs can share one workspace, so the active tab (the
   // same store selector QuestionDock/GrantCard use) is what identifies them.
   void workspacePath;
-  const { t, i18n } = useTranslation();
+  const { t } = useTranslation();
   const active = useChatStore((s) => s.active);
   const tasks = useChatStore((s) => {
     if (!active) return EMPTY_TASKS;
@@ -102,8 +116,7 @@ export function BackgroundTasksPanel({ workspacePath }: { workspacePath: string 
       {groups.map((group) => (
         <div key={group.runId} className="mb-1.5">
           <div className="px-2 py-1 text-[11px] text-foreground-icon-tertiary">
-            {/* Format in the app's language, not the OS locale. */}
-            {t("chat.tasks.turnAt", { time: new Date(group.startedAt).toLocaleTimeString(i18n.language) })}
+            {t("chat.tasks.turnAt", { time: formatTurnTime(group.startedAt) })}
           </div>
           {group.tasks.map((task) => <TaskRow key={task.id} task={task} now={now} />)}
         </div>
@@ -118,7 +131,7 @@ export function BackgroundTasksLine({ count }: { count: number }) {
   const { t } = useTranslation();
   return (
     <div className="flex items-center gap-2 py-2 text-xs text-foreground-icon-secondary">
-      <span className="size-1.5 animate-pulse rounded-full bg-accent-500" />
+      <span className="size-1.5 animate-pulse rounded-full bg-accent-500 motion-reduce:animate-none" />
       {t("chat.tasks.runningIndicator", { count })}
     </div>
   );

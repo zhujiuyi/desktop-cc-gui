@@ -1,19 +1,20 @@
 import type { AgentTaskStep } from "./components/agent-task-steps";
 import type { BackgroundTask } from "./store/stream";
 
-/** The task's display label: the engine's own name for it first (workflow,
- *  subagent type, description), then its bare type. `translateType` localizes
- *  that type fallback (`chat.tasks.type.*`); without it the raw type name
- *  shows. Shared by the tasks panel and the run-status pill so both name the
- *  same task the same way. */
+/** The task's display label: the workflow's own name first, then the task
+ *  brief (description), then the subagent type — a bare type like
+ *  "general-purpose" cannot tell two same-type subagents apart, the brief
+ *  can — and finally the bare type. `translateType` localizes that type
+ *  fallback (`chat.tasks.type.*`); without it the raw type name shows.
+ *  Shared by the tasks panel and the run-status pill so both name the same
+ *  task the same way. */
 export function taskLabel(
   task: BackgroundTask,
   translateType: (taskType: string) => string = (taskType) => taskType,
 ): string {
-  if (task.workflowName || task.subagentType || task.description) {
-    return task.workflowName || task.subagentType || task.description;
-  }
-  return translateType(task.taskType);
+  return (
+    task.workflowName || task.description || task.subagentType || translateType(task.taskType)
+  );
 }
 
 /** Tasks grouped under their run (turn), running groups first, then newest. */
@@ -48,23 +49,40 @@ export function runningTaskCount(tasks: BackgroundTask[]): number {
  *  Turn-level surface, so the same two rules as the tail indicator:
  *  - ambient tasks never show (session housekeeping, not this turn's work);
  *  - with a live run (`currentRunId`), only that run's tasks do — plus
- *    anything still running, which the reader is owed while it works. A
- *    session without a claimed run keeps the whole non-ambient table, so the
- *    pill's counts still freeze over a completed turn (see RunStatusStrip). */
+ *    anything still running, which the reader is owed while it works.
+ *
+ *  A new run's id lands (optimistic write on send) BEFORE its first task
+ *  frame: scoping to it would read empty and the pill would blink away,
+ *  collapsing a panel the user opened. So when the scope filters everything
+ *  out but settled history exists, freeze on the whole non-ambient table
+ *  until the new run reports its first task — the strip's "counts freeze
+ *  until a newer turn contributes fresh data" contract. A session without a
+ *  claimed run keeps the whole non-ambient table outright. */
 export function stepsFromTasks(
   tasks: BackgroundTask[],
   currentRunId: string | null,
   translateType?: (taskType: string) => string,
 ): AgentTaskStep[] {
-  return tasks
-    .filter(
-      (t) =>
-        !t.ambient &&
-        (currentRunId === null || t.runId === currentRunId || t.status === "running"),
-    )
-    .map((t) => ({
-      key: t.id,
-      label: taskLabel(t, translateType),
-      state: t.status === "running" ? "active" : t.status === "failed" ? "failed" : "complete",
-    }));
+  const nonAmbient = tasks.filter((t) => !t.ambient);
+  let scoped =
+    currentRunId === null
+      ? nonAmbient
+      : nonAmbient.filter((t) => t.runId === currentRunId || t.status === "running");
+  if (currentRunId !== null && scoped.length === 0 && nonAmbient.length > 0) {
+    scoped = nonAmbient;
+  }
+  return scoped.map((t) => ({
+    key: t.id,
+    label: taskLabel(t, translateType),
+    state:
+      t.status === "running"
+        ? "active"
+        : t.status === "completed"
+          ? "complete"
+          : t.status === "failed"
+            ? "failed"
+            : t.status, // "stopped" | "interrupted" keep their own name
+    subagentType: t.subagentType,
+    detail: t.description || undefined,
+  }));
 }

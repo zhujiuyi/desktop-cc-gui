@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { EngineEventPayload } from "@/lib/events";
 import { useChatStore } from "./store";
 import {
+  droppedContentRuns,
   handleEngineEvents,
   settleOrphanedRuns,
   settledRuns,
@@ -77,6 +78,7 @@ describe("same-session dual run", () => {
     drainSpy = vi.fn();
     runRouting.clear();
     settledRuns.clear();
+    droppedContentRuns.clear();
     useChatStore.setState({
       active: TAB,
       openTabs: [TAB],
@@ -194,6 +196,77 @@ describe("same-session dual run", () => {
     handleEngineEvents([ev(RUN_B, "delta", 3, "B 恢复输出")], deps());
     expect(session().retry).toBeNull();
     expect(useChatStore.getState().retryingByKey[KEY]).toBeUndefined();
+  it("backfills the dropped completion turn via a transcript reload when the foreign run settles", () => {
+    const reload = vi.fn();
+    const d = { ...deps(), reloadTranscript: reload };
+    settleRunAOnBackground();
+    handleEngineEvents([ev(RUN_B, "delta", 1, "B 正文")], d);
+
+    // A 的通知轮内容在 B 流式期间到达：被丢弃，但按 run 记下待补显。
+    handleEngineEvents([ev(RUN_A, "delta", 4, "工作流完成：")], d);
+    expect(reload).not.toHaveBeenCalled();
+
+    // A 的终局 done 到达：触发该会话的定向 transcript 重读合并。
+    handleEngineEvents([ev(RUN_A, "done", 5, { usage: null, backgroundTasks: 0 })], d);
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(reload).toHaveBeenCalledWith(KEY);
+
+    // 幂等：marker 已消费，重复处理同一终局帧不会再次触发（此处直接被
+    // settled 门禁拦下）。
+    handleEngineEvents([ev(RUN_A, "done", 6, { usage: null, backgroundTasks: 0 })], d);
+    expect(reload).toHaveBeenCalledTimes(1);
+  });
+
+  it("backfills on the foreign run's error too", () => {
+    const reload = vi.fn();
+    const d = { ...deps(), reloadTranscript: reload };
+    settleRunAOnBackground();
+    handleEngineEvents([ev(RUN_B, "delta", 1, "B 正文")], d);
+    handleEngineEvents([ev(RUN_A, "delta", 4, "工作流完成：")], d);
+
+    handleEngineEvents([ev(RUN_A, "error", 5, "boom")], d);
+
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(reload).toHaveBeenCalledWith(KEY);
+    // B 的回合不受 A 的错误影响。
+    expect(session().streaming).toBe(true);
+    expect(session().currentRunId).toBe(RUN_B);
+  });
+
+  it("does not reload the transcript when no frames were dropped", () => {
+    const reload = vi.fn();
+    const d = { ...deps(), reloadTranscript: reload };
+    handleEngineEvents([ev(RUN_A, "delta", 1, "正文")], d);
+    handleEngineEvents([ev(RUN_A, "done", 2, { usage: null })], d);
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  it("does not let a late foreign done stamp its usage over the settled reply", () => {
+    settleRunAOnBackground();
+    handleEngineEvents([ev(RUN_B, "delta", 1, "B 正文")], deps());
+    // A 的通知轮在 B 流式期间被丢弃。
+    handleEngineEvents([ev(RUN_A, "delta", 4, "工作流完成：")], deps());
+
+    // B 收尾：最后一个 assistant 行盖上 B 的 usage。
+    handleEngineEvents(
+      [ev(RUN_B, "done", 2, { usage: { input_tokens: 10, output_tokens: 5 }, backgroundTasks: 0 })],
+      deps(),
+    );
+    const lastAssistant = () =>
+      [...session().messages].reverse().find((m) => m.role === "assistant")!;
+    expect(lastAssistant().text).toBe("B 正文");
+    expect(lastAssistant().usage).toMatchObject({ input_tokens: 10, output_tokens: 5 });
+
+    // A 的迟到终局 done：claim 已被 B 的 done 清空，ownTurn 退化为 true，
+    // 但它不得把 B 的行盖上 A 的 usage——只做 run 级收尾。
+    handleEngineEvents(
+      [ev(RUN_A, "done", 5, { usage: { input_tokens: 999, output_tokens: 1 }, backgroundTasks: 0 })],
+      deps(),
+    );
+    expect(lastAssistant().text).toBe("B 正文");
+    expect(lastAssistant().usage).toMatchObject({ input_tokens: 10, output_tokens: 5 });
+    expect(session().settledRunIds).toEqual(expect.arrayContaining([RUN_A, RUN_B]));
+    expect(runRouting.has(RUN_A)).toBe(false);
   });
 
   it("lets a run take over a session whose claim was already settled", () => {

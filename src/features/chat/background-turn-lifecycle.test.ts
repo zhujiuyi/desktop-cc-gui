@@ -202,6 +202,89 @@ describe("background turn lifecycle", () => {
     expect(useChatStore.getState().streamingByKey[KEY]).toBe(true);
   });
 
+  it("converges the background wait on the killed run's closing tasks frame, before its terminal done", () => {
+    handleEngineEvents([
+      ev("delta", 1, "跑起来了"),
+      ev("task_started", 2, { taskId: "w1", taskType: "local_workflow", description: "wf" }),
+      ev("done", 3, { usage: null, backgroundTasks: 1 }),
+      // The process died in its background phase. The exit tail's staged
+      // closing REPLACE lands first (the live set is empty)...
+      ev("tasks", 4, { tasks: [] }),
+    ], deps());
+
+    const mid = useChatStore.getState().bySession[KEY]!;
+    // ...and the wait converges right there, not only on the done behind it.
+    expect(mid.awaitingTasks).toBe(false);
+    expect(mid.tasks[0].status).toBe("stopped");
+
+    // ...then the terminal done: the run itself still converges.
+    handleEngineEvents([
+      ev("done", 5, { usage: null, backgroundTasks: 0, runContinues: false }),
+    ], deps());
+    const s = useChatStore.getState().bySession[KEY]!;
+    expect(s.awaitingTasks).toBe(false);
+    expect(s.settledRunIds).toContain(runId);
+    expect(settledRuns.get(runId)).toBe("done");
+    expect(runRouting.has(runId)).toBe(false);
+  });
+
+  it("does not let an ambient row keep the background wait alive", () => {
+    handleEngineEvents([
+      ev("delta", 1, "跑起来了"),
+      ev("tasks", 2, {
+        tasks: [
+          { taskId: "w1", taskType: "local_workflow", description: "wf" },
+          { taskId: "mon", taskType: "local_agent", description: "monitor", ambient: true },
+        ],
+      }),
+      ev("done", 3, { usage: null, backgroundTasks: 1 }),
+      // The real task is gone from the live set; only ambient housekeeping
+      // remains — a turn never waits on that.
+      ev("tasks", 4, {
+        tasks: [{ taskId: "mon", taskType: "local_agent", description: "monitor", ambient: true }],
+      }),
+    ], deps());
+
+    const s = useChatStore.getState().bySession[KEY]!;
+    expect(s.awaitingTasks).toBe(false);
+    expect(s.tasks.find((t) => t.id === "mon")!.status).toBe("running");
+    expect(s.tasks.find((t) => t.id === "w1")!.status).toBe("stopped");
+  });
+
+  it("books the reply once across the held done and the exit tail's terminal done", () => {
+    handleEngineEvents([
+      ev("delta", 1, "跑起来了"),
+      ev("task_started", 2, { taskId: "w1", taskType: "local_workflow", description: "wf" }),
+      ev("done", 3, { usage: { input_tokens: 7, output_tokens: 3 }, backgroundTasks: 1 }),
+    ], deps());
+    expect(ipc.usageRecord).toHaveBeenCalledTimes(1);
+
+    // The exit tail's terminal done carries usage: null — no second row.
+    handleEngineEvents([
+      ev("done", 4, { usage: null, backgroundTasks: 0, runContinues: false }),
+    ], deps());
+    expect(ipc.usageRecord).toHaveBeenCalledTimes(1);
+  });
+
+  it("books nothing when the turn never reported usage, even with a stale session snapshot", () => {
+    // An earlier turn left its occupancy snapshot on the session.
+    useChatStore.setState((s) => ({
+      bySession: {
+        ...s.bySession,
+        [KEY]: { ...s.bySession[KEY]!, usage: { input_tokens: 50, output_tokens: 5 } },
+      },
+    }));
+    handleEngineEvents([
+      ev("delta", 1, "跑起来了"),
+      ev("task_started", 2, { taskId: "w1", taskType: "local_workflow", description: "wf" }),
+      ev("done", 3, { usage: null, backgroundTasks: 1 }),
+      ev("done", 4, { usage: null, backgroundTasks: 0, runContinues: false }),
+    ], deps());
+    // The stale snapshot is not this turn's report: booking it would count
+    // the earlier turn's tokens again.
+    expect(ipc.usageRecord).not.toHaveBeenCalled();
+  });
+
   it("a killed run's lingering tasks settle when the final done arrives", () => {
     handleEngineEvents([
       ev("delta", 1, "跑起来了"),

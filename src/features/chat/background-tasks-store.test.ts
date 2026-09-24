@@ -116,6 +116,51 @@ describe("background task store", () => {
   // process's still-live tasks and reports them as stopped ("didn't finish
   // before the previous session ended"). The row belongs to the run that
   // reported it, so a foreign run's notification must not settle it.
+  it("lets the next run's tasks frame adopt an ambient row a dead run left interrupted", () => {
+    handleEngineEvents(
+      [
+        ev("tasks", 2, {
+          tasks: [{ taskId: "mon", taskType: "local_agent", description: "monitor", ambient: true }],
+        }),
+        // The owning run dies: its settle labels the ambient row interrupted.
+        ev("done", 3, { usage: null, backgroundTasks: 0 }),
+      ],
+      deps(),
+    );
+    expect(useChatStore.getState().bySession[KEY]!.tasks[0].status).toBe("interrupted");
+
+    // The session's next run lists the same ambient housekeeping task in its
+    // authoritative set: the row transfers to it and reads as running again
+    // instead of staying mislabeled forever.
+    handleEngineEvents(
+      [
+        ev("tasks", 4, {
+          tasks: [{ taskId: "mon", taskType: "local_agent", description: "monitor", ambient: true }],
+        }, "run-b"),
+      ],
+      deps(),
+    );
+    const row = useChatStore.getState().bySession[KEY]!.tasks.find((t) => t.id === "mon")!;
+    expect(row).toMatchObject({ runId: "run-b", status: "running", ambient: true });
+  });
+
+  it("still refuses a tasks-frame adoption for a run-scoped (non-ambient) row", () => {
+    handleEngineEvents(
+      [ev("task_started", 2, { taskId: "w1", taskType: "local_workflow", description: "wf" })],
+      deps(),
+    );
+    handleEngineEvents(
+      [
+        ev("tasks", 3, {
+          tasks: [{ taskId: "w1", taskType: "local_workflow", description: "wf" }],
+        }, "run-b"),
+      ],
+      deps(),
+    );
+    const row = useChatStore.getState().bySession[KEY]!.tasks.find((t) => t.id === "w1")!;
+    expect(row).toMatchObject({ runId, status: "running" });
+  });
+
   it("ignores another run's stopped notification for this run's task", () => {
     runRouting.set("other-run", KEY);
     handleEngineEvents(
