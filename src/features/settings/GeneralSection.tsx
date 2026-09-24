@@ -204,6 +204,13 @@ function useGeneralSettingsState() {
     }
   };
 
+  const onThinkingAutoExpandChange = (autoExpand: boolean) => {
+    if (!settings) return;
+    setSettings({ ...settings, thinkingAutoExpand: autoExpand });
+    useChatStore.getState().setThinkingAutoExpand(autoExpand);
+    void save({ thinkingAutoExpand: autoExpand });
+  };
+
   /** 上传字体：读取并注册成功后才落设置（失败保留原选择并报错）。 */
   const onFontFilePick = async (field: FontField): Promise<boolean> => {
     if (!settings) return false;
@@ -244,6 +251,7 @@ function useGeneralSettingsState() {
     onThinkingAutoCollapseChange,
     onFontModeChange,
     onFontFilePick,
+    onThinkingAutoExpandChange,
   };
 }
 
@@ -493,10 +501,12 @@ function BehaviorCard({
   settings,
   onSendShortcutChange,
   onThinkingAutoCollapseChange,
+  onThinkingAutoExpandChange,
 }: {
   settings: AppSettings;
   onSendShortcutChange: (key: Key | null) => void;
   onThinkingAutoCollapseChange: (autoCollapse: boolean) => void;
+  onThinkingAutoExpandChange: (autoExpand: boolean) => void;
 }) {
   const { t } = useTranslation();
   return (
@@ -521,6 +531,18 @@ function BehaviorCard({
           </Select>
         </SettingsRow>
 
+        <SettingsRow
+          anchor="thinkingAutoExpand"
+          label={t("settings.thinkingAutoExpand")}
+          description={t("settings.thinkingAutoExpandDesc")}
+        >
+          <Switch
+            size="sm"
+            aria-label={t("settings.thinkingAutoExpand")}
+            isSelected={settings.thinkingAutoExpand ?? true}
+            onChange={onThinkingAutoExpandChange}
+          />
+        </SettingsRow>
         <SettingsRow
           anchor="thinkingAutoCollapse"
           label={t("settings.thinkingAutoCollapse")}
@@ -559,6 +581,7 @@ export function GeneralSection() {
     fontBusy,
     onFontModeChange,
     onFontFilePick,
+    onThinkingAutoExpandChange,
   } = useGeneralSettingsState();
 
   return (
@@ -592,6 +615,7 @@ export function GeneralSection() {
           settings={settings}
           onSendShortcutChange={onSendShortcutChange}
           onThinkingAutoCollapseChange={onThinkingAutoCollapseChange}
+          onThinkingAutoExpandChange={onThinkingAutoExpandChange}
         />
       )}
       {settings && <PromptHistoryManager />}

@@ -87,6 +87,12 @@ const generalEntries: SettingsSearchEntry[] = [
   },
   {
     page: "general",
+    anchor: "thinkingAutoExpand",
+    labelKey: "settings.thinkingAutoExpand",
+    sectionKey: "settings.behavior",
+  },
+  {
+    page: "general",
     anchor: "thinkingAutoCollapse",
     labelKey: "settings.thinkingAutoCollapse",
     sectionKey: "settings.behavior",
