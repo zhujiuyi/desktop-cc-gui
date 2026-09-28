@@ -3,7 +3,6 @@ import { useTranslation } from "react-i18next";
 import { useChatStore } from "./store";
 import { SessionTabStrip } from "./components/SessionTabStrip";
 import { ErrorBanner } from "./components/ErrorBanner";
-import type { ComposerInputHandle } from "@/components/application/ai-chat/ai-chat-composer";
 import { AppStatusBar } from "@/components/application/app-status-bar/app-status-bar";
 import { isWeb } from "@/lib/platform";
 import { useTitlebarStyle } from "@/features/settings/titlebar";
@@ -28,6 +27,8 @@ import { PANEL_TOGGLE_CLASSES } from "./panel-toggle-classes";
 import { ChatSidebarFrame } from "./ChatSidebarFrame";
 import { ChatSidePanel } from "./ChatSidePanel";
 import { ChatCenterPane } from "./ChatCenterPane";
+import { SplitDragProvider } from "./split/drag";
+import { useComposerBridge } from "./split/composer-bridge";
 import { resolvePanelLayout } from "./panel-layout";
 // Side-effect import: registers the builtin files/changes tabs into
 // panelTabRegistry (plan §4.2 #4).
@@ -60,7 +61,9 @@ export default function ChatPage() {
   // Terminal dock: toggled from the header open-actions cluster (and ⌘J).
   const toggleTerminal = useTerminalStore((s) => s.toggle);
   const [dialog, setDialog] = useState<ChatPageDialog | null>(null);
-  const composerInputRef = useRef<ComposerInputHandle>(null);
+  // 全局 composer ref 是一层「读到当前聚焦栏」的桥：单栏就是原来那一个输入框，
+  // 分屏后落到聚焦格（空格子没有输入框时为空，不抢焦点）。
+  const composerInputRef = useComposerBridge();
   const {
     panelWidth,
     panelCollapsed,
@@ -195,6 +198,7 @@ export default function ChatPage() {
   );
 
   return (
+    <SplitDragProvider>
     <div
       className={cx(
         "relative flex h-dvh w-full overflow-hidden bg-background-secondary-default",
@@ -335,5 +339,6 @@ export default function ChatPage() {
 
       <ChatPageDialogs dialog={dialog} onClose={() => setDialog(null)} />
     </div>
+    </SplitDragProvider>
   );
 }

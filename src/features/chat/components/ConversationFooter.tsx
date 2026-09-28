@@ -15,6 +15,7 @@ import { imageMetaText } from "@/utils/image-meta";
 import type { AttachmentPreview } from "./use-composer-images";
 import { RunStatusStrip } from "./RunStatusStrip";
 import { QuestionDock, usePendingQuestion } from "./QuestionDock";
+import { PlanReviewDock, usePendingPlanReview } from "./PlanReviewDock";
 import { ErrorBanner } from "./ErrorBanner";
 import { sessionKey } from "../store";
 import { ComposerSlotExtras } from "@/features/plugins/boundary/composer-slot-extras";
@@ -232,27 +233,32 @@ function FooterStatusBar({
   const [compacting, setCompacting] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
 
+  // 压缩/刷新按本格子的会话 key 发出：分屏时不能再落到全局 active 上。
+  const sessionKeyValue = active
+    ? sessionKey(active.engine, active.sessionId, active.workspacePath)
+    : "";
+
   const handleCompact = useCallback(async () => {
     if (!active || streaming || compacting) return;
     setCompacting(true);
     try {
-      await compactContext();
+      await compactContext(sessionKeyValue);
     } finally {
       setCompacting(false);
     }
-  }, [active, streaming, compacting, compactContext]);
+  }, [active, streaming, compacting, compactContext, sessionKeyValue]);
 
   const handleRefresh = useCallback(async () => {
     if (!active || refreshing) return;
     setRefreshing(true);
     try {
-      await refreshSessionUsage();
+      await refreshSessionUsage(sessionKeyValue);
     } finally {
       // No minimum-visible-busy delay here: the refresh button's feedback
       // finishes the spin lap (and checks) on its own.
       setRefreshing(false);
     }
-  }, [active, refreshing, refreshSessionUsage]);
+  }, [active, refreshing, refreshSessionUsage, sessionKeyValue]);
 
   const visibleWorkspaces = useMemo(
     () => {
@@ -390,6 +396,9 @@ export function ConversationFooter({
   // While the CLI waits on an AskUserQuestion the panel takes the composer's
   // place — it covers the input box instead of floating beside it.
   const pendingQuestion = usePendingQuestion();
+  // A plan revision awaiting the user's decision takes the same slot; the
+  // backend serializes native waiting points, so at most one is pending.
+  const pendingPlan = usePendingPlanReview();
 
   // The draft prop is the store's per-session value, so watching it covers
   // every change source at once: typing, submit-clear, and session switches
@@ -430,7 +439,9 @@ export function ConversationFooter({
           onZoomImage={setZoomImage}
         />
         <ActiveRunStatus active={active} />
-        {pendingQuestion ? (
+        {pendingPlan ? (
+          <PlanReviewDock />
+        ) : pendingQuestion ? (
           <QuestionDock />
         ) : (
           <FooterComposer

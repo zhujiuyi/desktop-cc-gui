@@ -370,6 +370,7 @@ fn prune_engine_subagent_sessions(
             rusqlite::params![engine, id],
         )
         .map_err(|e| e.to_string())?;
+        crate::engine::plan_review::delete_reviews_for_session(&conn, engine, id)?;
     }
     Ok(true)
 }
@@ -428,6 +429,7 @@ fn prune_codex_sessions_outside_home(db: &crate::db::Db) -> Result<bool, String>
             rusqlite::params![id],
         )
         .map_err(|e| e.to_string())?;
+        crate::engine::plan_review::delete_reviews_for_session(&tx, "codex", id)?;
     }
     tx.commit().map_err(|e| e.to_string())?;
     Ok(true)

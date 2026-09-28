@@ -1,43 +1,17 @@
 import { useDeferredValue, useMemo } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import rehypeHighlight from "rehype-highlight";
-import rehypeRaw from "rehype-raw";
-import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
+import { useTranslation } from "react-i18next";
+import { Streamdown, type StreamdownTranslations } from "streamdown";
+import { code } from "@streamdown/code";
+import { math } from "@streamdown/math";
+import { mermaid } from "@streamdown/mermaid";
+import { cjk } from "@streamdown/cjk";
+import "katex/dist/katex.min.css";
 import { fileUrl, openExternal } from "@/lib/platform";
-import type { Pluggable } from "unified";
 
-const REMARK_PLUGINS = [remarkGfm];
-// rehype-raw parses inline HTML (<div align>, <img>, badges); sanitize keeps
-// it safe; highlight runs last so its classes survive sanitization.
-const REHYPE_PLUGINS: Pluggable[] = [
-  rehypeRaw,
-  [
-    rehypeSanitize,
-    {
-      ...defaultSchema,
-      tagNames: [
-        ...(defaultSchema.tagNames ?? []),
-        "details",
-        "summary",
-        "abbr",
-        "mark",
-        "ins",
-        "del",
-        "sub",
-        "sup",
-        "kbd",
-        "var",
-        "samp",
-      ],
-      attributes: {
-        ...defaultSchema.attributes,
-        "*": [...(defaultSchema.attributes?.["*"] ?? []), "className", "class"],
-      },
-    },
-  ],
-  rehypeHighlight,
-];
+// Plugins are stateless singletons; a module-level reference keeps the
+// Streamdown `plugins` prop stable across renders.
+const PLUGINS = { code, math, mermaid, cjk };
+
 const BROWSER_LOADABLE_SRC_RE = /^(?:https?:|data:|blob:|asset:)/i;
 
 function normalizePathSegments(path: string): string {
@@ -92,21 +66,14 @@ function resolveMarkdownImageSrc(src: string, sourceFilePath: string): string {
 }
 
 export function MarkdownPreview({ path, draft }: { path: string; draft: string }) {
-  // Preview parses a deferred copy of the draft: the full rehype pipeline
-  // (raw → sanitize → highlight) per keystroke would jank typing.
+  const { t } = useTranslation();
+  // Preview parses a deferred copy of the draft: re-parsing the whole
+  // document per keystroke would jank typing.
   const deferredDraft = useDeferredValue(draft);
-  const markdownComponents = useMemo(
+  const components = useMemo(
     () => ({
-      // Unstyled <pre> from rehype-highlight gets basic chrome here.
-      pre: (props: React.HTMLAttributes<HTMLPreElement>) => (
-        <pre
-          {...props}
-          className="my-2 overflow-auto rounded-lg bg-background-secondary-default p-3 text-caption-1-regular"
-        />
-      ),
-      code: (props: React.HTMLAttributes<HTMLElement>) => (
-        <code {...props} className="font-mono text-[0.85em]" />
-      ),
+      // Local relative image paths must resolve next to the markdown file;
+      // Streamdown's default <img> would pass the raw relative src through.
       img: (props: React.ImgHTMLAttributes<HTMLImageElement>) => (
         <img
           {...props}
@@ -134,16 +101,47 @@ export function MarkdownPreview({ path, draft }: { path: string; draft: string }
     }),
     [path],
   );
+  const translations = useMemo<Partial<StreamdownTranslations>>(
+    () => ({
+      close: t("files.markdown.close"),
+      copied: t("files.markdown.copied"),
+      copyCode: t("files.markdown.copyCode"),
+      copyTable: t("files.markdown.copyTable"),
+      copyTableAsCsv: t("files.markdown.copyTableAsCsv"),
+      copyTableAsMarkdown: t("files.markdown.copyTableAsMarkdown"),
+      copyTableAsTsv: t("files.markdown.copyTableAsTsv"),
+      downloadDiagram: t("files.markdown.downloadDiagram"),
+      downloadDiagramAsMmd: t("files.markdown.downloadDiagramAsMmd"),
+      downloadDiagramAsPng: t("files.markdown.downloadDiagramAsPng"),
+      downloadDiagramAsSvg: t("files.markdown.downloadDiagramAsSvg"),
+      downloadFile: t("files.markdown.downloadFile"),
+      downloadImage: t("files.markdown.downloadImage"),
+      downloadTable: t("files.markdown.downloadTable"),
+      downloadTableAsCsv: t("files.markdown.downloadTableAsCsv"),
+      downloadTableAsMarkdown: t("files.markdown.downloadTableAsMarkdown"),
+      exitFullscreen: t("files.markdown.exitFullscreen"),
+      imageNotAvailable: t("files.markdown.imageNotAvailable"),
+      resetView: t("files.markdown.resetView"),
+      viewFullscreen: t("files.markdown.viewFullscreen"),
+      zoomIn: t("files.markdown.zoomIn"),
+      zoomOut: t("files.markdown.zoomOut"),
+    }),
+    [t],
+  );
 
   return (
-    <div className="min-h-0 flex-1 overflow-auto p-4 text-body-medium text-text-primary [&_h1]:mb-2 [&_h1]:text-lg [&_h1]:font-semibold [&_h2]:mb-2 [&_h2]:text-base [&_h2]:font-semibold [&_li]:ml-4 [&_li]:list-disc [&_p]:mb-2 [&_a]:text-accent-600 [&_a]:underline [&_kbd]:inline-flex [&_kbd]:items-center [&_kbd]:gap-1 [&_kbd]:rounded-md [&_kbd]:border [&_kbd]:border-separator-border [&_kbd]:bg-background-tertiary-default [&_kbd]:px-1.5 [&_kbd]:py-0.5 [&_kbd]:align-middle [&_kbd]:text-caption-1-regular">
-      <ReactMarkdown
-        remarkPlugins={REMARK_PLUGINS}
-        rehypePlugins={REHYPE_PLUGINS}
-        components={markdownComponents}
+    <div className="min-h-0 flex-1 overflow-auto p-4 text-body-medium text-text-primary">
+      <Streamdown
+        mode="static"
+        plugins={PLUGINS}
+        components={components}
+        translations={translations}
+        // External links are handed to the OS browser above; Streamdown's
+        // link-safety modal would be a second, redundant gate.
+        linkSafety={{ enabled: false }}
       >
         {deferredDraft}
-      </ReactMarkdown>
+      </Streamdown>
     </div>
   );
 }

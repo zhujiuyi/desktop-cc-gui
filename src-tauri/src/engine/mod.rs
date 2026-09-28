@@ -23,6 +23,7 @@ pub mod opencode_server;
 mod opencode_session;
 pub mod pi_family;
 pub mod pi_family_auth;
+pub mod plan_review;
 pub mod qoder;
 mod qoder_session;
 mod reader;
@@ -38,6 +39,7 @@ pub(crate) use events::{
     safe_prompt_arg, tool_call_message, tool_call_patch, tool_path_arg, tool_result_patch,
 };
 pub use events::{EngineEvent, TodoItem, TodosPayload};
+pub use plan_review::{PlanApproval, PlanReview, PlanReviewKind};
 // Live child-process registry (registry.rs).
 pub(crate) use registry::{kill_process_group, next_virtual_pid};
 pub use registry::{ChildEntry, ProcessRegistry};
@@ -200,6 +202,14 @@ pub trait Engine: Send + Sync {
             .and_then(|mode| supported.iter().copied().find(|m| *m == mode))
             .unwrap_or(supported[0])
     }
+    /// 计划预览与人工审批能力(engine/plan_review.rs)。默认 Legacy:引擎
+    /// 自身的原生计划入口保持既有行为。返回 Unavailable 时,显式 plan 请求
+    /// 必须在发送前受控拒绝——计划审批是用户决策,auto/bypass、静默回退
+    /// 和自动批准参数都不能代替(OMP/Codex/DSH/Grok/Qoder 在各自适配器
+    /// 接通前都是 Unavailable;PRD §1 原则 1/4)。
+    fn plan_approval(&self) -> PlanApproval {
+        PlanApproval::Legacy
+    }
 }
 pub fn engine_by_id(id: &str) -> Option<Box<dyn Engine>> {
     match id {
@@ -300,6 +310,10 @@ pub struct EngineInfo {
     /// Permission modes the engine honors at spawn; drives the composer
     /// picker's disabled options.
     pub permissions: Vec<String>,
+    /// 计划预览与人工审批能力(engine/plan_review.rs):typed = 审批主干已
+    /// 接通;legacy = 引擎原生计划入口(不经主干);unavailable + reason =
+    /// 显式计划请求将被受控拒绝,UI 不得提供可点的计划入口。
+    pub plan: PlanApproval,
 }
 fn codex_bin_from_home(settings: &crate::settings::AppSettings) -> Option<String> {
     let home = settings.codex_home.as_deref()?.trim();
@@ -381,6 +395,7 @@ fn list_engines_blocking() -> Vec<EngineInfo> {
                     .iter()
                     .map(|m| m.to_string())
                     .collect(),
+                plan: engine.plan_approval(),
             }
         })
         .collect()
@@ -391,6 +406,25 @@ fn list_engines_blocking() -> Vec<EngineInfo> {
 /// under both its run id and its session alias, so an entry count would
 /// halve the real ceiling.
 const MAX_CONCURRENT_RUNS: usize = 64;
+/// 显式计划请求的能力门禁:计划审批是用户决策,能力不足必须报错,禁止
+/// 降级——auto/bypass、resolve_permission 的静默回退和自动批准参数
+/// (如 --plan-yolo)都不能代替用户批准(PRD §1 原则 1/4、§3.1)。
+/// prepare_launch 在构建命令与 spawn 之前调用;Typed/Legacy 路径放行。
+fn ensure_plan_approval(
+    engine: &str,
+    engine_impl: &dyn Engine,
+    permission: Option<&str>,
+) -> Result<(), String> {
+    if permission == Some("plan") {
+        if let PlanApproval::Unavailable { reason } = engine_impl.plan_approval() {
+            return Err(format!(
+                "engine {engine} cannot run a human-approved plan: {reason}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Resolved launch parameters for one send: request, binary, built command.
 struct Launch {
     req: SendRequest,
@@ -417,6 +451,7 @@ fn prepare_launch(
     // 停用 still gates sending. Channel settings apply to this child below;
     // native CLI files remain the official configuration.
     crate::config::ensure_engine_enabled(engine)?;
+    ensure_plan_approval(engine, engine_impl.as_ref(), permission.as_deref())?;
     // 工具白名单是硬约束：引擎不能兑现就直接拒绝启动（不降级为无约束）。
     let allowed_tools = match allowed_tools {
         Some(tools) if !tools.is_empty() => {
@@ -760,6 +795,7 @@ async fn send_message_inner_with_sink(
                 reader_abort: Arc::clone(&reader_abort),
                 stdin: None,
                 questions: Arc::new(Mutex::new(HashMap::new())),
+                plans: Arc::new(Mutex::new(HashMap::new())),
             },
         );
     }
@@ -835,7 +871,11 @@ async fn send_reserved(
     // registry entry only routes interrupts to the transport task. Their
     // drivers spawn locally, so a remote workspace either keeps the CLI
     // transport (codex/grok) or has no path at all — 显式拒绝。
-    if launch.engine_impl.transport_for(wsl_tp.is_some()) == Transport::Own {
+    // OMP 的显式计划会话固定走 ACP 传输(elicitation.form 握手 + 计划文件
+    // 全文,见 omp_acp.rs);其余 omp/pi 请求保持既有子进程路径,不迁移。
+    if launch.engine_impl.transport_for(wsl_tp.is_some()) == Transport::Own
+        || (engine == "omp" && pi_family::acp_plan_requested(&launch.req))
+    {
         // 本机驱动没有远端路径:远程工作区显式拒绝(与旧行为一致),而不是
         // 静默起一个连不上远端工作区的本地会话。codex/grok 在上面退回 child。
         if wsl_tp.is_some() {
@@ -943,6 +983,7 @@ async fn send_reserved(
         launch.built.keep_stdin_open,
     );
     let questions: Arc<Mutex<HashMap<String, Value>>> = Arc::new(Mutex::new(HashMap::new()));
+    let plans: Arc<Mutex<HashMap<String, Value>>> = Arc::new(Mutex::new(HashMap::new()));
 
     // The reserved caller id keys the real entry too: inserting under the
     // same run_id replaces the placeholder, and the shared killed/reader_abort
@@ -981,6 +1022,7 @@ async fn send_reserved(
             reader_abort: Arc::clone(&reader_abort),
             stdin: kept_stdin.clone(),
             questions: Arc::clone(&questions),
+            plans: Arc::clone(&plans),
         },
     );
     if let Some(session_id) = launch.built.preassigned_session_id.as_deref() {
@@ -994,6 +1036,7 @@ async fn send_reserved(
                 reader_abort: Arc::clone(&reader_abort),
                 stdin: kept_stdin.clone(),
                 questions: Arc::clone(&questions),
+                plans: Arc::clone(&plans),
             },
         );
     }
@@ -1019,6 +1062,7 @@ async fn send_reserved(
             registry: Arc::clone(&state.processes),
             engine_id: engine.clone(),
             run_id: run_id.clone(),
+            db: Some(Arc::clone(&state.db)),
         },
         engine_impl: launch.engine_impl,
         pid,
@@ -1066,6 +1110,7 @@ async fn send_host_stream(
         reader_abort: Arc::clone(&reader_abort),
         stdin: None,
         questions: Arc::new(Mutex::new(HashMap::new())),
+        plans: Arc::new(Mutex::new(HashMap::new())),
     };
     state.processes.insert(run_id.clone(), entry.clone());
     if let Some(session_id) = launch.req.session_id.as_deref() {
@@ -1079,6 +1124,7 @@ async fn send_host_stream(
         registry: Arc::clone(&state.processes),
         engine_id: engine.clone(),
         run_id: run_id.clone(),
+        db: Some(Arc::clone(&state.db)),
     };
     let resume_session_id = launch.req.session_id.clone();
     let task = match engine.as_str() {
@@ -1108,6 +1154,13 @@ async fn send_host_stream(
             pid,
         )),
         "codex" => tokio::spawn(codex_app::run_app_server_turn(
+            core,
+            launch.req,
+            launch.built,
+            killed,
+            pid,
+        )),
+        "omp" => tokio::spawn(pi_family::omp_acp::run_acp_turn(
             core,
             launch.req,
             launch.built,
@@ -1365,6 +1418,223 @@ pub async fn answer_question(
     }
     Ok(())
 }
+
+/// respond_plan_review 的结果:决策已生效,或冲突(当前状态原样返回,供
+/// UI 呈现"已被另一窗口/新版本取代"而不是重复执行)。重复点击返回相同
+/// 结果或明确冲突——PRD §4.2。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase", tag = "outcome")]
+pub enum PlanRespondOutcome {
+    Applied { review: PlanReview },
+    Conflict { review: PlanReview },
+}
+
+/// 计划审批决策入口。前端只提交 planId + expectedRevision + decision +
+/// 可选反馈;原生回复上下文从不离开后端。流程:
+/// 1. expectedRevision + 状态条件原子抢占(plan_review::submit_decision),
+///    决策意图先落盘;
+/// 2. 按停住的原生上下文构造回复并写出——写管道失败退回待审、意图留存,
+///    批准绝不显示成功;
+/// 3. 原生确认后 mark_applied 落账。写成功 ≠ 远端已执行:失联只能标
+///    unknown 并核对上游,本客户端保证不重复提交同一批准。
+#[tauri::command]
+pub async fn respond_plan_review(
+    state: tauri::State<'_, crate::AppState>,
+    plan_id: String,
+    expected_revision: i64,
+    decision: plan_review::PlanDecision,
+    feedback: Option<String>,
+) -> Result<PlanRespondOutcome, String> {
+    let claimed = match plan_review::submit_decision(
+        &state.db,
+        &plan_id,
+        expected_revision,
+        decision,
+        feedback.as_deref(),
+    )? {
+        plan_review::SubmitOutcome::Conflict(review) => {
+            return Ok(PlanRespondOutcome::Conflict { review: *review });
+        }
+        plan_review::SubmitOutcome::Claimed { previous } => previous,
+    };
+    let fail = |message: String| -> Result<PlanRespondOutcome, String> {
+        // 提交权已抢占但路由/写入失败:退回待审,决策意图留存待恢复。
+        plan_review::revert_submission(&state.db, &plan_id, expected_revision, claimed)?;
+        Err(message)
+    };
+    let review = plan_review::get_review(&state.db, &plan_id, expected_revision)?
+        .ok_or_else(|| "plan review vanished mid-decision".to_string())?;
+
+    // 暂不执行:任何生命周期都不需要写原生回复;原生等待点保持停着,
+    // 用户可回到同一会话继续审批(deferred 允许再次提交)。
+    if decision == plan_review::PlanDecision::Defer {
+        plan_review::mark_applied(&state.db, &plan_id, expected_revision, decision)?;
+        let review = plan_review::get_review(&state.db, &plan_id, expected_revision)?
+            .ok_or_else(|| "plan review vanished mid-decision".to_string())?;
+        return Ok(PlanRespondOutcome::Applied { review });
+    }
+
+    if review.review_kind == plan_review::PlanReviewKind::NextTurn {
+        // next_turn:计划轮次已正常结束,没有停着的原生请求;批准=原子创建
+        // 一次 default 执行 turn,修改=新 plan turn 携反馈。执行器核对线程
+        // 存在且最终 plan item 未变(stale 由其就地 expire)。今天只有 codex
+        // 是 next_turn;其他引擎声明 next_turn 却没有执行器是编程错误,
+        // fail-closed 而不是静默无事发生。
+        if review.engine != "codex" {
+            return fail(format!(
+                "no next_turn plan executor is wired for engine {}",
+                review.engine
+            ));
+        }
+        if let Err(message) =
+            codex_app::run_plan_decision(&state, &review, decision, feedback.as_deref()).await
+        {
+            return fail(format!("plan decision was NOT delivered: {message}"));
+        }
+        plan_review::mark_applied(&state.db, &plan_id, expected_revision, decision)?;
+        if decision == plan_review::PlanDecision::Approve {
+            // 执行 turn 已被服务端确认创建(原子一次);完成/失败由该 run 的
+            // 后续事件推进,approved ≠ 执行成功。
+            plan_review::mark_execution(
+                &state.db,
+                &plan_id,
+                expected_revision,
+                plan_review::PlanExecution::Starting,
+            )?;
+        }
+        let review = plan_review::get_review(&state.db, &plan_id, expected_revision)?
+            .ok_or_else(|| "plan review vanished mid-decision".to_string())?;
+        return Ok(PlanRespondOutcome::Applied { review });
+    }
+
+    // native_request:取出停住的上下文,校验它属于同一版本、正文未变。
+    let session_key = review.run_id.clone().unwrap_or_else(|| review.session_id.clone());
+    let entry = state
+        .processes
+        .get(&session_key)
+        .or_else(|| state.processes.get(&review.session_id))
+        .ok_or_else(|| "no running session holds this plan's native request".to_string());
+    let entry = match entry {
+        Ok(entry) => entry,
+        Err(message) => return fail(message),
+    };
+    let parked = entry
+        .plans
+        .lock()
+        .map_err(|_| "plan state is poisoned".to_string())
+        .ok()
+        .and_then(|plans| plans.get(&plan_id).cloned());
+    let Some(parked) = parked else {
+        return fail("the native plan request is no longer parked for this session".to_string());
+    };
+    if parked.get("revision").and_then(Value::as_i64) != Some(expected_revision) {
+        return fail("the parked native request belongs to a different plan revision".to_string());
+    }
+    if let Some(hash) = parked.get("contentHash").and_then(Value::as_str) {
+        if hash != review.content_hash {
+            // 正文在审批期间变化:不能让已抢占版本带着旧正文继续执行——
+            // 先失效,要求重新审阅(PR §4.2 末条)。
+            let _ = plan_review::expire_reviews(&state.db, &[(plan_id.clone(), expected_revision)]);
+            return Err("plan content changed while awaiting review; the revision was expired"
+                .to_string());
+        }
+    }
+
+    let frame_key = match decision {
+        plan_review::PlanDecision::Approve => "approve",
+        plan_review::PlanDecision::RequestChanges => "changes",
+        plan_review::PlanDecision::Defer => unreachable!("defer returned above"),
+    };
+    let frame = parked
+        .get("frames")
+        .and_then(|frames| frames.get(frame_key))
+        .cloned()
+        .ok_or_else(|| {
+            "the parked native context carries no reply frame for this decision".to_string()
+        });
+    let frame = match frame {
+        Ok(frame) => frame,
+        Err(message) => return fail(message),
+    };
+    let frame = substitute_plan_feedback(frame, feedback.as_deref());
+
+    let written = match parked.get("route").and_then(Value::as_str) {
+        Some("stdin") => state.processes.write_line(&session_key, frame_to_line(&frame)).await,
+        Some("http") => {
+            let origin = parked.get("origin").and_then(Value::as_str).unwrap_or("");
+            let path = parked.get("path").and_then(Value::as_str).unwrap_or("");
+            if origin.is_empty() || path.is_empty() {
+                Err("the parked native context is missing its http origin/path".to_string())
+            } else {
+                crate::dsh_host::host_call(origin, path, frame).await.map(|_| ())
+            }
+        }
+        _ => Err("the parked native context does not declare a reply route".to_string()),
+    };
+    if let Err(message) = written {
+        return fail(format!("plan decision was NOT delivered: {message}"));
+    }
+
+    plan_review::mark_applied(&state.db, &plan_id, expected_revision, decision)?;
+    if decision == plan_review::PlanDecision::Approve {
+        // 原生确认已收到,实施开始;approved ≠ 执行成功,完成/失败由后续
+        // 运行事件推进。
+        plan_review::mark_execution(
+            &state.db,
+            &plan_id,
+            expected_revision,
+            plan_review::PlanExecution::Starting,
+        )?;
+    }
+    if let Ok(mut plans) = entry.plans.lock() {
+        plans.remove(&plan_id);
+    }
+    let review = plan_review::get_review(&state.db, &plan_id, expected_revision)?
+        .ok_or_else(|| "plan review vanished mid-decision".to_string())?;
+    Ok(PlanRespondOutcome::Applied { review })
+}
+
+/// 计划审批历史(重启后历史页加载):按 planId/revision 主键去重,随会话
+/// 删除清理。前端 localStorage 不是审批权威。
+#[tauri::command]
+pub async fn list_plan_reviews(
+    state: tauri::State<'_, crate::AppState>,
+    engine: String,
+    session_id: String,
+) -> Result<Vec<PlanReview>, String> {
+    plan_review::list_reviews(&state.db, &engine, &session_id)
+}
+
+/// 反馈文本注入原生回复帧:适配器在停车时把帧里需要携带用户反馈的字符串
+/// 叶子写成该占位符,发送时替换(如 DSH 的 custom 字段)。无占位符的帧原样
+/// 通过;无反馈时占位符替换为空对象 null 语义由适配器决定——DSH 规则是
+/// 反馈答案 selected:[] + custom 文本,批准答案绝不携带 custom。
+pub(crate) const PLAN_FEEDBACK_PLACEHOLDER: &str = "__CCGUI_PLAN_FEEDBACK__";
+fn substitute_plan_feedback(frame: Value, feedback: Option<&str>) -> Value {
+    match frame {
+        Value::String(text) if text.contains(PLAN_FEEDBACK_PLACEHOLDER) => {
+            Value::String(text.replace(PLAN_FEEDBACK_PLACEHOLDER, feedback.unwrap_or("")))
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| substitute_plan_feedback(item, feedback))
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, value)| (key, substitute_plan_feedback(value, feedback)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+fn frame_to_line(frame: &Value) -> String {
+    match frame {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
 #[cfg(test)]
 mod stop_task_tests {
     use super::stop_task_frame;
@@ -1608,6 +1878,7 @@ mod permission_tests {
             id: "claude".into(),
             available: true,
             enabled: true,
+            plan: PlanApproval::Legacy,
             supports_images: true,
             supports_computer_use: true,
             supports_effort: true,
@@ -1761,12 +2032,19 @@ mod permission_tests {
 
     #[test]
     fn unsupported_mode_falls_back_to_first_supported() {
+        // codex/omp/dsh 的 typed 计划适配器已接通:plan 不再回退 auto。
         let codex = codex::CodexEngine;
-        assert_eq!(codex.resolve_permission(Some("plan")), "auto");
+        assert_eq!(codex.resolve_permission(Some("plan")), "plan");
         assert_eq!(codex.resolve_permission(Some("manual")), "manual");
         assert_eq!(codex.resolve_permission(None), "auto");
+        assert_eq!(pi_family::omp().resolve_permission(Some("plan")), "plan");
+        assert_eq!(dsh::DshEngine.resolve_permission(Some("plan")), "plan");
+        // 未接通引擎保持回退(门禁 ensure_plan_approval 先拒绝显式 plan,
+        // 回退只是防御层)。
+        assert_eq!(pi_family::pi().resolve_permission(Some("plan")), "auto");
         let grok = grok::GrokEngine;
         assert_eq!(grok.resolve_permission(Some("auto")), "bypass");
+        assert_eq!(grok.resolve_permission(Some("plan")), "bypass");
     }
 
     #[test]
@@ -1880,52 +2158,89 @@ mod permission_tests {
     }
 
     #[test]
-    fn omp_offers_plan_and_bypass_while_pi_stays_auto() {
-        // omp 18.1.x grew real approval switches plus a headless plan flow; pi
-        // 0.85 still exposes none of them. Declaring only the modes a CLI can
-        // actually honor is the whole point of supported_permissions — the
-        // picker greys out the rest instead of sending a mode that is ignored.
-        assert_eq!(
-            pi_family::omp().supported_permissions(),
-            ["auto", "plan", "bypass"]
-        );
-        assert_eq!(pi_family::pi().supported_permissions(), ["auto"]);
+    fn plan_capability_matrix_matches_the_adapter_evidence() {
+        // 能力矩阵(验收规格 §2 末行断言的新形态):适配器已接通的引擎声明
+        // Typed(reviewKind 与协议生命周期一致),门禁放行 plan;未接通的
+        // 保持 fail-closed,显式 plan 请求在构建命令与 spawn 之前受控拒绝,
+        // 禁止降级 auto/bypass。各引擎适配器的细节断言(命令行/帧/正文)
+        // 在各自模块的测试里,这里只锁矩阵与门禁。
+        let typed: Vec<(Box<dyn Engine>, plan_review::PlanReviewKind)> = vec![
+            (
+                Box::new(pi_family::omp()),
+                plan_review::PlanReviewKind::NativeRequest,
+            ),
+            (
+                Box::new(codex::CodexEngine),
+                plan_review::PlanReviewKind::NextTurn,
+            ),
+            (
+                Box::new(dsh::DshEngine),
+                plan_review::PlanReviewKind::NativeRequest,
+            ),
+        ];
+        for (engine, kind) in typed {
+            let id = engine.id().to_string();
+            match engine.plan_approval() {
+                PlanApproval::Typed { review_kind, .. } => assert_eq!(review_kind, kind, "{id}"),
+                other => panic!("{id} must be Typed, got {other:?}"),
+            }
+            assert!(
+                engine.supported_permissions().contains(&"plan"),
+                "{id} picker must offer plan"
+            );
+            assert!(
+                ensure_plan_approval(&id, engine.as_ref(), Some("plan")).is_ok(),
+                "{id} plan request must pass the gate"
+            );
+            assert!(ensure_plan_approval(&id, engine.as_ref(), Some("auto")).is_ok());
+        }
 
-        // "manual" must stay unsupported: always-ask/write leave write/exec
-        // tools on a prompt policy, and print mode has no UI to answer with —
-        // the CLI aborts the turn ("requires approval but no interactive UI
-        // available") the moment a gated tool runs.
-        assert_eq!(pi_family::omp().resolve_permission(Some("manual")), "auto");
-        // pi falls back to its only mode for anything else.
-        assert_eq!(pi_family::pi().resolve_permission(Some("bypass")), "auto");
+        let unavailable: Vec<Box<dyn Engine>> = vec![
+            Box::new(pi_family::pi()),
+            Box::new(grok::GrokEngine),
+            Box::new(qoder::QoderEngine::new(qoder::QoderDistribution::Global)),
+            Box::new(qoder::QoderEngine::new(qoder::QoderDistribution::Cn)),
+        ];
+        for engine in unavailable {
+            let id = engine.id().to_string();
+            assert!(
+                matches!(engine.plan_approval(), PlanApproval::Unavailable { .. }),
+                "{id} must stay fail-closed until its adapter is proven"
+            );
+            assert!(
+                !engine.supported_permissions().contains(&"plan"),
+                "{id} picker must not offer plan"
+            );
+            let refusal = ensure_plan_approval(&id, engine.as_ref(), Some("plan"));
+            let Err(message) = refusal else {
+                panic!("{id} plan request must be refused before spawn");
+            };
+            assert!(message.contains("cannot run a human-approved plan"), "{message}");
+            assert!(ensure_plan_approval(&id, engine.as_ref(), Some("auto")).is_ok());
+        }
 
-        let auto = argv(&pi_family::omp(), &req(Some("auto")));
-        assert!(!auto.contains(&"--approval-mode".to_string()));
+        // omp 计划会话的真实入口是 ACP 传输(--mode acp),不是自动批准的
+        // --plan-yolo;细节断言见 pi_family::tests。
+        let mut plan_req = req(Some("plan"));
+        plan_req.model = Some("openai-codex/gpt-5.4".into());
+        let plan = argv(&pi_family::omp(), &plan_req);
+        assert!(plan.contains(&"--mode".to_string()));
+        assert!(!plan.contains(&"--plan-yolo".to_string()));
+        assert!(!plan.contains(&"--plan-yolo-into".to_string()));
+        assert!(!plan.contains(&"--auto-approve".to_string()));
+
+        // auto/bypass 路径不受计划门禁影响:模型原样传递,不强制降级。
+        let mut auto_req = req(Some("auto"));
+        auto_req.model = Some("openai-codex/gpt-5.4".into());
+        let auto = argv(&pi_family::omp(), &auto_req);
+        let pin = auto.iter().position(|a| a == "--model").expect("model flag");
+        assert_eq!(auto[pin + 1], "openai-codex/gpt-5.4");
         assert!(!auto.contains(&"--auto-approve".to_string()));
-        assert!(!auto.contains(&"--plan-yolo".to_string()));
-
         let bypass = argv(&pi_family::omp(), &req(Some("bypass")));
         assert!(bypass.contains(&"--auto-approve".to_string()));
         assert!(!bypass.contains(&"--plan-yolo".to_string()));
 
-        // The plan flow pins the implementation phase to the picked model;
-        // otherwise --plan-yolo-into drops to the cheap "smol" role.
-        let mut plan_req = req(Some("plan"));
-        plan_req.model = Some("openai-codex/gpt-5.4".into());
-        let plan = argv(&pi_family::omp(), &plan_req);
-        assert!(plan.contains(&"--plan-yolo".to_string()));
-        let pin = plan
-            .iter()
-            .position(|a| a == "--plan-yolo-into")
-            .expect("plan pins the implementation model");
-        assert_eq!(plan[pin + 1], "openai-codex/gpt-5.4");
-
-        // No model picked yet: --plan-yolo alone must not invent one.
-        let bare = argv(&pi_family::omp(), &req(Some("plan")));
-        assert!(bare.contains(&"--plan-yolo".to_string()));
-        assert!(!bare.contains(&"--plan-yolo-into".to_string()));
-
-        // pi never receives any of these flags, even when it is asked for one.
+        // pi never receives approval flags either, whatever it is asked for.
         for mode in [Some("plan"), Some("bypass"), Some("manual")] {
             let args = argv(&pi_family::pi(), &req(mode));
             assert!(!args.contains(&"--plan-yolo".to_string()), "{args:?}");
@@ -1992,6 +2307,7 @@ mod retry_lifecycle_tests {
             registry: Arc::new(ProcessRegistry::default()),
             engine_id: "omp".to_string(),
             run_id: "settled-run".to_string(),
+            db: None,
         };
         let mut state = TurnState::new(Some("session".to_string()));
         for event in [
@@ -2045,6 +2361,7 @@ mod retry_lifecycle_tests {
                 registry: Arc::new(ProcessRegistry::default()),
                 engine_id: "omp".to_string(),
                 run_id: "pipe-retry-run".to_string(),
+                db: None,
             },
             engine_impl: Box::new(pi_family::omp()),
             pid: child.id().unwrap(),
@@ -2093,6 +2410,7 @@ mod retry_lifecycle_tests {
                 registry: Arc::new(ProcessRegistry::default()),
                 engine_id: "codex".to_string(),
                 run_id: "plain-stdout-run".to_string(),
+                db: None,
             },
             engine_impl: Box::new(codex::CodexEngine),
             pid: child.id().unwrap(),
@@ -2203,6 +2521,7 @@ mod retry_lifecycle_tests {
                     reader_abort: Arc::new(std::sync::OnceLock::new()),
                     stdin: None,
                     questions: Arc::new(Mutex::new(HashMap::new())),
+                    plans: Arc::new(Mutex::new(HashMap::new())),
                 },
             );
         }
@@ -2212,6 +2531,7 @@ mod retry_lifecycle_tests {
                 registry: Arc::clone(&registry),
                 engine_id: "omp".to_string(),
                 run_id: "pipe-held-run".to_string(),
+                db: None,
             },
             engine_impl: Box::new(pi_family::omp()),
             pid,
@@ -2282,5 +2602,295 @@ mod codex_home_bin_tests {
             assert_eq!(engine_bin(&settings, "codex"), "/bin/sh");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+#[cfg(test)]
+mod plan_respond_tests {
+    //! respond_plan_review 的交付路径测试:批准/修改帧真实写进子进程
+    //! stdin、写失败退回待审、重复提交冲突。停车上下文需要 pub(crate)
+    //! 的 registry insert,故在 crate 内;IPC 形状与 fail-closed 见
+    //! tests/plan_review.rs。
+    use super::*;
+    use crate::engine::plan_review::{self, PlanDecision, PlanReview};
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+    use tauri::Manager;
+
+    fn build_state(tag: &str) -> (tauri::App<tauri::test::MockRuntime>, Arc<crate::db::Db>) {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "ccgui-plan-respond-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Arc::new(crate::db::Db::open_at(&dir.join("app.db")).unwrap());
+        app.manage(crate::AppState {
+            db: Arc::clone(&db),
+            sink: crate::event_sink::EventSink::new(Arc::new(app.handle().clone())),
+            terminal_sink: crate::event_sink::EventSink::with_name(
+                Arc::new(app.handle().clone()),
+                crate::terminal::TERMINAL_OUTPUT_EVENT,
+            ),
+            plugin_sink: crate::event_sink::EventSink::with_name(
+                Arc::new(app.handle().clone()),
+                crate::event_sink::PLUGIN_AGENT_EVENT_NAME,
+            ),
+            mission_sink: crate::event_sink::EventSink::with_name(
+                Arc::new(app.handle().clone()),
+                crate::event_sink::MISSION_AGENT_EVENT_NAME,
+            ),
+            terminals: crate::terminal::TerminalRegistry::default(),
+            processes: Arc::new(registry::ProcessRegistry::default()),
+            emitters: crate::event_sink::BroadcastEmit::new(Arc::new(app.handle().clone())),
+            web: crate::web::WebAccessState::default(),
+            relay: crate::relay::RelayState::default(),
+            dsh_host: Arc::new(crate::dsh_host::DshHostState::default()),
+            opencode_server: Arc::new(opencode_server::OpencodeServerState::default()),
+            worktree_creations: crate::git_worktree::CreationRegistry::default(),
+        });
+        (app, db)
+    }
+
+    fn review(plan_id: &str, session_id: &str) -> PlanReview {
+        PlanReview {
+            plan_id: plan_id.into(),
+            engine: "dsh".into(),
+            session_id: session_id.into(),
+            workspace_path: "/tmp/ccgui-plan-respond-ws".into(),
+            run_id: None,
+            revision: 0,
+            title: "Test plan".into(),
+            content: "# Plan\n\ndo the thing".into(),
+            content_hash: plan_review::content_hash("# Plan\n\ndo the thing"),
+            complete: true,
+            review_kind: plan_review::PlanReviewKind::NativeRequest,
+            native_plan_id: Some(format!("native-{plan_id}")),
+            exec_permission: "auto".into(),
+            status: plan_review::PlanStatus::AwaitingReview,
+            execution: plan_review::PlanExecution::NotStarted,
+            decision: None,
+            decision_intent_at: None,
+            applied_at: None,
+            created_at: 0,
+            updated_at: 0,
+            superseded_by: None,
+        }
+    }
+
+    /// 停车一个 native_request 上下文并(可选)接一根真实 stdin。
+    fn park(
+        app: &tauri::App<tauri::test::MockRuntime>,
+        key: &str,
+        plan_id: &str,
+        stdin: Option<Arc<tokio::sync::Mutex<Option<tokio::process::ChildStdin>>>>,
+        extra: serde_json::Value,
+    ) {
+        let state = app.state::<crate::AppState>();
+        let mut parked = json!({
+            "revision": 1,
+            "route": "stdin",
+            "frames": {
+                "approve": {"jsonrpc": "2.0", "id": 9, "result": {"outcome": "approved"}},
+                "changes": {"jsonrpc": "2.0", "id": 9, "result": {"outcome": "changes", "custom": PLAN_FEEDBACK_PLACEHOLDER}},
+            },
+        });
+        if let Some(obj) = extra.as_object() {
+            for (k, v) in obj {
+                parked[k] = v.clone();
+            }
+        }
+        let mut plans = std::collections::HashMap::new();
+        plans.insert(plan_id.to_string(), parked);
+        state.processes.insert(
+            key.to_string(),
+            registry::ChildEntry {
+                child: None,
+                pid: 4242,
+                run_id: key.to_string(),
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                reader_abort: Arc::new(std::sync::OnceLock::new()),
+                stdin,
+                questions: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                plans: Arc::new(Mutex::new(plans)),
+            },
+        );
+    }
+
+    /// cat 子进程把收到的帧落进文件,返回 (child, stdin, 输出路径)。
+    fn spawn_frame_sink(
+        tag: &str,
+    ) -> (
+        tokio::process::Child,
+        Arc<tokio::sync::Mutex<Option<tokio::process::ChildStdin>>>,
+        std::path::PathBuf,
+    ) {
+        let out_path = std::env::temp_dir().join(format!(
+            "ccgui-plan-frames-{tag}-{}",
+            std::process::id()
+        ));
+        let out_file = std::fs::File::create(&out_path).unwrap();
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::from(out_file))
+            .spawn()
+            .unwrap();
+        let stdin = Arc::new(tokio::sync::Mutex::new(child.stdin.take()));
+        (child, stdin, out_path)
+    }
+
+    async fn drain_frames(
+        app: &tauri::App<tauri::test::MockRuntime>,
+        key: &str,
+        mut child: tokio::process::Child,
+        out_path: &std::path::Path,
+    ) -> String {
+        let entry = app.state::<crate::AppState>().processes.get(key).unwrap();
+        if let Some(stdin) = entry.stdin {
+            *stdin.lock().await = None;
+        }
+        child.wait().await.unwrap();
+        std::fs::read_to_string(out_path).unwrap()
+    }
+
+    #[tokio::test]
+    async fn approve_delivers_the_native_frame_then_conflicts_on_repeat() {
+        let (app, db) = build_state("approve");
+        plan_review::record_review(&db, &review("plan-a", "sess-a")).unwrap();
+        let (child, stdin, out_path) = spawn_frame_sink("approve");
+        park(&app, "sess-a", "plan-a", Some(stdin), json!({}));
+
+        let outcome = respond_plan_review(
+            app.state::<crate::AppState>(),
+            "plan-a".to_string(),
+            1,
+            PlanDecision::Approve,
+            None,
+        )
+        .await
+        .expect("approve must apply");
+        let PlanRespondOutcome::Applied { review } = outcome else {
+            panic!("approve must apply, got {outcome:?}");
+        };
+        assert_eq!(review.status, plan_review::PlanStatus::Approved);
+        assert_eq!(review.execution, plan_review::PlanExecution::Starting);
+
+        let written = drain_frames(&app, "sess-a", child, &out_path).await;
+        assert!(written.contains("\"outcome\":\"approved\""), "{written}");
+
+        // 停住的上下文已移除;重复提交同一 revision 返回冲突而非重复执行。
+        let entry = app.state::<crate::AppState>().processes.get("sess-a").unwrap();
+        assert!(entry.plans.lock().unwrap().is_empty());
+        let again = respond_plan_review(
+            app.state::<crate::AppState>(),
+            "plan-a".to_string(),
+            1,
+            PlanDecision::Approve,
+            None,
+        )
+        .await
+        .expect("repeat respond must not error");
+        assert!(
+            matches!(again, PlanRespondOutcome::Conflict { .. }),
+            "double submit must conflict: {again:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_changes_substitutes_feedback_into_the_frame() {
+        let (app, db) = build_state("changes");
+        plan_review::record_review(&db, &review("plan-b", "sess-b")).unwrap();
+        let (child, stdin, out_path) = spawn_frame_sink("changes");
+        park(&app, "sess-b", "plan-b", Some(stdin), json!({}));
+
+        let outcome = respond_plan_review(
+            app.state::<crate::AppState>(),
+            "plan-b".to_string(),
+            1,
+            PlanDecision::RequestChanges,
+            Some("收紧范围,别动鉴权模块".to_string()),
+        )
+        .await
+        .expect("changes must apply");
+        let PlanRespondOutcome::Applied { review } = outcome else {
+            panic!("changes must apply, got {outcome:?}");
+        };
+        assert_eq!(review.status, plan_review::PlanStatus::ChangesRequested);
+
+        let written = drain_frames(&app, "sess-b", child, &out_path).await;
+        assert!(written.contains("收紧范围,别动鉴权模块"), "{written}");
+        assert!(!written.contains(PLAN_FEEDBACK_PLACEHOLDER), "{written}");
+    }
+
+    #[tokio::test]
+    async fn a_closed_stdin_reverts_to_pending_and_keeps_the_intent() {
+        let (app, db) = build_state("revert");
+        plan_review::record_review(&db, &review("plan-c", "sess-c")).unwrap();
+        // stdin 已关闭:写管道失败,批准绝不显示成功。
+        park(
+            &app,
+            "sess-c",
+            "plan-c",
+            Some(Arc::new(tokio::sync::Mutex::new(None))),
+            json!({}),
+        );
+
+        let result = respond_plan_review(
+            app.state::<crate::AppState>(),
+            "plan-c".to_string(),
+            1,
+            PlanDecision::Approve,
+            None,
+        )
+        .await;
+        let Err(message) = result else {
+            panic!("a closed stdin must fail the respond");
+        };
+        assert!(message.contains("NOT delivered"), "{message}");
+
+        let reverted = plan_review::get_review(&db, "plan-c", 1).unwrap().unwrap();
+        assert_eq!(reverted.status, plan_review::PlanStatus::AwaitingReview);
+        assert_eq!(reverted.execution, plan_review::PlanExecution::NotStarted);
+        assert!(reverted.decision_intent_at.is_some());
+        assert!(reverted.applied_at.is_none());
+        // 停住的上下文保留,用户可重试。
+        let entry = app.state::<crate::AppState>().processes.get("sess-c").unwrap();
+        assert!(entry.plans.lock().unwrap().contains_key("plan-c"));
+    }
+
+    #[tokio::test]
+    async fn a_changed_body_expires_the_revision_instead_of_executing() {
+        let (app, db) = build_state("stale-body");
+        plan_review::record_review(&db, &review("plan-d", "sess-d")).unwrap();
+        let (_child, stdin, _out) = spawn_frame_sink("stale-body");
+        // 停车上下文记录的正文哈希与落盘记录不一致:审批期间正文已变,
+        // 先失效再要求重新审阅,绝不带着旧正文执行(PRD §4.2 末条)。
+        park(
+            &app,
+            "sess-d",
+            "plan-d",
+            Some(stdin),
+            json!({"contentHash": "different-hash"}),
+        );
+
+        let result = respond_plan_review(
+            app.state::<crate::AppState>(),
+            "plan-d".to_string(),
+            1,
+            PlanDecision::Approve,
+            None,
+        )
+        .await;
+        let Err(message) = result else {
+            panic!("a changed body must not execute");
+        };
+        assert!(message.contains("expired"), "{message}");
+        let expired = plan_review::get_review(&db, "plan-d", 1).unwrap().unwrap();
+        assert_eq!(expired.status, plan_review::PlanStatus::Expired);
     }
 }

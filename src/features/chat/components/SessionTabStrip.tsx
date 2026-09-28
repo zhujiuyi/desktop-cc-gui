@@ -1,7 +1,7 @@
 import Globe from "lucide-react/dist/esm/icons/globe";
 import MessageSquarePlus from "lucide-react/dist/esm/icons/message-square-plus";
 import Plus from "lucide-react/dist/esm/icons/plus";
-import { useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { ReactNode } from "react";
 import { needsWindowControls, useTitlebarStyle } from "@/features/settings/titlebar";
@@ -9,6 +9,7 @@ import { IS_MAC } from "@/lib/platform";
 import { WindowControls } from "@/components/application/window-controls";
 import { ContextMenu } from "@/components/context-menu";
 import { cx } from "@/utils/cx";
+import { useOptionalSplitDrag } from "../split/drag";
 import { SessionTab, type SessionTabItem } from "./SessionTab";
 import { useTabDragReorder } from "./use-tab-drag-reorder";
 import { useTabStripChrome } from "./use-tab-strip-chrome";
@@ -68,8 +69,31 @@ export function SessionTabStrip({
 }: SessionTabStripProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const { t } = useTranslation();
-  const { dropTarget, suppressClickRef, handleTabPointerDown } =
-    useTabDragReorder(onReorder);
+  // 页签向下拖出页签条 = 拖到对话区分屏（横向仍是排序）。没有分屏 provider 时
+  // （独立渲染/测试）保持原行为。
+  const splitDrag = useOptionalSplitDrag();
+  const handleDragOut = useCallback(
+    (tab: SessionTabItem, event: PointerEvent) => {
+      if (!splitDrag || !tab.session) return false;
+      // 交接发生在 pointermove 上：那里 `button` 是 -1（“没有按键变化”），
+      // 按拖拽起点重建一个显式的左键事件，拖拽层才认。
+      splitDrag.startDrag(
+        { kind: "session", session: tab.session, label: tab.label },
+        {
+          button: 0,
+          clientX: event.clientX,
+          clientY: event.clientY,
+          pointerType: event.pointerType,
+        },
+      );
+      return true;
+    },
+    [splitDrag],
+  );
+  const { dropTarget, suppressClickRef, handleTabPointerDown } = useTabDragReorder(
+    onReorder,
+    splitDrag ? handleDragOut : undefined,
+  );
   const titlebarStyle = useTitlebarStyle();
   // 左侧红绿灯区：macOS 系统原生红绿灯 或 Windows 仿 mac 自绘按钮。
   const customControls = needsWindowControls(titlebarStyle);
@@ -86,6 +110,7 @@ export function SessionTabStrip({
   return (
     <div
       data-tauri-drag-region="deep"
+      data-tab-strip=""
       className={cx(
         "flex h-10 shrink-0 items-center border-b border-separator-border bg-background-primary-default select-none",
         (IS_MAC || customControls) && trafficLightInset && "pl-[80px]",

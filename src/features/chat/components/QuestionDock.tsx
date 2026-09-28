@@ -1,4 +1,5 @@
-import { sessionKey, useChatStore } from "../store";
+import { useChatStore } from "../store";
+import { useScopedSessionKey } from "../split/session-scope";
 import { QuestionCard } from "./QuestionCard";
 
 /**
@@ -7,10 +8,9 @@ import { QuestionCard } from "./QuestionCard";
  * composer) and the dock itself resolve it through this hook.
  */
 export function usePendingQuestion() {
-  const active = useChatStore((s) => s.active);
+  const key = useScopedSessionKey();
   return useChatStore((s) => {
-    if (!active) return null;
-    const key = sessionKey(active.engine, active.sessionId, active.workspacePath);
+    if (!key) return null;
     const messages = s.bySession[key]?.messages ?? [];
     for (let i = messages.length - 1; i >= 0; i--) {
       const m = messages[i];

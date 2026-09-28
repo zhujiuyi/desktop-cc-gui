@@ -26,6 +26,7 @@ import {
 } from "./persistence";
 import { EMPTY_SESSION, patchSession } from "./stream";
 import { handleEngineEvents, upsertSessionMetaInto } from "./engine-events";
+import { mergePlanReviewHistory } from "./plan-review";
 import i18n from "@/lib/i18n";
 import {
   listExternalSessionMetas,
@@ -505,6 +506,10 @@ export function createSessionActions(
       const existing = get().bySession[key];
       if (existing && existing.messages.length > 0) return;
       patchSession(set, key, { loading: true });
+      // 并行取计划审批历史:失败静默降级为无历史计划,绝不阻塞会话加载。
+      const plansPromise = ipc
+        .listPlanReviews(engine, sessionId)
+        .catch(() => null);
       try {
         const page = await loadHistoryPage(engine, sessionId, workspacePath, 100);
         patchSession(set, key, {
@@ -517,41 +522,60 @@ export function createSessionActions(
           usage:
             [...page.messages].reverse().find((m) => m.usage)?.usage ?? null,
         });
+        // 历史页应用后再并入计划卡片(按 planId+revision 去重;活跃等待点
+        // 可否恢复由后端状态保证,前端只按 record.status 渲染)。
+        const plans = await plansPromise;
+        if (plans && plans.length > 0) {
+          set((s) => {
+            const cur = s.bySession[key];
+            if (!cur) return {};
+            const messages = mergePlanReviewHistory(cur.messages, plans);
+            if (!messages) return {};
+            return {
+              bySession: { ...s.bySession, [key]: { ...cur, messages } },
+            };
+          });
+        }
       } catch (error) {
         patchSession(set, key, { loading: false, error: String(error) });
       }
     },
 
-    loadEarlier: async () => {
-      const { active, bySession } = get();
-      if (!active?.sessionId) return;
-      const key = sessionKey(
-        active.engine,
-        active.sessionId,
-        active.workspacePath,
+    loadEarlier: async (key) => {
+      const { active, bySession, openTabs } = get();
+      // 分屏里每格各自向上加载历史：不带 key 时仍按激活会话。
+      const targetKey =
+        key ??
+        (active
+          ? sessionKey(active.engine, active.sessionId, active.workspacePath)
+          : "");
+      if (!targetKey) return;
+      const tab = openTabs.find(
+        (t) => sessionKey(t.engine, t.sessionId, t.workspacePath) === targetKey,
       );
-      const state = bySession[key];
+      if (!tab?.sessionId) return;
+      const state = bySession[targetKey];
       if (!state?.nextBefore || state.loading) return;
-      patchSession(set, key, { loading: true });
+      patchSession(set, targetKey, { loading: true });
       try {
         const page = await loadHistoryPage(
-          active.engine,
-          active.sessionId,
-          active.workspacePath,
+          tab.engine,
+          tab.sessionId,
+          tab.workspacePath,
           100,
           state.nextBefore,
         );
-        patchSession(set, key, {
+        patchSession(set, targetKey, {
           messages: [
             ...page.messages,
-            ...(get().bySession[key] ?? EMPTY_SESSION).messages,
+            ...(get().bySession[targetKey] ?? EMPTY_SESSION).messages,
           ],
           nextBefore: page.nextBefore,
           subagentHistory: page.subagentHistory,
           loading: false,
         });
       } catch {
-        patchSession(set, key, { loading: false });
+        patchSession(set, targetKey, { loading: false });
       }
     },
 

@@ -3,9 +3,12 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { SessionTabStrip, type SessionTabItem } from "./SessionTabStrip";
 
-vi.mock("react-i18next", () => ({
-  useTranslation: () => ({ t: (key: string) => key }),
-}));
+vi.mock("react-i18next", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("react-i18next")>();
+  // 部分 mock：页签条的新菜单会（经分屏 store）间接引入 lib/i18n，
+  // 它需要真实的 initReactI18next 才能初始化。
+  return { ...actual, useTranslation: () => ({ t: (key: string) => key }) };
+});
 // jsdom gaps exercised by use-tab-strip-chrome's scroll-into-view effect.
 globalThis.CSS ??= {} as typeof CSS;
 CSS.escape ??= (value: string) => value;

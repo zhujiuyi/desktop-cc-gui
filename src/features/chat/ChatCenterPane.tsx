@@ -12,7 +12,7 @@ import { cx } from "@/utils/cx";
 import { creatorChatWorkspace, startCreatorChat } from "@/features/plugins/hub/creator-chat";
 import { ReleaseNotesPane } from "@/features/update/ReleaseNotesPane";
 import { focusComposerWhenVisible } from "@/features/chat/focus-composer";
-import { ChatConversation } from "./components/ChatConversation";
+import { SplitLayout } from "./split/SplitLayout";
 import type { ActiveSession } from "./store";
 
 // CodeMirror + react-markdown are heavy; split them out of the startup chunk.
@@ -210,12 +210,11 @@ export function ChatCenterPane({
   return (
     <>
       <Surface visible={surfaces.chat}>
-        <ChatConversation
+        <SplitLayout
           active={active}
           engines={engines}
           workspaces={workspaces}
           startNewChat={startNewChat}
-          composerInputRef={composerInputRef}
         />
       </Surface>
 

@@ -4,7 +4,8 @@ import Check from "lucide-react/dist/esm/icons/check";
 import ChevronLeft from "lucide-react/dist/esm/icons/chevron-left";
 import ChevronRight from "lucide-react/dist/esm/icons/chevron-right";
 import type { Message, QuestionSpec } from "@/lib/ipc";
-import { sessionKey, useChatStore } from "../store";
+import { useChatStore } from "../store";
+import { useScopedSessionKey } from "../split/session-scope";
 
 /**
  * AskUserQuestion panel (dock form): the CLI parked the question on the
@@ -82,10 +83,8 @@ function focusRow(root: HTMLElement | null, delta: 1 | -1) {
  *  only composes the header, options, and footer. */
 function useQuestionAnswers(questions: QuestionSpec[], seq: number) {
   const respondToQuestion = useChatStore((s) => s.respondToQuestion);
-  const active = useChatStore((s) => s.active);
-  const key = active
-    ? sessionKey(active.engine, active.sessionId, active.workspacePath)
-    : "";
+  // 会话 key 取自所属栏位：分屏时各格管各格的问答卡。
+  const key = useScopedSessionKey();
   const [picked, setPicked] = useState<AnswerMap>({});
   const [other, setOther] = useState<TextMap>({});
   const [page, setPage] = useState(0);

@@ -671,6 +671,36 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             FOREIGN KEY(engine, session_id)
                 REFERENCES sessions(engine, session_id) ON DELETE CASCADE
         );
+        -- 计划预览与人工审批的审批事实源(engine/plan_review.rs)。独立于
+        -- session_messages 搜索索引,不声明 FK:sessions 行由扫描器从
+        -- transcript 建立,可能晚于计划记录到达,删除由 sessions 的清理
+        -- 路径显式级联(delete_reviews_for_session/_workspace)。
+        CREATE TABLE IF NOT EXISTS plan_reviews(
+            plan_id TEXT NOT NULL,
+            engine TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            workspace_path TEXT NOT NULL,
+            run_id TEXT,
+            revision INTEGER NOT NULL,
+            title TEXT NOT NULL DEFAULT '',
+            content TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            complete INTEGER NOT NULL DEFAULT 0,
+            review_kind TEXT NOT NULL,
+            native_plan_id TEXT,
+            exec_permission TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL,
+            execution TEXT NOT NULL DEFAULT 'not_started',
+            decision TEXT,
+            decision_intent_at INTEGER,
+            applied_at INTEGER,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            superseded_by INTEGER,
+            PRIMARY KEY(plan_id, revision)
+        );
+        CREATE INDEX IF NOT EXISTS idx_plan_reviews_session
+            ON plan_reviews(engine, session_id);
         ",
     )?;
     // NB: no `cache_version` meta row — it was written but never read; cache

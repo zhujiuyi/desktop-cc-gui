@@ -4,7 +4,7 @@ import { useShallow } from "zustand/react/shallow";
 import type { ComposerInputHandle } from "@/components/application/ai-chat/ai-chat-composer";
 import { mentionToken } from "@/components/application/ai-chat/file-tags";
 import { pickFiles } from "@/lib/platform";
-import { useChatStore, type ActiveSession } from "../store";
+import { useChatStore, sessionKey as toSessionKey, type ActiveSession } from "../store";
 import { parseAppCommand } from "@/components/application/ai-chat/app-commands";
 import {
   COMPUTER_USE_SETTINGS_HASH,
@@ -25,8 +25,7 @@ export function useComposerActions({
   importImageFiles,
   supportsImages,
   composerInputRef,
-}: {
-  active: ActiveSession | null;
+}: {  active: ActiveSession | null;
   sessionKey: string;
   streaming: boolean;
   images: string[];
@@ -87,10 +86,10 @@ export function useComposerActions({
         // The task rides the queue with its flag, so a drained turn still
         // drives the machine instead of silently running text-only.
         if (streaming) {
-          queueMessage(appCommand.arg, images, { computerUse: true });
+          queueMessage(appCommand.arg, images, { computerUse: true }, active);
           return;
         }
-        void send(appCommand.arg, images, { computerUse: true });
+        void send(appCommand.arg, images, { computerUse: true }, active);
         return;
       }
       recordPrompt(value);
@@ -105,7 +104,7 @@ export function useComposerActions({
         return;
       }
       if (appCommand?.command === "compact" && active.sessionId && !streaming) {
-        void compactContext();
+        void compactContext(sessionKey);
         return;
       }
       if (appCommand?.command === "mcp") {
@@ -115,23 +114,36 @@ export function useComposerActions({
       // A turn is in flight: park the message in the session's queue; the
       // store drains it FIFO when the turn ends.
       if (streaming) {
-        queueMessage(value, images);
+        queueMessage(value, images, undefined, active);
         return;
       }
-      void send(value, images);
+      void send(value, images, undefined, active);
     },
     [active, images, streaming, sessionKey, setDraft, clearImages, send, queueMessage, startNewChat, compactContext, engines, setSessionError, t],
+  );
+
+  // 文件树「+」的 pendingMention 是全局信号：分屏时只有当前聚焦那一栏（就是
+  // 全局 active 所在的格子）能消费它，否则每个格子的输入框都会插一份。
+  const activeSessionKey = useChatStore((s) =>
+    s.active ? toSessionKey(s.active.engine, s.active.sessionId, s.active.workspacePath) : "",
   );
 
   // File-tree "+" asks the composer to insert an @path mention at the caret.
   useEffect(() => {
     if (!pendingMention) return;
+    if (activeSessionKey !== sessionKey) return;
     clearPendingMention();
     const input = composerInputRef.current;
     if (!input) return;
     input.focus();
     input.insertText(`${mentionToken(pendingMention.path)} `);
-  }, [pendingMention, clearPendingMention, composerInputRef]);
+  }, [
+    pendingMention,
+    activeSessionKey,
+    sessionKey,
+    clearPendingMention,
+    composerInputRef,
+  ]);
 
   const handleDraftChange = useCallback(
     (v: string) => setDraft(sessionKey, v),
@@ -171,7 +183,7 @@ export function useComposerActions({
     })();
   }, [t, routeIncomingPaths]);
 
-  const handleStop = useCallback(() => void interrupt(), [interrupt]);
+  const handleStop = useCallback(() => void interrupt(active), [interrupt, active]);
   const handlePickSkills = useCallback(
     () => composerInputRef.current?.openSlashPicker(),
     [composerInputRef],

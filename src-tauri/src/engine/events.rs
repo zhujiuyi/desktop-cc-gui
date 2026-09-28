@@ -3,6 +3,7 @@
 
 use serde::Serialize;
 use serde_json::Value;
+use super::plan_review::PlanReview;
 
 #[derive(Debug)]
 pub enum EngineEvent {
@@ -76,6 +77,27 @@ pub enum EngineEvent {
     /// A parked question no longer needs an answer (the CLI cancelled it or
     /// the run settled): the UI resolves the card without a choice.
     QuestionSettled { request_id: String },
+    /// 计划草稿的流式预览:正文不完整,任何批准路径都必须拒绝。
+    /// `replace` = 引擎给的是全量快照(如 ACP plan.entries),否则追加。
+    PlanDraft {
+        plan_id: String,
+        text: String,
+        replace: bool,
+    },
+    /// 完整计划到达并等待人工审批。`record` 是审批事实(落盘 + 下发);
+    /// `context` 是不透明的原生回复上下文,只停在后端注册表,永不下发
+    /// 前端(前端不能提交任意原生 RPC 方法、路径或审批 token)。
+    PlanReviewReady {
+        record: Box<PlanReview>,
+        context: Value,
+    },
+    /// 一个计划版本不再可审批(被取代/过期/取消/已决策):卡片按 status
+    /// 落定。与 QuestionSettled 同级,不复用——approve 不是问答字符串选项。
+    PlanReviewSettled {
+        plan_id: String,
+        revision: i64,
+        status: String,
+    },
     /// Context compaction started/ended (omp `auto_compaction_start/end`,
     /// forwarded by rpc-ui). Not terminal: the turn keeps running after the
     /// summary swap. The UI shows a live "compacting" indicator; `reason`

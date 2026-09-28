@@ -106,6 +106,10 @@ export interface SessionState {
    *  the conversation — the pet reads it so a task failure can persist at
    *  rest instead of being cleared by the model's own receipt. */
   notificationTurnStartedAt: number | null;
+  /** Deferred plan the user explicitly reopened from its timeline card
+   *  (`"${planId}:${revision}"`): the approval dock mounts for it again.
+   *  Pure UI state — the backend record stays `deferred` either way. */
+  planReviewResume: string | null;
 }
 
 export const EMPTY_SESSION: SessionState = {
@@ -130,6 +134,7 @@ export const EMPTY_SESSION: SessionState = {
   backgroundActive: false,
   awaitingTasks: false,
   notificationTurnStartedAt: null,
+  planReviewResume: null,
 };
 
 /** The model one session runs with, most specific first:

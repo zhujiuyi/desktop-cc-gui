@@ -91,22 +91,16 @@ pub(super) async fn run_acp_turn(
     let _registry_guard =
         VirtualRunGuard::new(Arc::clone(&core.registry), core.run_id.clone(), virtual_pid);
     let result = turn_inner(&core, &mut state, &mut view, &req, &mut command, &killed).await;
-    // Pending questions die with the turn: settle their cards BEFORE any
-    // terminal dispatch, or the monotonic saw_done/saw_error guard in
-    // dispatch_event would drop these and leave answerable cards pointing at
-    // a settled turn.
-    for key in [
+    // Pending questions and parked plan reviews die with the turn: settle the
+    // cards and expire the reviews BEFORE any terminal dispatch, or the
+    // monotonic saw_done/saw_error guard in dispatch_event would drop these
+    // and leave answerable surfaces pointing at a settled turn.
+    let parked_keys = [
         state.native_session_id.clone(),
         Some(core.run_id.clone()),
         preassigned_session_id.clone(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        for request_id in core.registry.take_questions(&key) {
-            core.dispatch_event(&mut state, EngineEvent::QuestionSettled { request_id });
-        }
-    }
+    ];
+    settle_parked(&core, &mut state, parked_keys);
     if let Err(error) = result {
         if !killed.load(Ordering::SeqCst) {
             core.dispatch_event(&mut state, EngineEvent::Error(error));
@@ -134,6 +128,21 @@ pub(super) async fn run_acp_turn(
     // The staged GROK_HOME channel dir holds this send's credentials and is
     // private to this run; the CLI is gone, so nothing may read it again.
     super::cleanup_staged_files(&cleanup_files);
+}
+
+/// Shared settle contract for every key this run was registered under
+/// (native session id, run id, preassigned alias): pending question cards are
+/// settled first, then parked plan reviews expire with the run (P1 收尾义务,
+/// PRD §8 防线 3). kimi never parks plan events, so the expiry is always a
+/// no-op on that path; calling it unconditionally keeps the shared driver
+/// honest if either engine ever parks a plan.
+fn settle_parked(core: &TurnCore, state: &mut TurnState, keys: [Option<String>; 3]) {
+    for key in keys.into_iter().flatten() {
+        for request_id in core.registry.take_questions(&key) {
+            core.dispatch_event(state, EngineEvent::QuestionSettled { request_id });
+        }
+        super::reader::expire_parked_plans(core, state, &key);
+    }
 }
 
 async fn turn_inner(
@@ -535,6 +544,7 @@ mod tests {
     use super::*;
     use crate::engine::registry::ChildEntry;
     use crate::engine::ProcessRegistry;
+    use crate::engine::plan_review;
     use crate::event_sink::{Emit, EventSink};
     use std::sync::Mutex as StdMutex;
 
@@ -563,6 +573,7 @@ mod tests {
                 reader_abort: Arc::new(std::sync::OnceLock::new()),
                 stdin: None,
                 questions: Arc::new(StdMutex::new(HashMap::new())),
+                plans: Arc::new(StdMutex::new(HashMap::new())),
             },
         );
         let core = TurnCore {
@@ -570,6 +581,7 @@ mod tests {
             registry: Arc::clone(&registry),
             engine_id: "grok".to_string(),
             run_id: "test-run".to_string(),
+            db: None,
         };
         (core, registry, emitter)
     }
@@ -739,6 +751,102 @@ mod tests {
                 .unwrap();
         assert_eq!(decline["result"]["action"], "decline");
         assert_eq!(entry.questions.lock().unwrap().len(), 1);
+    }
+
+    /// A parked plan review must expire when its run settles: the native
+    /// exit_plan_mode request is gone with the child, so the record flips to
+    /// `expired` and the frontend is told (P1 收尾义务, PRD §8 防线 3).
+    #[tokio::test]
+    async fn settle_parked_expires_plan_reviews_under_every_run_key() {
+        let dir = std::env::temp_dir().join(format!(
+            "ccgui-grok-acp-settle-{}-{}",
+            std::process::id(),
+            plan_review::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::Db::open_at(&dir.join("test.db")).unwrap();
+        let review = plan_review::PlanReview {
+            plan_id: "plan-1".into(),
+            engine: "grok".into(),
+            session_id: "s-1".into(),
+            workspace_path: "/tmp/ws".into(),
+            run_id: Some("test-run".into()),
+            revision: 0,
+            title: "计划".into(),
+            content: "# 步骤".into(),
+            content_hash: plan_review::content_hash("# 步骤"),
+            complete: true,
+            review_kind: plan_review::PlanReviewKind::NativeRequest,
+            native_plan_id: Some("7".into()),
+            exec_permission: "plan".into(),
+            status: plan_review::PlanStatus::AwaitingReview,
+            execution: plan_review::PlanExecution::NotStarted,
+            decision: None,
+            decision_intent_at: None,
+            applied_at: None,
+            created_at: 0,
+            updated_at: 0,
+            superseded_by: None,
+        };
+        let revision = plan_review::record_review(&db, &review).unwrap();
+        let (mut core, registry, emitter) = test_core();
+        core.db = Some(Arc::new(db));
+        let mut state = TurnState::new(None);
+        // Park the review under the run-id key exactly as the reader's
+        // PlanReviewReady dispatch does (revision injected at the top level).
+        registry
+            .get("test-run")
+            .unwrap()
+            .plans
+            .lock()
+            .unwrap()
+            .insert("plan-1".to_string(), json!({ "revision": revision, "route": "stdin" }));
+        settle_parked(&core, &mut state, [Some("test-run".to_string()), None, None]);
+        assert!(
+            registry
+                .get("test-run")
+                .unwrap()
+                .plans
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "the parked context leaves the registry with the run"
+        );
+        let settled =
+            plan_review::get_review(core.db.as_ref().unwrap(), "plan-1", revision)
+                .unwrap()
+                .unwrap();
+        assert_eq!(settled.status, plan_review::PlanStatus::Expired);
+        core.sink.flush();
+        let emitted = emitter.0.lock().unwrap().join(" ");
+        assert!(emitted.contains("plan_review_settled") && emitted.contains("expired"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same settle call still drains pending question cards first and is
+    /// a strict no-op for a run with nothing parked — the kimi path only ever
+    /// exercises this branch.
+    #[tokio::test]
+    async fn settle_parked_keeps_the_question_contract_and_no_ops_when_empty() {
+        let (mut core, registry, emitter) = test_core();
+        core.engine_id = "kimi".into();
+        let mut state = TurnState::new(None);
+        assert!(park_question(&core, &mut state, &json!(7), &ask_params()).is_none());
+        settle_parked(&core, &mut state, [Some("test-run".to_string()), None, None]);
+        assert!(
+            registry
+                .get("test-run")
+                .unwrap()
+                .questions
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "the ask is drained by the settle, not left parked"
+        );
+        core.sink.flush();
+        assert!(emitter.0.lock().unwrap().join(" ").contains("question_settled"));
+        // Nothing parked, no db: settling again must not emit or fail.
+        settle_parked(&core, &mut state, [Some("test-run".to_string()), None, None]);
     }
 
     #[test]

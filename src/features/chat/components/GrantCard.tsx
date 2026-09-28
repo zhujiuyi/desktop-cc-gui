@@ -5,7 +5,8 @@ import X from "lucide-react/dist/esm/icons/x";
 import RotateCcw from "lucide-react/dist/esm/icons/rotate-ccw";
 import type { Message } from "@/lib/ipc";
 import { isWeb } from "@/lib/platform";
-import { sessionKey, useChatStore } from "../store";
+import { useChatStore } from "../store";
+import { useScopedSessionKey } from "../split/session-scope";
 
 const ACTION_BUTTON =
   "inline-flex cursor-pointer items-center gap-1 rounded-md px-2.5 py-1 text-caption-1-medium transition-colors";
@@ -23,21 +24,10 @@ export function GrantCard({ message }: { message: Message }) {
   const { t } = useTranslation();
   const respondToGrant = useChatStore((s) => s.respondToGrant);
   const resendLastUser = useChatStore((s) => s.resendLastUser);
-  const streaming = useChatStore((s) => {
-    const active = s.active;
-    if (!active) return false;
-    return Boolean(
-      s.streamingByKey[
-        sessionKey(active.engine, active.sessionId, active.workspacePath)
-      ],
-    );
-  });
-  // Cards render inside the active conversation, so the active tab's key is
-  // the row's session key.
-  const active = useChatStore((s) => s.active);
-  const key = active
-    ? sessionKey(active.engine, active.sessionId, active.workspacePath)
-    : "";
+  // 卡片渲染在所属栏位的对话里，会话 key 也跟着那一栏（分屏后不能再用全局
+  // active，否则非聚焦格子里的授权卡会授到别的会话上）。
+  const key = useScopedSessionKey();
+  const streaming = useChatStore((s) => Boolean(key && s.streamingByKey[key]));
   const grant = message.grant ?? { status: "pending" as const };
   const path = message.path ?? "";
 

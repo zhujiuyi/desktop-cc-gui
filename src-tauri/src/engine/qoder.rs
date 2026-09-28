@@ -95,6 +95,23 @@ impl Engine for QoderEngine {
         // is honest.
         &["bypass"]
     }
+
+    /// Qoder 的人工计划审批(ACP session/set_mode plan + ExitPlanMode 的
+    /// request_permission)仅有文档与二进制字符串级证据:国际版 CLI 未
+    /// 安装(PATH/npm 均无,按约束不安装),CN 证据来自 QoderWork CN.app
+    /// 捆绑的 qoderclicn 1.0.41 与官方文档互证,ACP 报文细节未实机抓取,
+    /// 且该捆绑 CLI 的 --help 未列出 --acp/plan 入口(可能门控)。当前
+    /// 驱动固定 bypassPermissions——显式 plan 请求必须受控拒绝,而不是
+    /// 静默以 bypass 执行(P0 取证 Qoder 节;接入前置条件:可登录实机 +
+    /// 确认新旧 CLI 入口)。两发行版各自验证前都是 Unavailable。
+    fn plan_approval(&self) -> super::plan_review::PlanApproval {
+        super::plan_review::PlanApproval::Unavailable {
+            reason: match self.distribution {
+                QoderDistribution::Global => "Qoder (international) CLI is not installed on this machine; its ACP plan mode is documented but never verified against a live session. Install/login first — the app will not silently fall back to bypassPermissions",
+                QoderDistribution::Cn => "Qoder CN plan approval is evidenced only by the QoderWork-bundled qoderclicn 1.0.41 and docs; its ACP plan messages were never captured on a live session, and the bundled CLI does not advertise --acp. The current driver always sets bypassPermissions, so a plan request would silently degrade",
+            },
+        }
+    }
 }
 
 /// File stem of a bin path, lowercased (`/usr/local/bin/qodercli` → `qodercli`).

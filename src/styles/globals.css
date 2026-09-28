@@ -1,6 +1,38 @@
 @import "tailwindcss";
 @import "./theme.css";
 @import "./typography.css";
+/* Streamdown markdown renderer (file preview): let Tailwind see the utility
+ * classes inside the installed packages. Paths resolve from this file to the
+ * root node_modules (pnpm symlinks direct deps there). */
+@source "../../node_modules/streamdown/dist/*.js";
+@source "../../node_modules/@streamdown/code/dist/*.js";
+@source "../../node_modules/@streamdown/math/dist/*.js";
+@source "../../node_modules/@streamdown/mermaid/dist/*.js";
+@source "../../node_modules/@streamdown/cjk/dist/*.js";
+
+/* Streamdown is built on shadcn token names (bg-background, text-foreground,
+ * bg-muted, text-muted-foreground, border-border, bg/text-primary[-foreground]).
+ * Bridge them onto our semantic tokens so the preview follows the app theme;
+ * the semantic vars flip under .dark in theme.css, so no .dark block needed. */
+:root {
+  --background: var(--color-background-primary-default);
+  --foreground: var(--color-text-primary);
+  --muted: var(--color-background-secondary-default);
+  --muted-foreground: var(--color-text-secondary);
+  --border: var(--color-separator-border);
+  --primary: var(--color-accent-600);
+  --primary-foreground: var(--color-white);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-border: var(--border);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+}
 
 /* ---------------------------------------------------------------------------
  * Dark mode strategy

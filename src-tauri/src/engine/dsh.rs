@@ -39,4 +39,19 @@ impl Engine for DshEngine {
     fn supports_effort(&self) -> bool {
         true
     }
+
+    /// DSH 的人工计划审批经 commands/execute "/plan" 进入、plan-review
+    /// presentation intent 等待（0.1.5-rc.1 源码已证实完整协议，适配器见
+    /// dsh_session::park_plan_review / enter_plan_mode）。
+    fn plan_approval(&self) -> super::plan_review::PlanApproval {
+        super::plan_review::PlanApproval::Typed {
+            review_kind: super::plan_review::PlanReviewKind::NativeRequest,
+            evidence: "dsh 0.1.5-rc.1 dsh-plan-mode plan-review intent + commands/execute /plan",
+            limitations: "host 须组合 plan-mode 插件（运行时探测）；plan 是软行为引导非只读沙箱；host 重启后悬挂评审丢失",
+        }
+    }
+
+    fn supported_permissions(&self) -> &'static [&'static str] {
+        &["auto", "plan"]
+    }
 }

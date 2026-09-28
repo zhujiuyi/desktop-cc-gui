@@ -299,12 +299,31 @@ impl Engine for CodexEngine {
         true
     }
     fn supported_permissions(&self) -> &'static [&'static str] {
-        &["auto", "manual", "bypass"]
+        &["auto", "manual", "bypass", "plan"]
+    }
+
+    /// 人工计划审批走 next_turn 生命周期(turn/start collaborationMode.plan
+    /// → 完整 plan item → 批准后原子创建一次 default 执行 turn),由本机
+    /// app-server 传输兑现(见 codex_app.rs);exec/WSL fallback 没有这条
+    /// 协议,在 build_command 里继续受控拒绝。
+    fn plan_approval(&self) -> super::plan_review::PlanApproval {
+        super::plan_review::PlanApproval::Typed {
+            review_kind: super::plan_review::PlanReviewKind::NextTurn,
+            evidence: "0.154.0 experimental schema TurnStartParams.collaborationMode + item/completed plan item",
+            limitations: "全部相关字段 EXPERIMENTAL；审批点=客户端仲裁；跨重启恢复需重取 plan item 比对",
+        }
     }
 
     fn build_command(&self, req: &SendRequest, bin: &str) -> Result<BuiltCommand, String> {
         if super::codex_read_only::requested(req) {
             return Err("Codex read-only planning requires the local app-server; exec/WSL fallback is forbidden".into());
+        }
+        // Human plan approval exists only on the app-server transport
+        // (collaborationMode turns); the exec/WSL fallback has no such
+        // protocol, so an explicit plan request fails closed here instead of
+        // silently degrading to an auto run.
+        if req.permission.as_deref() == Some("plan") {
+            return Err("Codex plan approval runs on the local app-server transport; the exec/WSL fallback cannot honor it".into());
         }
         // This path only serves a remote (WSL) workspace, and the injected
         // driver is the local app's own binary: the distro cannot run it.
@@ -692,6 +711,41 @@ mod tests {
         // Off by default: no driver on an ordinary turn.
         let off = CodexEngine.host_command(&base_req(), "fake-bin").unwrap();
         assert!(overrides(&off.command).get("mcp_servers").is_none());
+    }
+
+    /// Codex 的人工计划审批能力声明:类型化 next_turn,且 plan 重新出现在
+    /// 支持列表里(resolve_permission 不再静默回退 auto)。
+    #[test]
+    fn plan_approval_is_typed_next_turn_and_advertised() {
+        assert!(CodexEngine.supported_permissions().contains(&"plan"));
+        match CodexEngine.plan_approval() {
+            crate::engine::plan_review::PlanApproval::Typed {
+                review_kind,
+                evidence,
+                limitations,
+            } => {
+                assert_eq!(
+                    review_kind,
+                    crate::engine::plan_review::PlanReviewKind::NextTurn
+                );
+                assert!(evidence.contains("collaborationMode"), "{evidence}");
+                assert!(!limitations.is_empty());
+            }
+            other => panic!("codex must declare typed next_turn plan approval, got {other:?}"),
+        }
+    }
+
+    /// exec/WSL fallback 没有 collaborationMode 协议:显式 plan 请求必须
+    /// fail-closed,不能随 resolve_permission 静默降级为 workspace-write。
+    #[test]
+    fn exec_path_refuses_plan_permission() {
+        let mut req = base_req();
+        req.permission = Some("plan".into());
+        let error = match CodexEngine.build_command(&req, "fake-bin") {
+            Err(error) => error,
+            Ok(_) => panic!("the exec/WSL path must refuse an explicit plan request"),
+        };
+        assert!(error.contains("app-server"), "{error}");
     }
 
     #[test]

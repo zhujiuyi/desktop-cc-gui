@@ -27,12 +27,26 @@
 //! `approvalPolicy: "never"` and the sandbox is the enforced boundary, exactly
 //! as the exec transport's auto-decline behaves, so answering "approve" here
 //! would hand the model a privilege the app never offered.
+//!
+//! Plan approval (next_turn): a `permission == "plan"` run starts its turn
+//! with `collaborationMode {mode:"plan"}` (EXPERIMENTAL in the 0.154.0
+//! schema, so the client opts into `experimentalApi` at initialize). The plan
+//! streams as `item/plan/delta` previews — drafts only, the schema warns the
+//! concatenation need not match the final text — and the authoritative body
+//! is the completed `type:"plan"` item, which becomes a next_turn PlanReview.
+//! The plan turn then just ENDS (`turn/completed`): the thread idles while
+//! the user reviews, and [`run_plan_decision`] later re-attaches, re-fetches
+//! the final plan item to prove it is unchanged, and atomically starts one
+//! execution (`mode:"default"`) or follow-up planning turn.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use rusqlite::OptionalExtension;
 
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -46,10 +60,11 @@ use super::qoder_session::{
     encode_ndjson, jsonrpc_id_key, jsonrpc_request, jsonrpc_result_response, teardown, KILL_POLL,
     PROMPT_TIMEOUT, RPC_HANDSHAKE_TIMEOUT,
 };
+use super::plan_review::{self, PlanDecision, PlanReview, PlanReviewKind};
 use super::{
     assistant_message, read_line_capped, spawn_stderr_capture, tool_call_message,
-    tool_result_patch, BuiltCommand, EngineEvent, LineRead, SendRequest, TurnCore, TurnState,
-    VirtualRunGuard, MAX_LINE_BYTES,
+    tool_result_patch, BuiltCommand, ChildEntry, Engine, EngineEvent, LineRead, SendRequest,
+    TurnCore, TurnState, VirtualRunGuard, MAX_LINE_BYTES,
 };
 
 /// Terminal marker for a kill-interrupted turn. The driver swallows it (the
@@ -104,6 +119,13 @@ struct TurnView {
     last_usage: Option<Value>,
     exit_unconfirmed: bool,
     isolated_home: Option<std::path::PathBuf>,
+    /// This run is a human-approved planning turn (`permission == "plan"`):
+    /// only then do plan deltas/items feed the approval backbone — a plan
+    /// item in an ordinary turn must never become an approvable review.
+    plan_mode: bool,
+    /// Workspace snapshot for the review record (the turn handlers have no
+    /// access to the request, so the driver seeds it here).
+    workspace: String,
 }
 
 /// A turn's JSON-RPC channel to one `codex app-server` child.
@@ -373,9 +395,36 @@ fn handle_notification(
         }
         "item/started" | "item/completed" => {
             if let Some(item) = params.get("item") {
-                handle_item(core, state, view, item, method == "item/completed");
+                let thread_id = params.get("threadId").and_then(Value::as_str);
+                handle_item(core, state, view, item, method == "item/completed", thread_id);
             }
         }
+        // Plan body streaming (EXPERIMENTAL): draft preview only. The schema
+        // warns the concatenated deltas need not match the completed plan
+        // item, so the review text below comes from the item, never from
+        // accumulating these.
+        "item/plan/delta" => {
+            if view.plan_mode {
+                if let (Some(thread_id), Some(delta)) = (
+                    params.get("threadId").and_then(Value::as_str),
+                    params.get("delta").and_then(Value::as_str),
+                ) {
+                    if !delta.is_empty() {
+                        core.dispatch_event(
+                            state,
+                            EngineEvent::PlanDraft {
+                                plan_id: plan_id_for(thread_id),
+                                text: delta.to_string(),
+                                replace: false,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        // `turn/plan/updated` is the update_plan tool's task checklist (step
+        // statuses), not the proposed plan body: it must never trigger a
+        // review, and it has no timeline row of its own.
         "thread/tokenUsage/updated" => {
             if let Some(usage) = params.get("tokenUsage") {
                 if let Some(payload) = usage_payload(usage, params.get("modelContextWindow")) {
@@ -439,6 +488,7 @@ fn handle_item(
     view: &mut TurnView,
     item: &Value,
     completed: bool,
+    thread_id: Option<&str>,
 ) {
     let Some(kind) = item.get("type").and_then(Value::as_str) else {
         return;
@@ -453,6 +503,67 @@ fn handle_item(
             if !text.trim().is_empty() {
                 core.dispatch_event(state, assistant_message(text.to_string()));
             }
+        }
+        // The completed plan item is the AUTHORITATIVE plan body (the schema
+        // says so verbatim) — it replaces, never extends, the streamed
+        // deltas. In a plan run it becomes the review the user approves; the
+        // turn then ends normally and the thread idles until the decision.
+        "plan" => {
+            if !completed || !view.plan_mode {
+                return;
+            }
+            let (Some(plan_item_id), Some(text)) = (
+                item.get("id").and_then(Value::as_str),
+                item.get("text").and_then(Value::as_str),
+            ) else {
+                return;
+            };
+            if text.trim().is_empty() {
+                return;
+            }
+            // No stable thread id, no approvable identity: fail closed.
+            let Some(thread_id) = thread_id
+                .map(str::to_string)
+                .or_else(|| state.native_session_id.clone())
+            else {
+                return;
+            };
+            let record = PlanReview {
+                plan_id: plan_id_for(&thread_id),
+                engine: core.engine_id.clone(),
+                session_id: thread_id.clone(),
+                workspace_path: view.workspace.clone(),
+                run_id: Some(core.run_id.clone()),
+                // Assigned by record_review on dispatch.
+                revision: 0,
+                title: plan_title(text),
+                content: text.to_string(),
+                content_hash: plan_review::content_hash(text),
+                complete: true,
+                review_kind: PlanReviewKind::NextTurn,
+                native_plan_id: Some(plan_item_id.to_string()),
+                // The execution turn inherits the thread's sandbox, which the
+                // plan run derived exactly like an "auto" run (workspace-write).
+                exec_permission: "auto".to_string(),
+                status: plan_review::PlanStatus::AwaitingReview,
+                execution: plan_review::PlanExecution::NotStarted,
+                decision: None,
+                decision_intent_at: None,
+                applied_at: None,
+                created_at: 0,
+                updated_at: 0,
+                superseded_by: None,
+            };
+            // next_turn does not park: the plan turn ended on its own, and
+            // approval means starting a fresh execution turn. The context is
+            // Null — the backbone only parks native_request reviews.
+            core.dispatch_event(
+                state,
+                EngineEvent::PlanReviewReady {
+                    record: Box::new(record),
+                    context: Value::Null,
+                },
+            );
         }
         "reasoning" => {
             if !completed || view.streamed_reasoning.as_deref() == item_id {
@@ -799,6 +910,210 @@ fn pick(value: &Value, keys: &[&str]) -> Value {
     Value::Object(out)
 }
 
+// ==================== plan review (next_turn) ====================
+
+/// The fixed execution instruction carried by an approval: the decision
+/// itself transports no user text, so everything the model needs to start
+/// executing lives in this one constant — any user text on the approve path
+/// would blur what exactly was approved.
+const EXECUTE_PLAN_PROMPT: &str = "The plan has been reviewed and approved. Leave plan mode and implement it exactly as approved: do not rewrite the plan, start executing now.";
+
+/// Card title when the plan body carries no markdown heading.
+const DEFAULT_PLAN_TITLE: &str = "Codex plan";
+
+/// Staleness marker on verification errors: the plan item changed or vanished
+/// while awaiting review, so the claimed revision must be expired (not just
+/// reverted to awaiting_review — it may not keep waiting with a stale body).
+const PLAN_STALE_PREFIX: &str = "codex plan is stale:";
+
+/// Stable review identity: one thread has at most one plan awaiting review at
+/// a time, so thread id + a fixed suffix suffices; a revised plan lands as the
+/// next revision of the same planId (record_review supersedes the old one).
+fn plan_id_for(thread_id: &str) -> String {
+    format!("{thread_id}/plan")
+}
+
+/// Review card title: the first ATX heading of the plan body, else a fixed
+/// default. A `#` not followed by whitespace is not a heading.
+fn plan_title(content: &str) -> String {
+    for line in content.lines() {
+        let line = line.trim_start();
+        let hashes = line.chars().take_while(|c| *c == '#').count();
+        if hashes == 0 || hashes > 6 {
+            continue;
+        }
+        let rest = &line[hashes..];
+        if !rest.starts_with(' ') && !rest.starts_with('\t') {
+            continue;
+        }
+        let title = rest.trim();
+        if !title.is_empty() {
+            return title.chars().take(80).collect();
+        }
+    }
+    DEFAULT_PLAN_TITLE.to_string()
+}
+
+/// `collaborationMode` params (0.154.0 schema, EXPERIMENTAL): `settings.model`
+/// is a REQUIRED field, `reasoning_effort` rides along only when it has a
+/// value. The caller fails closed when it cannot name a model — sending a
+/// settings object without its required field would be an invalid request,
+/// not a negotiation.
+fn collaboration_mode(mode: &str, model: &str, effort: Option<&str>) -> Value {
+    let mut settings = Map::new();
+    settings.insert("model".to_string(), json!(model));
+    if let Some(effort) = effort.map(str::trim).filter(|e| !e.is_empty()) {
+        settings.insert("reasoning_effort".to_string(), json!(effort));
+    }
+    json!({ "mode": mode, "settings": Value::Object(settings) })
+}
+
+/// collaborationMode for the initial planning turn: the request's explicit
+/// model wins, else the thread's reported model; neither is fail-closed.
+fn plan_collaboration(
+    req_model: Option<&str>,
+    thread_model: Option<&str>,
+    effort: Option<&str>,
+) -> Result<Value, String> {
+    let model = req_model
+        .filter(|m| !m.trim().is_empty())
+        .or_else(|| thread_model.filter(|m| !m.trim().is_empty()))
+        .ok_or_else(|| {
+            "codex plan mode needs a model for collaborationMode.settings, but neither the request nor the thread reported one".to_string()
+        })?;
+    Ok(collaboration_mode("plan", model, effort))
+}
+
+/// collaborationMode for a decision turn: the thread metadata carries no
+/// mode field, so the client must restate it explicitly (P0: "模式状态需客户
+/// 端重新断言"); settings inherit the thread's current model/effort as
+/// reported by thread/resume.
+fn decision_collaboration(
+    mode: &'static str,
+    thread_model: Option<&str>,
+    thread_effort: Option<&str>,
+) -> Result<Value, String> {
+    let model = thread_model
+        .filter(|m| !m.trim().is_empty())
+        .ok_or_else(|| {
+            "thread/resume reported no model; cannot restate collaborationMode settings"
+                .to_string()
+        })?;
+    Ok(collaboration_mode(mode, model, thread_effort))
+}
+
+/// What a user decision becomes: the new turn's collaboration mode, input
+/// text and permission, plus the native item id to verify against. Every
+/// check runs before the transport is touched, so the failure paths need no
+/// process at all.
+struct DecisionSpec {
+    mode: &'static str,
+    prompt: String,
+    permission: String,
+    native_plan_id: String,
+}
+
+fn decision_spec(
+    review: &PlanReview,
+    decision: PlanDecision,
+    feedback: Option<&str>,
+) -> Result<DecisionSpec, String> {
+    if review.review_kind != PlanReviewKind::NextTurn {
+        return Err("codex only executes next_turn plan decisions".to_string());
+    }
+    if review.session_id.trim().is_empty() {
+        return Err("the plan review lost its codex thread id".to_string());
+    }
+    let native_plan_id = review
+        .native_plan_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| "the plan review lost its native plan item id".to_string())?
+        .to_string();
+    let (mode, prompt, permission) = match decision {
+        PlanDecision::Approve => {
+            let permission = review.exec_permission.trim();
+            if permission.is_empty() {
+                return Err(
+                    "the plan review lost its execution permission snapshot".to_string()
+                );
+            }
+            ("default", EXECUTE_PLAN_PROMPT.to_string(), permission.to_string())
+        }
+        PlanDecision::RequestChanges => {
+            let feedback = feedback
+                .map(str::trim)
+                .filter(|f| !f.is_empty())
+                .ok_or_else(|| "request_changes requires non-empty feedback".to_string())?;
+            ("plan", feedback.to_string(), "plan".to_string())
+        }
+        PlanDecision::Defer => {
+            return Err("defer is settled locally; it never starts a codex turn".to_string())
+        }
+    };
+    Ok(DecisionSpec {
+        mode,
+        prompt,
+        permission,
+        native_plan_id,
+    })
+}
+
+/// Find the reviewed final plan item inside one `thread/turns/list`
+/// (itemsView=full) page and compare bodies: id AND text hash must match the
+/// record. A mismatch or a missing item is staleness (PLAN_STALE_PREFIX —
+/// the version gets expired); a malformed page is a plain error (the claim
+/// reverts, the version stays open for a retry).
+fn check_plan_item(page: &Value, native_plan_id: &str, expected_hash: &str) -> Result<(), String> {
+    let turns = page
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "thread/turns/list returned no turn page".to_string())?;
+    for turn in turns {
+        let Some(items) = turn.get("items").and_then(Value::as_array) else {
+            continue;
+        };
+        for item in items {
+            let is_plan = item.get("type").and_then(Value::as_str) == Some("plan");
+            let matches = item.get("id").and_then(Value::as_str) == Some(native_plan_id);
+            if !is_plan || !matches {
+                continue;
+            }
+            let Some(text) = item.get("text").and_then(Value::as_str) else {
+                return Err(format!(
+                    "{PLAN_STALE_PREFIX} the thread's plan item carries no text"
+                ));
+            };
+            return if plan_review::content_hash(text) == expected_hash {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{PLAN_STALE_PREFIX} plan content changed while awaiting review"
+                ))
+            };
+        }
+    }
+    Err(format!(
+        "{PLAN_STALE_PREFIX} the reviewed plan item is no longer in the thread"
+    ))
+}
+
+/// The channel the planning session ran on (recorded per session by the
+/// frontend's session memory): the decision turn must re-attach with the same
+/// credentials, or thread/resume would land on the default backend.
+fn session_provider_id(db: &crate::db::Db, session_id: &str) -> Option<String> {
+    let conn = db.0.lock();
+    conn.query_row(
+        "SELECT provider_id FROM session_providers WHERE engine='codex' AND session_id=?1",
+        rusqlite::params![session_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
 struct SpawnedCodex {
     child: Child,
     server: AppServer,
@@ -861,13 +1176,41 @@ pub(super) async fn run_app_server_turn(
 ) {
     let mut state = TurnState::new(req.session_id.clone());
     let mut view = TurnView::default();
+    view.plan_mode = req.permission.as_deref() == Some("plan");
+    view.workspace = req.workspace.to_string_lossy().into_owned();
     let preassigned_session_id = req.session_id.clone();
     // Abort-safe backstop: the by-name removals below only run when the task
     // finishes normally. An abort or a panic would otherwise leave this run's
     // keys pinning a concurrency slot until app exit.
     let _registry_guard =
         VirtualRunGuard::new(Arc::clone(&core.registry), core.run_id.clone(), virtual_pid);
-    let result = turn_inner(&core, &mut state, &mut view, &req, built, &killed).await;
+    let result = turn_inner(&core, &mut state, &mut view, &req, built, &killed, None).await;
+    settle(
+        &core,
+        &mut state,
+        &view,
+        result,
+        &killed,
+        virtual_pid,
+        preassigned_session_id,
+    )
+    .await;
+}
+
+/// Shared settle for every virtual app-server run (ordinary turns and plan
+/// decision turns): parked questions die with the turn, parked plan reviews
+/// expire with it (a no-op for codex — next_turn never parks — kept as the
+/// host-driver contract the sibling drivers follow), then the turn reports
+/// either the engine's error or its own Done.
+async fn settle(
+    core: &TurnCore,
+    state: &mut TurnState,
+    view: &TurnView,
+    result: Result<(), String>,
+    killed: &Arc<AtomicBool>,
+    virtual_pid: u32,
+    preassigned_session_id: Option<String>,
+) {
     // Pending questions die with the turn: settle their cards BEFORE any
     // terminal dispatch, or the monotonic saw_done/saw_error guard in
     // dispatch_event would drop these and leave answerable cards pointing at a
@@ -881,14 +1224,15 @@ pub(super) async fn run_app_server_turn(
     .flatten()
     {
         for request_id in core.registry.take_questions(&key) {
-            core.dispatch_event(&mut state, EngineEvent::QuestionSettled { request_id });
+            core.dispatch_event(state, EngineEvent::QuestionSettled { request_id });
         }
+        super::reader::expire_parked_plans(core, state, &key);
     }
     // A killed turn is not an error: it was interrupted on purpose, and the
     // marker below only exists to end this pump.
     if let Err(error) = result {
         if !killed.load(Ordering::SeqCst) {
-            core.dispatch_event(&mut state, EngineEvent::Error(error));
+            core.dispatch_event(state, EngineEvent::Error(error));
         }
     }
     // An interrupted run commits its partial output as a normal turn end — the
@@ -900,7 +1244,7 @@ pub(super) async fn run_app_server_turn(
             view.last_usage.clone()
         };
         let session_id = state.native_session_id.clone();
-        core.dispatch_event(&mut state, EngineEvent::Done { session_id, usage });
+        core.dispatch_event(state, EngineEvent::Done { session_id, usage });
     }
     core.registry.remove_if_pid(&core.run_id, virtual_pid);
     // Clean up both the native session id (if the CLI reported one) and the
@@ -914,7 +1258,7 @@ pub(super) async fn run_app_server_turn(
         core.registry.remove_if_pid(&session_id, virtual_pid);
     }
     if !view.exit_unconfirmed {
-        state.confirm_exit(&core);
+        state.confirm_exit(core);
     }
     core.sink.flush();
 }
@@ -926,6 +1270,7 @@ async fn turn_inner(
     req: &SendRequest,
     built: BuiltCommand,
     killed: &Arc<AtomicBool>,
+    decision: Option<&DecisionCheck>,
 ) -> Result<(), String> {
     let BuiltCommand {
         mut command,
@@ -933,7 +1278,7 @@ async fn turn_inner(
         ..
     } = built;
     let _staging_guard = codex_read_only::StagedHomeGuard(cleanup_files);
-    let outcome = drive(&mut command, core, state, view, req, killed).await;
+    let outcome = drive(&mut command, core, state, view, req, killed, decision).await;
     // Staged prompt files go on every exit path, including a spawn that never
     // got off the ground.
     outcome
@@ -948,6 +1293,7 @@ async fn drive(
     view: &mut TurnView,
     req: &SendRequest,
     killed: &Arc<AtomicBool>,
+    decision: Option<&DecisionCheck>,
 ) -> Result<(), String> {
     if codex_read_only::requested(req) {
         view.isolated_home = Some(
@@ -961,7 +1307,8 @@ async fn drive(
     // so the registry gets the writer from the first frame on.
     core.registry
         .set_stdin(&core.run_id, Arc::clone(&spawned.server.stdin));
-    let result = handshake_and_turn(&mut spawned.server, core, state, view, req, killed).await;
+    let result =
+        handshake_and_turn(&mut spawned.server, core, state, view, req, killed, decision).await;
     teardown(&mut spawned.child).await;
     view.exit_unconfirmed = !matches!(spawned.child.try_wait(), Ok(Some(_)));
     match result {
@@ -978,15 +1325,63 @@ async fn handshake_and_turn(
     view: &mut TurnView,
     req: &SendRequest,
     killed: &Arc<AtomicBool>,
+    decision: Option<&DecisionCheck>,
 ) -> Result<(), String> {
+    let Some(started) = handshake_and_start(
+        server,
+        core,
+        state,
+        view,
+        req,
+        killed,
+        decision,
+        PROMPT_TIMEOUT,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    pump_turn_to_end(server, core, state, view, &started, killed).await
+}
+
+/// A turn whose `turn/start` the server has acknowledged.
+struct TurnStarted {
+    thread_id: String,
+    /// None when the ack carried no id (defensive; interrupt then has no
+    /// handle and a kill falls back to ending the pump).
+    turn_id: Option<String>,
+}
+
+/// `initialize` → thread → [plan-item verification] → `turn/start`, up to the
+/// turn's acknowledgement. `decision` marks a plan-decision turn: the reviewed
+/// plan item is re-fetched and compared first, and the turn starts in the
+/// decision's collaboration mode instead of the request's plain model/effort.
+/// `Ok(None)` means the turn already ended inside the ack window.
+async fn handshake_and_start(
+    server: &mut AppServer,
+    core: &TurnCore,
+    state: &mut TurnState,
+    view: &mut TurnView,
+    req: &SendRequest,
+    killed: &Arc<AtomicBool>,
+    decision: Option<&DecisionCheck>,
+    ack_timeout: Duration,
+) -> Result<Option<TurnStarted>, String> {
     let deadline = Instant::now() + RPC_HANDSHAKE_TIMEOUT;
+    // collaborationMode and the plan items are EXPERIMENTAL in the 0.154.0
+    // schema: the client must opt into the experimental API to negotiate
+    // them. If the server then refuses the fields, the rpc error fails the
+    // turn — there is no degraded fallback.
+    let experimental = codex_read_only::requested(req)
+        || decision.is_some()
+        || req.permission.as_deref() == Some("plan");
     let key = server
         .request(
             "initialize",
             json!({ "clientInfo": {
                 "name": "ccgui",
                 "version": env!("CARGO_PKG_VERSION"),
-            }, "capabilities": {"experimentalApi": codex_read_only::requested(req)}}),
+            }, "capabilities": {"experimentalApi": experimental}}),
         )
         .await?;
     let initialized = server
@@ -1097,59 +1492,100 @@ async fn handshake_and_turn(
         .or_else(|| req.session_id.clone())
         .ok_or_else(|| format!("{method} returned no thread id"))?;
     core.dispatch_event(state, EngineEvent::SessionId(thread_id.clone()));
-    if let Some(model) = result.get("model").and_then(Value::as_str) {
+    let thread_model = result.get("model").and_then(Value::as_str).map(str::to_string);
+    if let Some(model) = thread_model.as_deref() {
         core.dispatch_event(state, EngineEvent::Model(model.to_string()));
     }
     let reported_effort = result
         .get("reasoningEffort")
         .or_else(|| result.pointer("/thread/reasoningEffort"))
-        .and_then(Value::as_str);
-    if let Some(effort) = req.effort.as_deref().or(reported_effort) {
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if let Some(effort) = req.effort.as_deref().or(reported_effort.as_deref()) {
         core.dispatch_event(state, EngineEvent::Effort(effort.to_string()));
     }
-    // The turn id is needed to interrupt a cancelled turn, so it must be known
-    // before the turn pump starts.
+    // A decision turn may only start once the reviewed plan is proven live and
+    // unchanged: re-fetch the final plan item from the thread and compare id +
+    // body hash against the record. Changed or gone → the whole decision fails
+    // here, before any turn exists.
+    if let Some(check) = decision {
+        verify_plan_item(server, core, state, view, &thread_id, check, killed).await?;
+    }
     let mut turn_params = json!({ "threadId": thread_id, "input": turn_input(req) });
     if codex_read_only::requested(req) {
         turn_params["approvalPolicy"] = json!("never");
         turn_params["sandboxPolicy"] = json!({"type":"readOnly","networkAccess":false});
     }
-    if let Some(effort) = req.effort.as_deref() {
-        turn_params["effort"] = json!(effort);
-    }
-    if let Some(model) = req.model.as_deref() {
-        turn_params["model"] = json!(model);
+    if let Some(check) = decision {
+        // Approve → one execution turn (mode "default"); RequestChanges → a
+        // fresh planning turn carrying the feedback. The thread metadata has
+        // no mode field, so the mode is restated explicitly and the settings
+        // inherit the thread's current model/effort.
+        turn_params["collaborationMode"] = decision_collaboration(
+            check.mode,
+            thread_model.as_deref(),
+            reported_effort.as_deref(),
+        )?;
+    } else if req.permission.as_deref() == Some("plan") {
+        // Planning turn (EXPERIMENTAL): collaborationMode takes precedence
+        // over the top-level model/effort fields, so only one of the two
+        // shapes is sent. A missing model is schema-invalid — fail closed.
+        turn_params["collaborationMode"] =
+            plan_collaboration(req.model.as_deref(), thread_model.as_deref(), req.effort.as_deref())?;
+    } else {
+        if let Some(effort) = req.effort.as_deref() {
+            turn_params["effort"] = json!(effort);
+        }
+        if let Some(model) = req.model.as_deref() {
+            turn_params["model"] = json!(model);
+        }
     }
     let key = server.request("turn/start", turn_params).await?;
-    let deadline = Instant::now() + PROMPT_TIMEOUT;
     // A fast turn can be over before its own acknowledgement is read, so an
     // ended pump here is a settled turn and not a missing reply.
     let Some(result) = server
         .pump(
             "turn/start",
             Expect::Reply(&key),
-            deadline,
+            Instant::now() + ack_timeout,
             killed,
             None,
             &mut |value| route(core, state, view, value),
         )
         .await?
     else {
-        return Ok(());
+        return Ok(None);
     };
-    view.turn_id = result
+    let turn_id = result
         .pointer("/turn/id")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let interrupt = view
+    Ok(Some(TurnStarted { thread_id, turn_id }))
+}
+
+/// Everything after the `turn/start` ack: stream the turn to its terminal
+/// notification. A kill first asks the CLI to interrupt (so it can persist
+/// the rollout), exactly like the ordinary turn path.
+async fn pump_turn_to_end(
+    server: &mut AppServer,
+    core: &TurnCore,
+    state: &mut TurnState,
+    view: &mut TurnView,
+    started: &TurnStarted,
+    killed: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    // The turn id is needed to interrupt a cancelled turn, so it must be known
+    // before the turn pump starts.
+    view.turn_id = started.turn_id.clone();
+    let interrupt = started
         .turn_id
         .clone()
-        .map(|turn_id| (thread_id.clone(), turn_id));
+        .map(|turn_id| (started.thread_id.clone(), turn_id));
     server
         .pump(
             "turn",
             Expect::Turn,
-            deadline,
+            Instant::now() + PROMPT_TIMEOUT,
             killed,
             interrupt
                 .as_ref()
@@ -1158,6 +1594,324 @@ async fn handshake_and_turn(
         )
         .await?;
     Ok(())
+}
+
+/// Verification handle for a plan-decision turn.
+struct DecisionCheck {
+    /// "default" (approve → execute) | "plan" (request changes → keep planning).
+    mode: &'static str,
+    /// The completed plan item id recorded at review time.
+    native_plan_id: String,
+    /// Hash of the reviewed body; the re-fetched item must match it.
+    content_hash: String,
+}
+
+/// `thread/turns/list` (itemsView=full) → [`check_plan_item`]: the reviewed
+/// final plan item must still be in the thread with an identical body.
+async fn verify_plan_item(
+    server: &mut AppServer,
+    core: &TurnCore,
+    state: &mut TurnState,
+    view: &mut TurnView,
+    thread_id: &str,
+    check: &DecisionCheck,
+    killed: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let key = server
+        .request(
+            "thread/turns/list",
+            json!({
+                "threadId": thread_id,
+                "itemsView": "full",
+                // The plan turn is the latest one; a small newest-first page
+                // covers it without walking history.
+                "limit": 16,
+                "sortDirection": "desc",
+            }),
+        )
+        .await?;
+    let page = server
+        .pump(
+            "thread/turns/list",
+            Expect::Reply(&key),
+            Instant::now() + RESUME_TIMEOUT,
+            killed,
+            None,
+            &mut |value| route(core, state, view, value),
+        )
+        .await?
+        .ok_or_else(|| "the codex app-server ended before thread/turns/list was answered".to_string())?;
+    check_plan_item(&page, &check.native_plan_id, &check.content_hash)
+}
+
+/// Codex next_turn plan approval executor — the backbone's respond_plan_review
+/// NextTurn branch calls this AFTER the CAS claimed the submission.
+///
+/// Semantics: re-attach to the review's thread, prove the reviewed final plan
+/// item is still there with an identical body (thread/resume +
+/// thread/turns/list itemsView=full), then atomically start ONE new turn —
+/// Approve: collaborationMode "default" with the fixed execution instruction;
+/// RequestChanges: collaborationMode "plan" with the feedback text. `Ok(())`
+/// means the server acknowledged the new turn (its streaming finishes in a
+/// detached task, registered as a new run under the same session id). Any
+/// `Err` means no turn was created: a stale plan expires the claimed revision
+/// here (it may not keep waiting with a stale body); every other failure is
+/// the backbone's revert_submission case, decision intent preserved.
+pub(crate) async fn run_plan_decision(
+    state: &crate::AppState,
+    review: &PlanReview,
+    decision: PlanDecision,
+    feedback: Option<&str>,
+) -> Result<(), String> {
+    let spec = decision_spec(review, decision, feedback)?;
+    let thread_id = review.session_id.trim().to_string();
+    let check = DecisionCheck {
+        mode: spec.mode,
+        native_plan_id: spec.native_plan_id,
+        content_hash: review.content_hash.clone(),
+    };
+
+    // Rebuild the launch exactly like a send on this session would: same
+    // binary, same channel (the decision turn re-attaches to the thread, and
+    // the thread's backend only answers with the planning session's
+    // credentials), same service tier.
+    crate::config::ensure_engine_enabled("codex")?;
+    let settings = crate::settings::read_settings().unwrap_or_default();
+    let bin = super::engine_bin(&settings, "codex");
+    let provider_id = session_provider_id(&state.db, &thread_id);
+    let provider = crate::config::resolve_provider("codex", provider_id.as_deref())?;
+    let channel_env = provider
+        .as_ref()
+        .map(|provider| crate::provider_files::channel_env("codex", provider))
+        .transpose()?
+        .unwrap_or_default();
+    let req = SendRequest {
+        session_id: Some(thread_id.clone()),
+        workspace: PathBuf::from(&review.workspace_path),
+        prompt: spec.prompt,
+        images: Vec::new(),
+        // Settings inherit the thread's reported model/effort instead.
+        model: None,
+        effort: None,
+        service_tier: settings.codex_service_tier.clone(),
+        permission: Some(spec.permission),
+        additional_dirs: state.db.granted_roots().unwrap_or_default(),
+        provider_id,
+        computer_use: None,
+        allowed_tools: None,
+    };
+    let mut built = super::codex::CodexEngine.host_command(&req, &bin)?;
+    built.command.current_dir(&req.workspace);
+    for (key, value) in &channel_env {
+        built.command.env(key, value);
+    }
+    if let Some(provider) = provider.as_ref() {
+        super::codex::apply_channel(&mut built.command, provider, &channel_env, &req)?;
+    }
+    super::codex_provider_env::apply(&mut built.command).await;
+
+    // Register like send_host_stream does: the entry routes interrupts and
+    // question answers for the new run; the session alias lets the frontend
+    // stop it by conversation id. Registration precedes the spawn so a Stop
+    // landing inside the start window still settles the turn.
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let killed = Arc::new(AtomicBool::new(false));
+    let reader_abort = Arc::new(std::sync::OnceLock::new());
+    let pid = super::next_virtual_pid();
+    let entry = ChildEntry {
+        child: None,
+        pid,
+        run_id: run_id.clone(),
+        killed: Arc::clone(&killed),
+        reader_abort: Arc::clone(&reader_abort),
+        stdin: None,
+        questions: Arc::new(Mutex::new(HashMap::new())),
+        plans: Arc::new(Mutex::new(HashMap::new())),
+    };
+    {
+        let mut map = state.processes.0.lock().map_err(|e| e.to_string())?;
+        if super::registry::active_run_count(&map) >= super::MAX_CONCURRENT_RUNS {
+            return Err(format!(
+                "too many concurrent runs ({}); wait for one to finish",
+                super::MAX_CONCURRENT_RUNS
+            ));
+        }
+        map.insert(run_id.clone(), entry.clone());
+    }
+    state.processes.insert_alias(thread_id.clone(), entry);
+
+    let core = TurnCore {
+        sink: Arc::clone(&state.sink),
+        registry: Arc::clone(&state.processes),
+        engine_id: "codex".to_string(),
+        run_id: run_id.clone(),
+        db: Some(Arc::clone(&state.db)),
+    };
+    let mut turn_state = TurnState::new(Some(thread_id.clone()));
+    let mut view = TurnView::default();
+    // A RequestChanges turn plans again: its new plan item becomes the next
+    // revision of the same planId. An execution turn must never produce one.
+    view.plan_mode = decision == PlanDecision::RequestChanges;
+    view.workspace = review.workspace_path.clone();
+
+    // Phase A (synchronous): spawn → initialize → resume → verify → one
+    // atomic turn/start. Only a server-acknowledged turn returns Ok.
+    let spawned = match start_decision_turn(
+        &core,
+        &mut turn_state,
+        &mut view,
+        &req,
+        built,
+        &killed,
+        pid,
+        &check,
+    )
+    .await
+    {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            if error.starts_with(PLAN_STALE_PREFIX) {
+                // The reviewed body is gone or changed: the claimed revision
+                // may not survive this. Expire it here — the backbone's
+                // revert_submission then no-ops on the non-submitting status.
+                let _ = plan_review::expire_reviews(
+                    &state.db,
+                    &[(review.plan_id.clone(), review.revision)],
+                );
+            }
+            return Err(error);
+        }
+    };
+
+    // Phase B (detached): the turn exists — stream it to its end and settle
+    // like any other app-server run.
+    let task = tokio::spawn(finish_decision_turn(
+        core,
+        req.session_id.clone(),
+        killed,
+        pid,
+        spawned.0,
+        spawned.1,
+        turn_state,
+        view,
+    ));
+    let _ = reader_abort.set(task.abort_handle());
+    Ok(())
+}
+
+/// Decision turn, phase A: everything up to and including the `turn/start`
+/// acknowledgement. On error the process tree is torn down, the run is
+/// settled (so its events end honestly) and the registry keys are gone.
+#[allow(clippy::too_many_arguments)]
+async fn start_decision_turn(
+    core: &TurnCore,
+    state: &mut TurnState,
+    view: &mut TurnView,
+    req: &SendRequest,
+    built: BuiltCommand,
+    killed: &Arc<AtomicBool>,
+    virtual_pid: u32,
+    check: &DecisionCheck,
+) -> Result<(SpawnedCodex, Option<TurnStarted>), String> {
+    let BuiltCommand {
+        mut command,
+        cleanup_files,
+        ..
+    } = built;
+    let _staging_guard = codex_read_only::StagedHomeGuard(cleanup_files);
+    let mut spawned = match spawn_app_server(&mut command, &req.workspace) {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            // Nothing was ever emitted for this run, so there is nothing to
+            // settle — just drop the registrations made above.
+            core.registry.remove_if_pid(&core.run_id, virtual_pid);
+            if let Some(session_id) = req.session_id.as_deref() {
+                core.registry.remove_if_pid(session_id, virtual_pid);
+            }
+            return Err(error);
+        }
+    };
+    view.exit_unconfirmed = true;
+    core.registry
+        .set_stdin(&core.run_id, Arc::clone(&spawned.server.stdin));
+    // The ack is immediate by protocol; bound it like a resume, not like a
+    // turn — the caller (an IPC handler) is waiting on this phase.
+    let started = handshake_and_start(
+        &mut spawned.server,
+        core,
+        state,
+        view,
+        req,
+        killed,
+        Some(check),
+        RESUME_TIMEOUT,
+    )
+    .await;
+    let started = match started {
+        Ok(started) => started,
+        Err(error) => {
+            let error = terminal_message(error, &spawned.stderr_buf);
+            teardown(&mut spawned.child).await;
+            view.exit_unconfirmed = !matches!(spawned.child.try_wait(), Ok(Some(_)));
+            settle(
+                core,
+                state,
+                view,
+                Err(error.clone()),
+                killed,
+                virtual_pid,
+                req.session_id.clone(),
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    Ok((spawned, started))
+}
+
+/// Decision turn, phase B: the turn was created — stream it to its terminal
+/// notification, tear the tree down and settle exactly like an ordinary run.
+#[allow(clippy::too_many_arguments)]
+async fn finish_decision_turn(
+    core: TurnCore,
+    preassigned_session_id: Option<String>,
+    killed: Arc<AtomicBool>,
+    virtual_pid: u32,
+    mut spawned: SpawnedCodex,
+    started: Option<TurnStarted>,
+    mut state: TurnState,
+    mut view: TurnView,
+) {
+    let _registry_guard =
+        VirtualRunGuard::new(Arc::clone(&core.registry), core.run_id.clone(), virtual_pid);
+    let result = match started {
+        Some(started) => {
+            pump_turn_to_end(
+                &mut spawned.server,
+                &core,
+                &mut state,
+                &mut view,
+                &started,
+                &killed,
+            )
+            .await
+        }
+        // The turn ended inside its own ack window.
+        None => Ok(()),
+    };
+    teardown(&mut spawned.child).await;
+    view.exit_unconfirmed = !matches!(spawned.child.try_wait(), Ok(Some(_)));
+    let result = result.map_err(|error| terminal_message(error, &spawned.stderr_buf));
+    settle(
+        &core,
+        &mut state,
+        &view,
+        result,
+        &killed,
+        virtual_pid,
+        preassigned_session_id,
+    )
+    .await;
 }
 
 /// Reduce a failure to what the user should read: the CLI's own rpc message,
@@ -1211,6 +1965,7 @@ mod tests {
                 reader_abort: Arc::new(std::sync::OnceLock::new()),
                 stdin: None,
                 questions: Arc::new(Mutex::new(HashMap::new())),
+                plans: Arc::new(Mutex::new(HashMap::new())),
             },
         );
         let core = TurnCore {
@@ -1218,6 +1973,7 @@ mod tests {
             registry: Arc::clone(&registry),
             engine_id: "codex".to_string(),
             run_id: "test-run".to_string(),
+            db: None,
         };
         (core, registry, emitter)
     }
@@ -1822,6 +2578,343 @@ mod tests {
         // The driver settles the turn itself; a mid-turn error here would make
         // a perfectly good run look failed.
         assert!(flushed(&core, &emitter).is_empty());
+    }
+
+    // ==================== plan approval (next_turn) ====================
+
+    fn plan_view() -> TurnView {
+        TurnView {
+            plan_mode: true,
+            workspace: "/tmp/ws".to_string(),
+            ..TurnView::default()
+        }
+    }
+
+    fn next_turn_review() -> PlanReview {
+        PlanReview {
+            plan_id: "thread-1/plan".into(),
+            engine: "codex".into(),
+            session_id: "thread-1".into(),
+            workspace_path: "/tmp/ws".into(),
+            run_id: Some("run-1".into()),
+            revision: 1,
+            title: "Plan".into(),
+            content: "# Plan\n- a".into(),
+            content_hash: plan_review::content_hash("# Plan\n- a"),
+            complete: true,
+            review_kind: PlanReviewKind::NextTurn,
+            native_plan_id: Some("item-9".into()),
+            exec_permission: "auto".into(),
+            status: plan_review::PlanStatus::Submitting,
+            execution: plan_review::PlanExecution::NotStarted,
+            decision: None,
+            decision_intent_at: None,
+            applied_at: None,
+            created_at: 0,
+            updated_at: 0,
+            superseded_by: None,
+        }
+    }
+
+    #[test]
+    fn collaboration_mode_carries_only_the_fields_that_have_values() {
+        assert_eq!(
+            collaboration_mode("plan", "gpt-5", Some("high")),
+            json!({"mode": "plan", "settings": {"model": "gpt-5", "reasoning_effort": "high"}})
+        );
+        // 没有 effort:settings 只带 schema 必填的 model。
+        assert_eq!(
+            collaboration_mode("default", "gpt-5", None),
+            json!({"mode": "default", "settings": {"model": "gpt-5"}})
+        );
+        // 空白 effort 等同于没有。
+        assert_eq!(
+            collaboration_mode("plan", "gpt-5", Some("  ")),
+            json!({"mode": "plan", "settings": {"model": "gpt-5"}})
+        );
+    }
+
+    #[test]
+    fn plan_collaboration_prefers_the_request_and_fails_closed_without_a_model() {
+        // 显式模型优先于线程报告值;effort 仅在有值时携带。
+        assert_eq!(
+            plan_collaboration(Some("gpt-5"), Some("thread-model"), Some("low")).unwrap(),
+            json!({"mode": "plan", "settings": {"model": "gpt-5", "reasoning_effort": "low"}})
+        );
+        // 请求没选模型:沿用线程当前模型。
+        assert_eq!(
+            plan_collaboration(None, Some("thread-model"), None).unwrap(),
+            json!({"mode": "plan", "settings": {"model": "thread-model"}})
+        );
+        // 两者都没有:settings.model 是必填,缺了就是 schema 级非法参数。
+        let error = plan_collaboration(None, None, None).unwrap_err();
+        assert!(error.contains("model"), "{error}");
+        let error = plan_collaboration(Some("  "), Some(" "), None).unwrap_err();
+        assert!(error.contains("model"), "{error}");
+    }
+
+    #[test]
+    fn decision_collaboration_restates_mode_and_inherits_thread_settings() {
+        assert_eq!(
+            decision_collaboration("default", Some("thread-model"), Some("high")).unwrap(),
+            json!({"mode": "default", "settings": {"model": "thread-model", "reasoning_effort": "high"}})
+        );
+        assert_eq!(
+            decision_collaboration("plan", Some("thread-model"), None).unwrap(),
+            json!({"mode": "plan", "settings": {"model": "thread-model"}})
+        );
+        // 线程模型未知就不能重建 settings——恢复后必须显式断言模式。
+        assert!(decision_collaboration("default", None, None).is_err());
+    }
+
+    #[tokio::test]
+    async fn plan_deltas_stream_as_drafts_only_in_a_plan_run() {
+        let (core, _registry, emitter) = test_core();
+        let mut state = TurnState::new(Some("thread-1".into()));
+        let mut view = plan_view();
+        for delta in ["# Dra", "ft"] {
+            route(
+                &core,
+                &mut state,
+                &mut view,
+                &json!({
+                    "method": "item/plan/delta",
+                    "params": {"threadId": "thread-1", "turnId": "turn-1", "itemId": "item-9", "delta": delta},
+                }),
+            );
+        }
+        let events = flushed(&core, &emitter);
+        assert_eq!(
+            events,
+            vec![
+                ("plan_draft".to_string(), json!({"planId": "thread-1/plan", "text": "# Dra", "replace": false})),
+                ("plan_draft".to_string(), json!({"planId": "thread-1/plan", "text": "ft", "replace": false})),
+            ]
+        );
+        // 非计划轮:同样的 delta 一律忽略,永不进入审批主干。
+        let (core, _registry, emitter) = test_core();
+        let mut state = TurnState::new(Some("thread-1".into()));
+        let mut view = TurnView::default();
+        route(
+            &core,
+            &mut state,
+            &mut view,
+            &json!({
+                "method": "item/plan/delta",
+                "params": {"threadId": "thread-1", "turnId": "turn-1", "itemId": "item-9", "delta": "# Dra"},
+            }),
+        );
+        assert!(flushed(&core, &emitter).is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_completed_plan_item_is_the_authoritative_review_content() {
+        let (core, _registry, emitter) = test_core();
+        let mut state = TurnState::new(Some("thread-1".into()));
+        let mut view = plan_view();
+        route(
+            &core,
+            &mut state,
+            &mut view,
+            &json!({
+                "method": "item/plan/delta",
+                "params": {"threadId": "thread-1", "turnId": "turn-1", "itemId": "item-9", "delta": "# Draft that does not match"},
+            }),
+        );
+        route(
+            &core,
+            &mut state,
+            &mut view,
+            &json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "completedAtMs": 1,
+                    "item": {"id": "item-9", "type": "plan", "text": "# Final plan\n- step one"},
+                },
+            }),
+        );
+        let events = flushed(&core, &emitter);
+        let kinds: Vec<&str> = events.iter().map(|(kind, _)| kind.as_str()).collect();
+        assert_eq!(kinds, ["plan_draft", "plan_review"]);
+        let review = &events[1].1;
+        // 最终 item 权威替换:正文不是 delta 拼接,而是 completed item 的全文。
+        assert_eq!(review["content"], json!("# Final plan\n- step one"));
+        assert_eq!(
+            review["contentHash"],
+            json!(plan_review::content_hash("# Final plan\n- step one"))
+        );
+        assert_eq!(review["complete"], json!(true));
+        assert_eq!(review["reviewKind"], json!("next_turn"));
+        assert_eq!(review["planId"], json!("thread-1/plan"));
+        assert_eq!(review["sessionId"], json!("thread-1"));
+        assert_eq!(review["nativePlanId"], json!("item-9"));
+        assert_eq!(review["title"], json!("Final plan"));
+        assert_eq!(review["status"], json!("awaiting_review"));
+        assert_eq!(review["execPermission"], json!("auto"));
+        assert_eq!(review["workspacePath"], json!("/tmp/ws"));
+        assert_eq!(review["engine"], json!("codex"));
+        assert_eq!(review["runId"], json!("test-run"));
+    }
+
+    #[tokio::test]
+    async fn a_plan_item_outside_a_plan_run_never_becomes_a_review() {
+        let (core, _registry, emitter) = test_core();
+        let mut state = TurnState::new(Some("thread-1".into()));
+        let mut view = TurnView::default();
+        view.workspace = "/tmp/ws".into();
+        route(
+            &core,
+            &mut state,
+            &mut view,
+            &json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "completedAtMs": 1,
+                    "item": {"id": "item-9", "type": "plan", "text": "# Plan"},
+                },
+            }),
+        );
+        assert!(flushed(&core, &emitter).is_empty());
+    }
+
+    #[tokio::test]
+    async fn non_plan_items_and_the_task_checklist_never_trigger_a_review() {
+        let (core, _registry, emitter) = test_core();
+        let mut state = TurnState::new(Some("thread-1".into()));
+        let mut view = plan_view();
+        // turn/plan/updated:update_plan 工具的任务清单(步骤状态),不是方案正文。
+        route(
+            &core,
+            &mut state,
+            &mut view,
+            &json!({
+                "method": "turn/plan/updated",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "plan": [{"step": "do a", "status": "inProgress"}],
+                },
+            }),
+        );
+        // 普通 agentMessage 完成项:走消息投影,与审批无关。
+        route(
+            &core,
+            &mut state,
+            &mut view,
+            &json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "completedAtMs": 1,
+                    "item": {"id": "m1", "type": "agentMessage", "text": "working on it"},
+                },
+            }),
+        );
+        let events = flushed(&core, &emitter);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].0, "message");
+        assert_eq!(events[0].1["text"], json!("working on it"));
+    }
+
+    #[tokio::test]
+    async fn an_empty_or_idless_plan_item_is_not_a_review() {
+        let (core, _registry, emitter) = test_core();
+        let mut state = TurnState::new(Some("thread-1".into()));
+        let mut view = plan_view();
+        for item in [
+            json!({"id": "item-9", "type": "plan", "text": "   "}),
+            json!({"type": "plan", "text": "# Plan"}),
+        ] {
+            route(
+                &core,
+                &mut state,
+                &mut view,
+                &json!({
+                    "method": "item/completed",
+                    "params": {"threadId": "thread-1", "turnId": "turn-1", "completedAtMs": 1, "item": item},
+                }),
+            );
+        }
+        assert!(flushed(&core, &emitter).is_empty());
+    }
+
+    #[test]
+    fn check_plan_item_accepts_only_the_unchanged_final_item() {
+        let page = json!({"data": [
+            {"id": "turn-1", "itemsView": "full", "status": "completed", "items": [
+                {"id": "m1", "type": "agentMessage", "text": "done"},
+                {"id": "item-9", "type": "plan", "text": "# Plan\n- a"},
+            ]},
+        ], "nextCursor": null});
+        let hash = plan_review::content_hash("# Plan\n- a");
+        assert!(check_plan_item(&page, "item-9", &hash).is_ok());
+        // 正文变了:staleness,版本必须 expire。
+        let error = check_plan_item(&page, "item-9", "0123456789abcdef").unwrap_err();
+        assert!(error.starts_with(PLAN_STALE_PREFIX), "{error}");
+        // item 没了:同上。
+        let error = check_plan_item(&page, "item-404", &hash).unwrap_err();
+        assert!(error.starts_with(PLAN_STALE_PREFIX), "{error}");
+        // 空页找不到 item 也是 staleness。
+        let error = check_plan_item(&json!({"data": []}), "item-9", &hash).unwrap_err();
+        assert!(error.starts_with(PLAN_STALE_PREFIX), "{error}");
+        // 畸形响应不是 staleness:普通错误,提交回退、版本保留。
+        let error = check_plan_item(&json!({}), "item-9", &hash).unwrap_err();
+        assert!(!error.starts_with(PLAN_STALE_PREFIX), "{error}");
+    }
+
+    #[test]
+    fn plan_title_takes_the_first_atx_heading() {
+        assert_eq!(plan_title("# 实施方案\n- a"), "实施方案");
+        assert_eq!(plan_title("intro\n## Steps\n- a"), "Steps");
+        // `#` 后不跟空白不是标题。
+        assert_eq!(plan_title("#tag\nbody"), DEFAULT_PLAN_TITLE);
+        assert_eq!(plan_title("no heading here"), DEFAULT_PLAN_TITLE);
+        assert_eq!(plan_title(""), DEFAULT_PLAN_TITLE);
+    }
+
+    #[test]
+    fn decision_spec_builds_the_turn_from_the_record() {
+        let review = next_turn_review();
+        let spec = decision_spec(&review, PlanDecision::Approve, None).unwrap();
+        assert_eq!(spec.mode, "default");
+        assert_eq!(spec.prompt, EXECUTE_PLAN_PROMPT);
+        assert_eq!(spec.permission, "auto");
+        assert_eq!(spec.native_plan_id, "item-9");
+
+        let spec =
+            decision_spec(&review, PlanDecision::RequestChanges, Some("  收紧范围 ")).unwrap();
+        assert_eq!(spec.mode, "plan");
+        assert_eq!(spec.prompt, "收紧范围");
+        assert_eq!(spec.permission, "plan");
+    }
+
+    #[test]
+    fn decision_spec_rejects_before_touching_the_transport() {
+        let review = next_turn_review();
+        // 修改必须带非空反馈(CAS 已保证,这里是传输层之前的最后一道)。
+        assert!(decision_spec(&review, PlanDecision::RequestChanges, None).is_err());
+        assert!(decision_spec(&review, PlanDecision::RequestChanges, Some("  ")).is_err());
+        // Defer 是本地落定,从不创建 turn。
+        assert!(decision_spec(&review, PlanDecision::Defer, None).is_err());
+        // 非 next_turn 记录不该走到这里。
+        let mut wrong_kind = next_turn_review();
+        wrong_kind.review_kind = PlanReviewKind::NativeRequest;
+        assert!(decision_spec(&wrong_kind, PlanDecision::Approve, None).is_err());
+        // 缺原生 item id / 执行权限快照:没法核对、没法沿用,拒绝。
+        let mut no_item = next_turn_review();
+        no_item.native_plan_id = None;
+        assert!(decision_spec(&no_item, PlanDecision::Approve, None).is_err());
+        let mut no_permission = next_turn_review();
+        no_permission.exec_permission = "  ".into();
+        assert!(decision_spec(&no_permission, PlanDecision::Approve, None).is_err());
+        // 批准携带的固定执行指令不含任何用户文本。
+        let spec = decision_spec(&review, PlanDecision::Approve, Some("ignored")).unwrap();
+        assert_eq!(spec.prompt, EXECUTE_PLAN_PROMPT);
     }
 
     #[tokio::test]

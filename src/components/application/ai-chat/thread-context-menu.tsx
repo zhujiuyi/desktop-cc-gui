@@ -1,8 +1,10 @@
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
-import Copy from "lucide-react/dist/esm/icons/copy";
 import Archive from "lucide-react/dist/esm/icons/archive";
+import Columns2 from "lucide-react/dist/esm/icons/columns-2";
+import Copy from "lucide-react/dist/esm/icons/copy";
 import Pencil from "lucide-react/dist/esm/icons/pencil";
+import Rows2 from "lucide-react/dist/esm/icons/rows-2";
 import Trash2 from "lucide-react/dist/esm/icons/trash-2";
 import {
   sessionMenuRegistry,
@@ -12,6 +14,7 @@ import {
 } from "@ccgui/plugin-sdk";
 import { ContextMenu, type ContextMenuEntry } from "@/components/context-menu";
 import type { ThreadAction } from "@/components/application/ai-chat/sidebar-types";
+import { openSessionBeside, sessionFromThreadId } from "@/features/chat/split/store";
 
 export interface ThreadMenuState {
   x: number;
@@ -112,6 +115,26 @@ function buildPluginEntries(
   });
 }
 
+/** 会话行的分屏入口：等价于把这个会话拖到聚焦格的左/右侧或上/下侧。 */
+function buildSplitEntries(threadId: string, t: TFunction): MenuEntry[] {
+  const session = sessionFromThreadId(threadId);
+  if (!session) return [];
+  return [
+    {
+      id: "split-right",
+      label: t("chat.splitRight"),
+      icon: <Columns2 className="size-4" aria-hidden />,
+      onSelect: () => openSessionBeside(session, "right"),
+    },
+    {
+      id: "split-down",
+      label: t("chat.splitDown"),
+      icon: <Rows2 className="size-4" aria-hidden />,
+      onSelect: () => openSessionBeside(session, "bottom"),
+    },
+  ];
+}
+
 /**
  * Right-click menu for sidebar session rows. Chrome (portal anchoring,
  * viewport clamping, Escape/outside dismissal) comes from the shared
@@ -145,7 +168,11 @@ export function ThreadContextMenu({
     pluginDefs.length > 0 && !isDraft
       ? buildPluginEntries(pluginDefs, parseThreadTarget(menu.threadId))
       : [];
-  const entries = joinSections([...hostSections, pluginSection]);
+  const entries = joinSections([
+    buildSplitEntries(menu.threadId, t),
+    ...hostSections,
+    pluginSection,
+  ]);
 
   return (
     <ContextMenu

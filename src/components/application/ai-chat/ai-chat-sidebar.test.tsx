@@ -360,7 +360,10 @@ it("draft 新对话右键只提供删除,不暴露重命名/复制 ID/插件项"
 
     await rightClick(threadRow("新对话"));
     const menu = openMenu();
+    // 草稿只能删除与分屏打开：重命名/复制 ID/插件项都不适用。
     expect([...menu.querySelectorAll("[role='menuitem']")].map((el) => el.textContent)).toEqual([
+      "chat.splitRight",
+      "chat.splitDown",
       "chat.deleteSession",
     ]);
     await act(async () => menuItem(menu, "chat.deleteSession").click());

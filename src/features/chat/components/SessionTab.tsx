@@ -4,11 +4,15 @@ import type { PointerEvent as ReactPointerEvent } from "react";
 import type { LucideIcon } from "lucide-react";
 import { cx } from "@/utils/cx";
 import { EngineIcon } from "@/components/foundations/icons/engine-icon";
+import type { ActiveSession } from "../store/persistence";
 
 export interface SessionTabItem {
   key: string;
   label: string;
   streaming: boolean;
+  /** 会话页签的会话身份：向下拖出页签条分屏时用它作为拖拽载荷。
+   *  非会话页签（文件/浏览器/插件/差异）没有这个字段。 */
+  session?: ActiveSession;
   /** Provider backoff on the running turn — keep the dot but stop its pulse. */
   retrying?: boolean;
   /** Engine (CLI) id, shown as a brand mark before the label. */

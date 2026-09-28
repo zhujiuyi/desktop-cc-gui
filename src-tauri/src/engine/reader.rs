@@ -7,6 +7,7 @@ use super::events::{EngineEvent, TaskSummary};
 use super::grok;
 #[cfg(windows)]
 use super::job;
+use super::plan_review;
 use super::registry::{kill_process_group, ProcessRegistry};
 use super::Engine;
 use crate::event_sink;
@@ -428,7 +429,36 @@ pub(crate) struct TurnCore {
     pub(crate) registry: Arc<ProcessRegistry>,
     pub(crate) engine_id: String,
     pub(crate) run_id: String,
+    /// 审批事实源:计划事件到达即落盘(engine/plan_review.rs)。驱动内部与
+    /// 测试构造点没有 db 句柄时为 None——那些路径不产生计划事件。
+    pub(crate) db: Option<Arc<crate::db::Db>>,
 }
+/// 停住的计划审批随运行消亡:原生请求不再有效,记录过期并推送
+/// PlanReviewSettled,历史 UI 不得假装还能批准(PRD §8 防线 3)。
+/// host-transport 驱动(dsh/grok/qoder/codex/omp-acp)在自己的 settle 段
+/// 对每个注册键调用一次,语义与 run_reader 的收尾一致。无 db 句柄的
+/// 路径不产生计划事件,plans 必然为空。
+pub(crate) fn expire_parked_plans(core: &TurnCore, state: &mut TurnState, key: &str) {
+    let Some(db) = &core.db else {
+        return;
+    };
+    let parked: Vec<(String, i64)> = core
+        .registry
+        .take_plans(key)
+        .into_iter()
+        .map(|(plan_id, revision, _)| (plan_id, revision))
+        .collect();
+    if let Ok(expired) = plan_review::expire_reviews(db, &parked) {
+        for (plan_id, revision, _previous) in expired {
+            core.dispatch_event(state, EngineEvent::PlanReviewSettled {
+                plan_id,
+                revision,
+                status: plan_review::PlanStatus::Expired.as_str().to_string(),
+            });
+        }
+    }
+}
+
 impl TurnCore {
     /// Adopt a native session id: rekey the registry entry (no overwrite) and
     /// remember it for subsequent event payloads.
@@ -699,6 +729,97 @@ impl TurnCore {
                         "requestId": request_id,
                         "toolUseId": tool_use_id,
                         "input": input,
+                    }),
+                );
+            }
+            EngineEvent::PlanDraft {
+                plan_id,
+                text,
+                replace,
+            } => {
+                // 草稿只是预览:不落盘为可审批版本,UI 不得据此激活批准。
+                state.push(
+                    &self.sink,
+                    &self.run_id,
+                    &self.engine_id,
+                    "plan_draft",
+                    serde_json::json!({
+                        "planId": plan_id,
+                        "text": text,
+                        "replace": replace,
+                    }),
+                );
+            }
+            EngineEvent::PlanReviewReady { record, context } => {
+                state.gen_end();
+                // 完整正文 + 等待点确认后才落盘/下发 awaiting_review;原生
+                // 回复上下文只停在后端注册表,事件载荷永不含它。
+                let mut record = *record;
+                if let Some(db) = &self.db {
+                    match plan_review::record_review(db, &record) {
+                        Ok(revision) => record.revision = revision,
+                        Err(error) => {
+                            // 审批事实源写不进去就不能假装可审批:按错误
+                            // 落定,原生上下文不停车,等待点随运行结束消亡。
+                            self.dispatch_event(
+                                state,
+                                EngineEvent::Error(format!(
+                                    "plan review could not be persisted: {error}"
+                                )),
+                            );
+                            return;
+                        }
+                    }
+                }
+                // next_turn(Codex)没有活的原生请求:计划轮次已正常结束,
+                // 批准=另起一次执行 turn;审批元数据在记录本体(session_id=
+                // 线程、native_plan_id=item、content_hash),不停车——否则
+                // 运行一结束就被 expire,用户永远批不了。native_request 才
+                // 停车,形状与 respond_plan_review 的读取约定一致:
+                // {revision, route, frames, ...} 顶层平铺——context 是适配器
+                // 产出的对象,revision 由后端注入,适配器不得占用该键。
+                if record.review_kind == plan_review::PlanReviewKind::NativeRequest {
+                if let Some(entry) = self.registry.get(&self.run_id) {
+                    if let Ok(mut plans) = entry.plans.lock() {
+                        let mut parked = context;
+                        if let Some(map) = parked.as_object_mut() {
+                            map.insert(
+                                "revision".to_string(),
+                                serde_json::Value::from(record.revision),
+                            );
+                        } else {
+                            parked = serde_json::json!({
+                                "revision": record.revision,
+                                "opaque": parked,
+                            });
+                        }
+                        plans.insert(record.plan_id.clone(), parked);
+                    }
+                }
+                }
+                let payload = serde_json::to_value(&record)
+                    .unwrap_or_else(|_| serde_json::json!({ "planId": record.plan_id }));
+                state.push(&self.sink, &self.run_id, &self.engine_id, "plan_review", payload);
+            }
+            EngineEvent::PlanReviewSettled {
+                plan_id,
+                revision,
+                status,
+            } => {
+                if let Some(entry) = self.registry.get(&self.run_id) {
+                    if let Ok(mut plans) = entry.plans.lock() {
+                        plans.remove(&plan_id);
+                    }
+                }
+                state.push(
+                    &self.sink,
+                    &self.run_id,
+                    &self.engine_id,
+                    "plan_review_settled",
+                    serde_json::json!({
+                        "planId": plan_id,
+                        "revision": revision,
+                        "status": status,
                     }),
                 );
             }
@@ -1369,6 +1490,7 @@ pub(crate) async fn run_reader(stdout: ChildStdout, ctx: RunContext) {
         for request_id in ctx.core.registry.take_questions(&key) {
             ctx.dispatch_event(&mut state, EngineEvent::QuestionSettled { request_id });
         }
+        expire_parked_plans(&ctx.core, &mut state, &key);
     }
     // Drain this run's registry entries: under the native session id after
     // rekey, and under the run id when the session id never arrived.
@@ -1564,6 +1686,7 @@ mod staging_tests {
                     registry: Arc::new(ProcessRegistry::default()),
                     engine_id: "grok".into(),
                     run_id: "test".into(),
+                    db: None,
                 },
                 engine_impl: Box::new(grok::GrokEngine),
                 pid: 0,
@@ -1626,6 +1749,7 @@ mod staging_tests {
                 registry: Arc::new(ProcessRegistry::default()),
                 engine_id: "claude".into(),
                 run_id: "exit-with-tasks".into(),
+                db: None,
             },
             engine_impl: Box::new(crate::engine::claude::ClaudeEngine::new()),
             pid: 0,
@@ -1703,6 +1827,7 @@ mod staging_tests {
                 registry: Arc::new(ProcessRegistry::default()),
                 engine_id: "claude".into(),
                 run_id: "exit-awaiting-tasks".into(),
+                db: None,
             },
             engine_impl: Box::new(crate::engine::claude::ClaudeEngine::new()),
             pid: 0,
@@ -1763,6 +1888,7 @@ mod staging_tests {
             reader_abort: Arc::new(std::sync::OnceLock::new()),
             stdin: None,
             questions: Arc::new(Mutex::new(HashMap::new())),
+            plans: Arc::new(Mutex::new(HashMap::new())),
         };
         registry.insert("run-abort".into(), entry.clone());
         registry.insert_alias("session-abort".into(), entry);
@@ -1772,6 +1898,7 @@ mod staging_tests {
                 registry: Arc::clone(&registry),
                 engine_id: "grok".into(),
                 run_id: "run-abort".into(),
+                db: None,
             },
             engine_impl: Box::new(grok::GrokEngine),
             pid: 4242,
@@ -1817,6 +1944,7 @@ mod staging_tests {
             reader_abort: Arc::new(std::sync::OnceLock::new()),
             stdin: None,
             questions: Arc::new(Mutex::new(HashMap::new())),
+            plans: Arc::new(Mutex::new(HashMap::new())),
         };
         registry.insert("run-v".into(), entry.clone());
         registry.insert_alias("session-v".into(), entry);
@@ -1831,6 +1959,7 @@ mod staging_tests {
                 reader_abort: Arc::new(std::sync::OnceLock::new()),
                 stdin: None,
                 questions: Arc::new(Mutex::new(HashMap::new())),
+                plans: Arc::new(Mutex::new(HashMap::new())),
             },
         );
 
@@ -1875,6 +2004,7 @@ mod terminal_event_tests {
                     registry: Arc::new(ProcessRegistry::default()),
                     engine_id: engine.into(),
                     run_id: "pa-relay-test".into(),
+                    db: None,
                 };
                 let mut state = TurnState::new(None);
                 core.dispatch_event(
@@ -1908,6 +2038,7 @@ mod terminal_event_tests {
             registry: Arc::new(ProcessRegistry::default()),
             engine_id: "pi".into(),
             run_id: "gen-ms-test".into(),
+            db: None,
         };
         let mut state = TurnState::new(Some("session".into()));
         let tool_start = || EngineEvent::Message {
@@ -1964,6 +2095,7 @@ mod terminal_event_tests {
                 registry: Arc::new(ProcessRegistry::default()),
                 engine_id: "codex".into(),
                 run_id: "terminal-test".into(),
+                db: None,
             };
             let mut state = TurnState::new(Some("session".into()));
             core.dispatch_event(&mut state, EngineEvent::Delta("完成中文与 emoji 🐎".into()));
@@ -2051,6 +2183,7 @@ mod terminal_event_tests {
                     reader_abort: Arc::new(std::sync::OnceLock::new()),
                     stdin: None,
                     questions: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                    plans: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 },
             );
             let context = RunContext {
@@ -2059,6 +2192,7 @@ mod terminal_event_tests {
                     registry: registry.clone(),
                     engine_id: "pi".into(),
                     run_id: run_id.into(),
+                    db: None,
                 },
                 engine_impl: Box::new(crate::engine::pi_family::pi()),
                 pid,
@@ -2168,6 +2302,7 @@ mod terminal_event_tests {
             sink: event_sink::EventSink::new(collector.clone()),
             registry: Arc::new(ProcessRegistry::default()),
             engine_id: "claude".into(), run_id: "hollow-test".into(),
+            db: None,
         };
         let mut state = TurnState::new(Some("session".into()));
         // The resume-time reconciliation turn carries no content of its own.
@@ -2195,6 +2330,7 @@ mod terminal_event_tests {
             registry: Arc::new(ProcessRegistry::default()),
             engine_id: "claude".into(),
             run_id: "mcp-hollow-done-test".into(),
+            db: None,
         };
         let workspace = std::env::temp_dir().join("ccgui-mcp-hollow-done-test");
         let workspace = workspace.to_string_lossy().into_owned();
@@ -2399,6 +2535,7 @@ mod terminal_event_tests {
             registry: Arc::new(ProcessRegistry::default()),
             engine_id: "claude".into(),
             run_id: "done-with-task".into(),
+            db: None,
         };
         let mut state = TurnState::new(None);
         state.pending_tasks.insert(
@@ -2434,6 +2571,7 @@ mod terminal_event_tests {
             registry: Arc::new(ProcessRegistry::default()),
             engine_id: "claude".into(),
             run_id: "ambient-tasks".into(),
+            db: None,
         };
         let mut state = TurnState::new(None);
         let ambient = |id: &str| TaskSummary {
@@ -2489,6 +2627,7 @@ mod terminal_event_tests {
                 registry: Arc::new(ProcessRegistry::default()),
                 engine_id: "claude".into(),
                 run_id: run_id.into(),
+                db: None,
             },
             collector,
         )
@@ -2709,5 +2848,171 @@ mod terminal_event_tests {
 
         core.sink.flush();
         assert!(collector.0.lock().unwrap().is_empty());
+    }
+}
+#[cfg(test)]
+mod plan_dispatch_tests {
+    //! PlanReviewReady 的 dispatch 契约:落盘赋 revision、停车上下文顶层
+    //! 平铺 {revision, route, frames, ...}(respond_plan_review 按此读取)、
+    //! 事件载荷不含原生上下文;审批事实源写失败则转 Error 落定、不停车。
+    use super::*;
+    use crate::engine::ChildEntry;
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct Collector(Mutex<Vec<Value>>);
+    impl event_sink::Emit for Collector {
+        fn emit_json(&self, _: &str, raw: &str) {
+            self.0
+                .lock()
+                .unwrap()
+                .extend(serde_json::from_str::<Vec<Value>>(raw).unwrap());
+        }
+    }
+
+    fn ready_core(
+        tag: &str,
+        drop_table: bool,
+    ) -> (TurnCore, Arc<Collector>, Arc<crate::db::Db>) {
+        let dir = std::env::temp_dir().join(format!(
+            "ccgui-plan-dispatch-{tag}-{}-{}",
+            std::process::id(),
+            plan_review::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Arc::new(crate::db::Db::open_at(&dir.join("app.db")).unwrap());
+        if drop_table {
+            db.0.lock()
+                .execute("DROP TABLE plan_reviews", [])
+                .unwrap();
+        }
+        let collector = Arc::new(Collector::default());
+        let core = TurnCore {
+            sink: event_sink::EventSink::new(collector.clone()),
+            registry: Arc::new(ProcessRegistry::default()),
+            engine_id: "dsh".into(),
+            run_id: "run-plan".into(),
+            db: Some(Arc::clone(&db)),
+        };
+        core.registry.insert(
+            "run-plan".into(),
+            ChildEntry {
+                child: None,
+                pid: 4242,
+                run_id: "run-plan".into(),
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                reader_abort: Arc::new(std::sync::OnceLock::new()),
+                stdin: None,
+                questions: Arc::new(Mutex::new(HashMap::new())),
+                plans: Arc::new(Mutex::new(HashMap::new())),
+            },
+        );
+        (core, collector, db)
+    }
+
+    fn review(plan_id: &str) -> plan_review::PlanReview {
+        plan_review::PlanReview {
+            plan_id: plan_id.into(),
+            engine: "dsh".into(),
+            session_id: "sess-plan".into(),
+            workspace_path: "/tmp/ccgui-plan-dispatch-ws".into(),
+            run_id: Some("run-plan".into()),
+            revision: 0,
+            title: "Dispatch plan".into(),
+            content: "# Plan\n\nbody".into(),
+            content_hash: plan_review::content_hash("# Plan\n\nbody"),
+            complete: true,
+            review_kind: plan_review::PlanReviewKind::NativeRequest,
+            native_plan_id: Some("native-1".into()),
+            exec_permission: "auto".into(),
+            status: plan_review::PlanStatus::AwaitingReview,
+            execution: plan_review::PlanExecution::NotStarted,
+            decision: None,
+            decision_intent_at: None,
+            applied_at: None,
+            created_at: 0,
+            updated_at: 0,
+            superseded_by: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_review_ready_persists_parks_flat_and_emits_without_context() {
+        let (core, collector, db) = ready_core("ok", false);
+        let mut state = TurnState::new(Some("sess-plan".into()));
+        core.dispatch_event(
+            &mut state,
+            EngineEvent::PlanReviewReady {
+                record: Box::new(review("plan-x")),
+                context: serde_json::json!({
+                    "route": "stdin",
+                    "frames": {"approve": {"ok": true}},
+                }),
+            },
+        );
+        core.sink.flush();
+
+        // 落盘:revision 由后端赋值。
+        let stored = plan_review::get_review(&db, "plan-x", 1)
+            .unwrap()
+            .expect("record persisted");
+        assert_eq!(stored.revision, 1);
+        assert_eq!(stored.status, plan_review::PlanStatus::AwaitingReview);
+
+        // 停车:context 顶层平铺 + 后端注入的 revision,供 respond 直接读。
+        let entry = core.registry.get("run-plan").unwrap();
+        let parked = entry.plans.lock().unwrap().get("plan-x").cloned().unwrap();
+        assert_eq!(parked["revision"], 1);
+        assert_eq!(parked["route"], "stdin");
+        assert!(parked["frames"]["approve"]["ok"].as_bool().unwrap());
+
+        // 事件:camelCase record,永不含原生回复上下文。
+        let events = collector.0.lock().unwrap();
+        let payload = events
+            .iter()
+            .find(|event| event["kind"].as_str() == Some("plan_review"))
+            .expect("plan_review event emitted");
+        assert_eq!(payload["data"]["planId"], "plan-x");
+        assert_eq!(payload["data"]["revision"], 1);
+        assert_eq!(payload["sessionId"], "sess-plan");
+        assert!(payload["data"].get("context").is_none(), "{payload}");
+        assert!(payload["data"].get("frames").is_none(), "{payload}");
+    }
+
+    #[tokio::test]
+    async fn a_persistence_failure_settles_as_error_without_parking() {
+        let (core, collector, _db) = ready_core("fail", true);
+        let mut state = TurnState::new(Some("sess-plan".into()));
+        core.dispatch_event(
+            &mut state,
+            EngineEvent::PlanReviewReady {
+                record: Box::new(review("plan-y")),
+                context: serde_json::json!({"route": "stdin"}),
+            },
+        );
+        core.sink.flush();
+
+        // 审批事实源写不进去:不停车、不推 plan_review,按 Error 落定——
+        // 绝不假装这个计划可以审批。
+        let entry = core.registry.get("run-plan").unwrap();
+        assert!(entry.plans.lock().unwrap().is_empty());
+        let events = collector.0.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .all(|event| event["kind"].as_str() != Some("plan_review")),
+            "{events:?}"
+        );
+        let error = events
+            .iter()
+            .find(|event| event["kind"].as_str() == Some("error"))
+            .expect("persistence failure surfaces as error");
+        assert!(
+            error["data"]
+                .as_str()
+                .unwrap()
+                .contains("could not be persisted"),
+            "{error}"
+        );
     }
 }

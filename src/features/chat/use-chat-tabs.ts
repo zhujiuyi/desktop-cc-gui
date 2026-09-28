@@ -171,6 +171,8 @@ export function useChatTabs({
           : undefined;
         return {
           key: sessionKey(tab.engine, tab.sessionId, tab.workspacePath),
+          // 会话身份随页签带下去：向下拖出页签条即分屏（split/drag.tsx）。
+          session: tab,
           engine: tab.engine,
           label: meta?.customTitle || meta?.title || t("chat.newChat"),
           streaming: tabStreaming[index] ?? false,

@@ -42,6 +42,7 @@ import {
 import { ASK_OTHER_OPTION, askLoops, beginAskSubmit, revertAskSubmit } from "./ask-loop";
 import { engineSupportsComputerUse } from "../computer-use";
 import type { SendOptions } from "./types";
+import { patchPlanReview } from "./plan-review";
 import { effectivePermission } from "./permissions";
 import {
   buildAgentBlock,
@@ -75,6 +76,23 @@ export interface MessagingDeps {
   subscribe: StoreSubscribe;
 }
 
+/** 会话 key：调用方给了目标就用它，否则回退到当前激活会话。
+ *  分屏后每个格子都有自己的输入框与队列，不能再无脑用全局 active。 */
+function keyOfTarget(
+  target: ActiveSession | null | undefined,
+  active: ActiveSession | null,
+): string {
+  const session = target ?? active;
+  return session
+    ? sessionKey(session.engine, session.sessionId, session.workspacePath)
+    : "";
+}
+
+/** 已经算好 key 的调用点直接用 key，没给就回退到激活会话。 */
+function resolveKey(key: string | undefined, active: ActiveSession | null): string {
+  return key ?? keyOfTarget(null, active);
+}
+
 /** The one answer value a question card sends. A multi-select pick arrives as
  * labels and travels as the text the CLI's free-form editor would have given. */
 function answerText(answers: Record<string, string | string[]>): string {
@@ -88,6 +106,8 @@ export function createMessagingActions(
   ChatStore,
   | "send"
   | "respondToGrant"
+  | "respondToPlanReview"
+  | "resumePlanReview"
   | "respondToQuestion"
   | "resendLastUser"
   | "queueMessage"
@@ -469,13 +489,130 @@ export function createMessagingActions(
     });
   }
 
+  /** 按会话 key 中断：公共 `interrupt(target)` 与队列「立即发送」共用。
+   *  key 而不是会话对象，是因为后台会话的排队项只有 key。 */
+  async function interruptByKey(key: string) {
+    // This session's current runs: the ones Stop is about to kill, so no
+    // task frame will ever report a terminal status for what they left
+    // running. Read here — before the awaits below — because the settle
+    // that follows must not catch a run started while Stop was in flight.
+    const stoppedRunIds = [...runRouting]
+      .filter(([, routed]) => routed === key)
+      .map(([runId]) => runId);
+    // Settle locally FIRST: the killed run's done event can arrive while
+    // the kill IPCs below are still in flight, and onDone drains the queue
+    // whenever interrupted is still false — that would fire the next
+    // queued message right after the user pressed stop.
+    const pending = drainPending(key);
+    set((s) => {
+      const cur = s.bySession[key] ?? EMPTY_SESSION;
+      const messages = settleLiveRows(
+        pending
+          ? applyStreamParts(cur.messages, pending.parts, pending.model)
+          : cur.messages,
+      );
+      // A session that is (or was) waiting on background work has rows the
+      // stop just killed; a plain streaming turn has nothing to settle.
+      // `stopped`, not `interrupted`: the user asked for this stop, and the
+      // store reserves 已中断 for a run that died without a notification.
+      // Runs whose routing entry is already gone are out of this scope:
+      // the orphan sweep settles whatever they left running.
+      // backgroundActive excludes ambient tasks, so it alone would skip
+      // the settle for a session whose only running rows are ambient —
+      // those rows would spin forever (routing is deleted below and the
+      // settledRunIds gate drops their late frames). Look at the stopped
+      // runs' own rows instead.
+      const stoppingTasks =
+        cur.awaitingTasks ||
+        cur.tasks.some((t) => stoppedRunIds.includes(t.runId) && t.status === "running");
+      const tasks = stoppingTasks
+        ? stoppedRunIds.reduce(
+            (acc, runId) => settleRunTasks(acc, runId, "stopped"),
+            cur.tasks,
+          )
+        : cur.tasks;
+      return {
+        bySession: {
+          ...s.bySession,
+          [key]: {
+            ...cur,
+            messages,
+            streaming: false,
+            interrupted: true,
+            turnStartedAt: null,
+            retry: null,
+            // The stopped runs are settled: the session is unclaimed again,
+            // so their late frames cannot read as a newer run's turn.
+            currentRunId: null,
+            // The wait ends with the work it waited for: without this the
+            // tail indicator keeps claiming a task is running and the pill
+            // keeps breathing over rows the user just stopped.
+            ...(stoppingTasks
+              ? {
+                  tasks,
+                  awaitingTasks: false,
+                  // Same derivation as withTaskDerived: ambient tasks never
+                  // drive the turn-level flag.
+                  backgroundActive: tasks.some((t) => t.status === "running" && !t.ambient),
+                }
+              : {}),
+            // Mark the runs dead in this same write. The kill IPCs below can
+            // take a while, and the last task frames of the dying process
+            // arrive inside that window — still routed, with no done that
+            // ever marked them settled. Without this the cleared wait above
+            // would no longer shield them: adoptObservedRun would reopen the
+            // turn (streaming true, composer queueing) for a process that is
+            // already gone. Idempotent with the loop at the end of the stop.
+            settledRunIds: stoppedRunIds.reduce(
+              (acc, runId) => rememberSettledRun({ settledRunIds: acc }, runId),
+              cur.settledRunIds ?? [],
+            ),
+          },
+        },
+        streamingByKey: setStreamingFlag(s.streamingByKey, key, false),
+        retryingByKey: setRetryingFlag(s.retryingByKey, key, false),
+      };
+    });
+    // Registry is keyed by native session id once known; before that the
+    // run id routes. Try both.
+    const sessionId = key.includes("/") ? key.slice(key.indexOf("/") + 1) : "";
+    if (sessionId && !key.startsWith("new:"))
+      await ipc.interruptSession(sessionId).catch(() => false);
+    const deadRunIds: string[] = [];
+    for (const [runId, routed] of runRouting) {
+      // Intersect with the pre-kill snapshot: a run started while the kill
+      // IPCs were in flight (Stop→Send race) is routed to this key but was
+      // never asked to stop — killing and settling it here would strand its
+      // streaming state and drop all its frames.
+      if (routed === key && stoppedRunIds.includes(runId)) deadRunIds.push(runId);
+    }
+    // Independent kills, one IPC call per routed run — fired together.
+    await Promise.all(
+      deadRunIds.map((runId) =>
+        ipc.interruptSession(runId).catch(() => false),
+      ),
+    );
+    // The runs are dead: drop their routing and usage entries so the maps
+    // cannot grow forever. (A late done event would also remove them.)
+    for (const runId of deadRunIds) {
+      patchSession(set, key, { settledRunIds: rememberSettledRun(get().bySession[key], runId) });
+      runRouting.delete(runId);
+      untrackRun(runId);
+      dropRunUsage(runId);
+    }
+    // Refresh without holding Stop: the read can take three loads with
+    // backoff, and Stop must complete immediately (every other caller
+    // fires and forgets).
+    void get().refreshSessionUsage(key);
+  }
+
   return {
     drainQueue,
     markUnseenIfBackground,
 
-    send: async (prompt, images, options) => {
-      const { active } = get();
-      if (active) await sendPrompt(active, prompt, images, options);
+    send: async (prompt, images, options, target) => {
+      const session = target === undefined ? get().active : target;
+      if (session) await sendPrompt(session, prompt, images, options);
     },
 
     respondToGrant: async (key, seq, accept) => {
@@ -498,6 +635,66 @@ export function createMessagingActions(
       } catch (error) {
         patchSession(set, key, { error: errorText(error) });
       }
+    },
+
+    respondToPlanReview: async (key, planId, expectedRevision, decision, feedback) => {
+      const row = (get().bySession[key]?.messages ?? []).find(
+        (m) =>
+          m.planReview?.planId === planId &&
+          m.planReview?.revision === expectedRevision,
+      );
+      const record = row?.planReview;
+      // Only an open revision can be decided; anything else (already
+      // submitted, settled, unknown) is a stale click the backend CAS would
+      // reject anyway.
+      if (
+        !record ||
+        (record.status !== "awaiting_review" && record.status !== "deferred")
+      ) {
+        return { kind: "error", error: i18n.t("chat.planReviewNotPending") };
+      }
+      const text = feedback?.trim() || undefined;
+      if (decision === "request_changes" && !text) {
+        return { kind: "error", error: i18n.t("chat.planReviewFeedbackRequired") };
+      }
+      if (decision !== "defer" && !record.complete) {
+        return { kind: "error", error: i18n.t("chat.planReviewIncomplete") };
+      }
+      const revertTo = record.status;
+      patchPlanReview(set, key, planId, expectedRevision, (cur) => ({
+        ...cur,
+        status: "submitting",
+      }));
+      try {
+        const outcome = await ipc.respondPlanReview(
+          planId,
+          expectedRevision,
+          decision,
+          text,
+        );
+        // Applied or conflict, the returned record is the backend's truth:
+        // a conflict replaces the card with the current state instead of
+        // pretending the submit landed.
+        patchPlanReview(set, key, planId, expectedRevision, () => outcome.review);
+        // A landed decision closes a dock the user reopened from the card.
+        if (get().bySession[key]?.planReviewResume === `${planId}:${expectedRevision}`) {
+          patchSession(set, key, { planReviewResume: null });
+        }
+        return outcome.outcome === "applied"
+          ? { kind: "applied", record: outcome.review }
+          : { kind: "conflict", record: outcome.review };
+      } catch (error) {
+        // Never fake success: the card returns to its pre-submit status so
+        // the user can retry (or the next settled event resolves it).
+        patchPlanReview(set, key, planId, expectedRevision, (cur) =>
+          cur.status === "submitting" ? { ...cur, status: revertTo } : cur,
+        );
+        return { kind: "error", error: errorText(error) };
+      }
+    },
+
+    resumePlanReview: (key, resume) => {
+      patchSession(set, key, { planReviewResume: resume });
     },
 
     respondToQuestion: async (key, seq, answers) => {
@@ -552,13 +749,13 @@ export function createMessagingActions(
         });
     },
 
-    queueMessage: (text, images, options) => {
-      const { active } = get();
-      if (!active || (!text.trim() && images.length === 0)) return;
+    queueMessage: (text, images, options, target) => {
+      const session = target === undefined ? get().active : target;
+      if (!session || (!text.trim() && images.length === 0)) return;
       const key = sessionKey(
-        active.engine,
-        active.sessionId,
-        active.workspacePath,
+        session.engine,
+        session.sessionId,
+        session.workspacePath,
       );
       set((s) => {
         const prev = s.bySession[key] ?? EMPTY_SESSION;
@@ -583,21 +780,16 @@ export function createMessagingActions(
       });
     },
 
-    removeQueued: (id) => {
-      const { active } = get();
-      if (!active) return;
-      const key = sessionKey(
-        active.engine,
-        active.sessionId,
-        active.workspacePath,
-      );
+    removeQueued: (id, key) => {
+      const targetKey = resolveKey(key, get().active);
+      if (!targetKey) return;
       set((s) => {
-        const prev = s.bySession[key];
+        const prev = s.bySession[targetKey];
         if (!prev) return {};
         return {
           bySession: {
             ...s.bySession,
-            [key]: {
+            [targetKey]: {
               ...prev,
               queue: prev.queue.filter((item) => item.id !== id),
             },
@@ -609,16 +801,11 @@ export function createMessagingActions(
      *  first, so "up" walks the row toward the end of the send order (sent
      *  later) and "down" toward the head (sent sooner); a move past either
      *  end is a no-op. */
-    moveQueued: (id, direction) => {
-      const { active } = get();
-      if (!active) return;
-      const key = sessionKey(
-        active.engine,
-        active.sessionId,
-        active.workspacePath,
-      );
+    moveQueued: (id, direction, key) => {
+      const targetKey = resolveKey(key, get().active);
+      if (!targetKey) return;
       set((s) => {
-        const prev = s.bySession[key];
+        const prev = s.bySession[targetKey];
         if (!prev) return {};
         const index = prev.queue.findIndex((item) => item.id === id);
         if (index < 0) return {};
@@ -629,26 +816,21 @@ export function createMessagingActions(
         return {
           bySession: {
             ...s.bySession,
-            [key]: { ...prev, queue },
+            [targetKey]: { ...prev, queue },
           },
         };
       });
     },
-    clearQueue: () => {
-      const { active } = get();
-      if (!active) return;
-      const key = sessionKey(
-        active.engine,
-        active.sessionId,
-        active.workspacePath,
-      );
+    clearQueue: (key) => {
+      const targetKey = resolveKey(key, get().active);
+      if (!targetKey) return;
       set((s) => {
-        const prev = s.bySession[key];
+        const prev = s.bySession[targetKey];
         if (!prev || prev.queue.length === 0) return {};
         return {
           bySession: {
             ...s.bySession,
-            [key]: { ...prev, queue: [] },
+            [targetKey]: { ...prev, queue: [] },
           },
         };
       });
@@ -659,24 +841,19 @@ export function createMessagingActions(
      *  and the stop's own park is lifted, so the exit drain sends this message
      *  instead of waiting the turn out. The rows behind it follow on the next
      *  settle. */
-    sendQueuedNow: async (id) => {
-      const { active } = get();
-      if (!active) return;
-      const key = sessionKey(
-        active.engine,
-        active.sessionId,
-        active.workspacePath,
-      );
-      const session = get().bySession[key];
+    sendQueuedNow: async (id, key) => {
+      const targetKey = resolveKey(key, get().active);
+      if (!targetKey) return;
+      const session = get().bySession[targetKey];
       const item = session?.queue.find((entry) => entry.id === id);
       if (!item || !session) return;
       const running = session.streaming;
       set((s) => {
-        const prev = s.bySession[key] ?? EMPTY_SESSION;
+        const prev = s.bySession[targetKey] ?? EMPTY_SESSION;
         return {
           bySession: {
             ...s.bySession,
-            [key]: {
+            [targetKey]: {
               ...prev,
               queue: [item, ...prev.queue.filter((entry) => entry.id !== id)],
               interrupted: false,
@@ -684,129 +861,14 @@ export function createMessagingActions(
           },
         };
       });
-      if (running) await get().interrupt();
-      drainQueue(key);
+      if (running) await interruptByKey(targetKey);
+      drainQueue(targetKey);
     },
 
-    interrupt: async () => {
-      const { active } = get();
-      if (!active) return;
-      const key = sessionKey(
-        active.engine,
-        active.sessionId,
-        active.workspacePath,
-      );
-      // This session's current runs: the ones Stop is about to kill, so no
-      // task frame will ever report a terminal status for what they left
-      // running. Read here — before the awaits below — because the settle
-      // that follows must not catch a run started while Stop was in flight.
-      const stoppedRunIds = [...runRouting]
-        .filter(([, routed]) => routed === key)
-        .map(([runId]) => runId);
-      // Settle locally FIRST: the killed run's done event can arrive while
-      // the kill IPCs below are still in flight, and onDone drains the queue
-      // whenever interrupted is still false — that would fire the next
-      // queued message right after the user pressed stop.
-      const pending = drainPending(key);
-      set((s) => {
-        const cur = s.bySession[key] ?? EMPTY_SESSION;
-        const messages = settleLiveRows(
-          pending
-            ? applyStreamParts(cur.messages, pending.parts, pending.model)
-            : cur.messages,
-        );
-        // A session that is (or was) waiting on background work has rows the
-        // stop just killed; a plain streaming turn has nothing to settle.
-        // `stopped`, not `interrupted`: the user asked for this stop, and the
-        // store reserves 已中断 for a run that died without a notification.
-        // Runs whose routing entry is already gone are out of this scope:
-        // the orphan sweep settles whatever they left running.
-        // backgroundActive excludes ambient tasks, so it alone would skip
-        // the settle for a session whose only running rows are ambient —
-        // those rows would spin forever (routing is deleted below and the
-        // settledRunIds gate drops their late frames). Look at the stopped
-        // runs' own rows instead.
-        const stoppingTasks =
-          cur.awaitingTasks ||
-          cur.tasks.some((t) => stoppedRunIds.includes(t.runId) && t.status === "running");
-        const tasks = stoppingTasks
-          ? stoppedRunIds.reduce(
-              (acc, runId) => settleRunTasks(acc, runId, "stopped"),
-              cur.tasks,
-            )
-          : cur.tasks;
-        return {
-          bySession: {
-            ...s.bySession,
-            [key]: {
-              ...cur,
-              messages,
-              streaming: false,
-              interrupted: true,
-              turnStartedAt: null,
-              retry: null,
-              // The stopped runs are settled: the session is unclaimed again,
-              // so their late frames cannot read as a newer run's turn.
-              currentRunId: null,
-              // The wait ends with the work it waited for: without this the
-              // tail indicator keeps claiming a task is running and the pill
-              // keeps breathing over rows the user just stopped.
-              ...(stoppingTasks
-                ? {
-                    tasks,
-                    awaitingTasks: false,
-                    // Same derivation as withTaskDerived: ambient tasks never
-                    // drive the turn-level flag.
-                    backgroundActive: tasks.some((t) => t.status === "running" && !t.ambient),
-                  }
-                : {}),
-              // Mark the runs dead in this same write. The kill IPCs below can
-              // take a while, and the last task frames of the dying process
-              // arrive inside that window — still routed, with no done that
-              // ever marked them settled. Without this the cleared wait above
-              // would no longer shield them: adoptObservedRun would reopen the
-              // turn (streaming true, composer queueing) for a process that is
-              // already gone. Idempotent with the loop at the end of the stop.
-              settledRunIds: stoppedRunIds.reduce(
-                (acc, runId) => rememberSettledRun({ settledRunIds: acc }, runId),
-                cur.settledRunIds ?? [],
-              ),
-            },
-          },
-          streamingByKey: setStreamingFlag(s.streamingByKey, key, false),
-          retryingByKey: setRetryingFlag(s.retryingByKey, key, false),
-        };
-      });
-      // Registry is keyed by native session id once known; before that the
-      // run id routes. Try both.
-      if (active.sessionId)
-        await ipc.interruptSession(active.sessionId).catch(() => false);
-      const deadRunIds: string[] = [];
-      for (const [runId, routed] of runRouting) {
-        // Intersect with the pre-kill snapshot: a run started while the kill
-        // IPCs were in flight (Stop→Send race) is routed to this key but was
-        // never asked to stop — killing and settling it here would strand its
-        // streaming state and drop all its frames.
-        if (routed === key && stoppedRunIds.includes(runId)) deadRunIds.push(runId);
-      }
-      // Independent kills, one IPC call per routed run — fired together.
-      await Promise.all(
-        deadRunIds.map((runId) =>
-          ipc.interruptSession(runId).catch(() => false),
-        ),
-      );
-      // The runs are dead: drop their routing and usage entries so the maps
-      // cannot grow forever. (A late done event would also remove them.)
-      for (const runId of deadRunIds) {
-        patchSession(set, key, { settledRunIds: rememberSettledRun(get().bySession[key], runId) });
-        runRouting.delete(runId);
-        untrackRun(runId);
-        dropRunUsage(runId);
-      }
-      // Refresh without holding Stop: the read can take three loads with
-      // backoff, and Stop must complete immediately (every other caller
-      // fires and forgets).
-      void get().refreshSessionUsage(key);
+    interrupt: async (target) => {
+      const key = keyOfTarget(target === undefined ? get().active : target, null);
+      if (!key) return;
+      await interruptByKey(key);
     },
 
     clearSettledTasks: () => {

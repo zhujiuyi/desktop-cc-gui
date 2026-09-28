@@ -45,6 +45,10 @@ pub struct ChildEntry {
     /// Pending question requests (request_id -> full tool input) awaiting the
     /// user's answer; shared by both registry keys of the run.
     pub questions: Arc<Mutex<HashMap<String, Value>>>,
+    /// 停住的计划审批原生回复上下文(plan_id -> {revision, context}):只存
+    /// 后端,永不下发前端;由 respond_plan_review 按 planId+revision 消费,
+    /// 运行结束时随进程一并过期(与 questions 同生命周期)。
+    pub plans: Arc<Mutex<HashMap<String, Value>>>,
 }
 
 #[derive(Default)]
@@ -143,6 +147,27 @@ impl ProcessRegistry {
         let ids: Vec<String> = questions.keys().cloned().collect();
         questions.clear();
         ids
+    }
+    /// Drain and return a run's parked plan-review contexts as
+    /// (plan_id, revision, context): the native request dies with the run, so
+    /// the settle path expires every record still open for approval.
+    pub(crate) fn take_plans(&self, key: &str) -> Vec<(String, i64, Value)> {
+        let Some(entry) = self.get(key) else {
+            return Vec::new();
+        };
+        let Ok(mut plans) = entry.plans.lock() else {
+            return Vec::new();
+        };
+        plans
+            .drain()
+            .map(|(plan_id, context)| {
+                let revision = context
+                    .get("revision")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                (plan_id, revision, context)
+            })
+            .collect()
     }
 
     pub(crate) fn insert(&self, key: String, entry: ChildEntry) {
@@ -470,6 +495,7 @@ mod registry_tests {
             reader_abort: Arc::new(std::sync::OnceLock::new()),
             stdin: None,
             questions: Arc::new(Mutex::new(HashMap::new())),
+            plans: Arc::new(Mutex::new(HashMap::new())),
         };
         let registry = Arc::new(ProcessRegistry::default());
         registry.insert("run-1".to_string(), entry);
@@ -522,6 +548,7 @@ mod registry_tests {
             reader_abort: Arc::new(std::sync::OnceLock::new()),
             stdin: None,
             questions: Arc::new(Mutex::new(HashMap::new())),
+            plans: Arc::new(Mutex::new(HashMap::new())),
         };
         let registry = Arc::new(ProcessRegistry::default());
         registry.insert("run-preassigned".to_string(), entry.clone());
@@ -581,6 +608,7 @@ mod registry_tests {
             reader_abort: Arc::new(std::sync::OnceLock::new()),
             stdin: None,
             questions: Arc::new(Mutex::new(HashMap::new())),
+            plans: Arc::new(Mutex::new(HashMap::new())),
         };
         let registry = Arc::new(ProcessRegistry::default());
         registry.insert("run-tree".to_string(), entry);
@@ -619,6 +647,7 @@ mod registry_tests {
             reader_abort: Arc::new(std::sync::OnceLock::new()),
             stdin: None,
             questions: Arc::new(Mutex::new(HashMap::new())),
+            plans: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 

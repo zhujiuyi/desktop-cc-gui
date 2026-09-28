@@ -19,6 +19,8 @@ import { ipc } from "@/lib/ipc";
 import { useWorktreeStore } from "@/features/worktree/store";
 import { WorktreeProgressRow } from "@/features/worktree/WorktreeProgressRow";
 import type { AiChatRepo, AiChatThread, ThreadAction } from "@/components/application/ai-chat/sidebar-types";
+import { useDragSource } from "@/features/chat/split/drag";
+import { sessionFromThreadId } from "@/features/chat/split/store";
 import { cx } from "@/utils/cx";
 
 /** Streaming/unseen status dot on a thread row; renders nothing when the
@@ -141,6 +143,14 @@ function ThreadItem({
   /** Right-click anywhere on the row: opens the thread context menu. */
   onContextMenu?: (event: ReactMouseEvent<HTMLElement>, id: string) => void;
 }) {
+  // 拖到中心区 = 分屏（边=切分到那一侧，中心=替换/互换）：会话在按下时才查，
+  // 免得每一行都订阅整个会话列表。
+  const startDrag = useDragSource(
+    useCallback(() => {
+      const session = sessionFromThreadId(id);
+      return session ? { kind: "session" as const, session, label } : null;
+    }, [id, label]),
+  );
   return (
     <div
       onContextMenu={
@@ -157,6 +167,7 @@ function ThreadItem({
         type="button"
         tabIndex={tabIndex}
         aria-current={isSelected ? "page" : undefined}
+        onPointerDown={startDrag}
         onClick={() => id && onSelect?.(id)}
         className="flex min-w-0 flex-1 cursor-pointer items-center gap-2.5 text-left"
       >

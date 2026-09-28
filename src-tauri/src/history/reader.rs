@@ -874,6 +874,7 @@ pub(super) fn delete_session_blocking(
         )
         .map_err(|e| e.to_string())?;
     }
+    crate::engine::plan_review::delete_reviews_for_session(&tx, engine, session_id)?;
     tx.commit().map_err(|e| e.to_string())
 }
 
@@ -1196,6 +1197,8 @@ pub fn remove_workspace(
             rusqlite::params![path],
         )
         .map_err(|e| e.to_string())?;
+        // 审批记录不声明 FK(sessions 行可能晚于计划到达),由清理路径级联。
+        crate::engine::plan_review::delete_reviews_for_workspace(&conn, &path)?;
     }
     drop(conn);
     state.sink.emit_sessions_changed();

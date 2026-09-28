@@ -2,6 +2,11 @@ use super::{
     command_for_binary, images, push_session_id, BuiltCommand, Engine, EngineEvent, SendRequest,
 };
 use serde_json::Value;
+/// OMP ACP 计划会话驱动（P3 主方案）。声明在这里而不是 mod.rs：适配器
+/// 归 pi_family 所有，mod.rs 只需 send_reserved 的 Own 分支条件与
+/// send_host_stream 的 "omp" 匹配臂两处路由改动。
+#[path = "omp_acp.rs"]
+pub(crate) mod omp_acp;
 
 /// 提取并规范化上下文窗口字段
 fn attach_context_window(mut usage: Value) -> Value {
@@ -240,6 +245,60 @@ pub fn omp() -> PiFamilyEngine {
     }
 }
 
+/// omp 的显式 plan 请求由 ACP 计划传输承接：mod.rs 据此把该次发送路由进
+/// send_host_stream 的 "omp" 臂（omp_acp::run_acp_turn），而不是普通
+/// rpc-ui 子进程。
+pub(crate) fn acp_plan_requested(req: &SendRequest) -> bool {
+    req.permission.as_deref() == Some("plan")
+}
+
+/// ACP 计划会话的启动命令：`omp --mode acp`（src/cli/flag-tables.ts:
+/// 123-127；`omp acp` 子命令等价，src/commands/acp.ts:30-33）。子进程由
+/// omp_acp 驱动 spawn，stdin/stdout 是 JSON-RPC 管道，所以这里没有
+/// stdin_payload，也不带 --extension ask 桥（ACP 的提问走 elicitation）。
+/// 模型/effort 经 ACP 协议（session/set_config_option model|thinking）
+/// 在握手后传入，不在 argv 上重复，保持用户选择不降级。
+fn build_omp_acp_plan_command(
+    req: &SendRequest,
+    mut cmd: tokio::process::Command,
+) -> Result<BuiltCommand, String> {
+    // 审批点（planModeState/proposal handler）是纯内存状态，session/load
+    // 不重注册（acp-agent.ts:670-736 vs 1844-1866）：恢复的会话没有可
+    // 核验的人工等待点，spawn 前受控拒绝。
+    if req.session_id.is_some() {
+        return Err(omp_acp::RESUME_REFUSAL.to_string());
+    }
+    // 操作电脑的 MCP 注入只针对 rpc 通道验证过；ACP 计划路径未验证，
+    // 受控拒绝而非静默降级。
+    if req.computer_use == Some(true) {
+        return Err(
+            "操作电脑与 OMP ACP 计划会话不兼容：.omp/mcp.json 注入未在 ACP 传输验证".to_string(),
+        );
+    }
+    cmd.args(["--mode", "acp"]);
+    // service-tier 没有 ACP 配置等价物，保持启动 flag（与 rpc 路径同一
+    // 校验与 gating：仅显式 openai-codex 选择器才传）。
+    if req.model.as_deref().is_some_and(|m| {
+        m.strip_prefix("openai-codex/")
+            .is_some_and(|id| !id.is_empty())
+    }) {
+        if let Some(tier) = req.service_tier.as_deref() {
+            if !matches!(tier, "default" | "priority") {
+                return Err("Invalid OMP OpenAI service tier".to_string());
+            }
+            cmd.args(["--service-tier", tier]);
+        }
+    }
+    Ok(BuiltCommand {
+        command: cmd,
+        stdin_payload: None,
+        keep_stdin_open: false,
+        cleanup_files: Vec::new(),
+        mcp_restore: None,
+        preassigned_session_id: None,
+    })
+}
+
 impl Engine for PiFamilyEngine {
     fn id(&self) -> &'static str {
         self.id
@@ -258,8 +317,10 @@ impl Engine for PiFamilyEngine {
         self.id == "omp"
     }
     /// omp exposes real approval switches (`--approval-mode`,
-    /// `--auto-approve`) plus a headless plan flow (`--plan-yolo`); pi 0.85
-    /// has none of them, so it keeps the trait default.
+    /// `--auto-approve`); pi 0.85 has none of them, so it keeps the trait
+    /// default. "plan" 由 OMP 原生 ACP 计划流程承接（plan_approval 的
+    /// Typed 声明 + omp_acp 驱动）；`--plan-yolo` 自动批准流程已移除，
+    /// 永远不会再作为"人工计划审批"入口回来（PRD §5-OMP.7）。
     ///
     /// `always-ask`/`write` are deliberately absent: they leave write/exec
     /// tools on a `prompt` policy, and print mode has no UI to answer with —
@@ -268,9 +329,28 @@ impl Engine for PiFamilyEngine {
     /// can be honored headlessly.
     fn supported_permissions(&self) -> &'static [&'static str] {
         if self.id == "omp" {
-            &["auto", "plan", "bypass"]
+            &["auto", "bypass", "plan"]
         } else {
             &["auto"]
+        }
+    }
+
+    /// OMP 的人工计划审批走原生 ACP 计划流程（session/set_mode plan +
+    /// elicitation.form 握手 + 计划文件全文，omp_acp 驱动）。pi 没有任何
+    /// 计划能力，静默回退到 auto 是被禁止的降级。旧的 `--plan-yolo`
+    /// 无头流程自动批准计划，永远不能再作为"人工计划审批"入口
+    /// （PRD §5-OMP.7）。
+    fn plan_approval(&self) -> crate::engine::plan_review::PlanApproval {
+        if self.id == "omp" {
+            crate::engine::plan_review::PlanApproval::Typed {
+                review_kind: crate::engine::plan_review::PlanReviewKind::NativeRequest,
+                evidence: "OMP 18.0.11 acp-agent.ts elicitation.form 握手 + 计划文件全文（行号见 P0）",
+                limitations: "ACP 反馈仅二值 Refine 信号无文本载体；审批点跨重启不可恢复；仅新会话可进入计划模式",
+            }
+        } else {
+            crate::engine::plan_review::PlanApproval::Unavailable {
+                reason: "pi exposes no plan mode; a plan request would silently degrade to auto",
+            }
         }
     }
 
@@ -298,6 +378,13 @@ impl Engine for PiFamilyEngine {
                 );
             }
             cmd.args(["--no-extensions", "--tools", &tools.join(",")]);
+        }
+        // OMP 原生 ACP 计划流程（PRD §5-OMP 主方案）：显式 plan 请求改走
+        // ACP 传输，omp_acp 驱动接管子进程（stdio JSON-RPC + elicitation
+        // 停车）。计划审批是用户决策——这条命令行绝不携带
+        // --plan-yolo/--plan-yolo-into/--auto-approve。
+        if self.id == "omp" && acp_plan_requested(req) {
+            return build_omp_acp_plan_command(req, cmd);
         }
         // pi 与 omp 都走 rpc:提问对话框以 extension_ui_request 帧到达、应答
         // 写回 stdin。omp 用 rpc-ui(hasUI 打开 CLI 内置 ask);pi 用 rpc 加
@@ -353,19 +440,10 @@ impl Engine for PiFamilyEngine {
             "bypass" => {
                 cmd.arg("--auto-approve");
             }
-            // omp's own documented headless plan flow: start read-only,
-            // auto-approve the plan on the model's first resolve call, then
-            // implement. `--plan-yolo-into` otherwise drops to the cheap
-            // "smol" role — pin it to the picked model so the implementation
-            // phase runs on the CLI the user actually selected.
-            "plan" => {
-                cmd.arg("--plan-yolo");
-                if let Some(model) = req.model.as_deref() {
-                    cmd.arg("--plan-yolo-into");
-                    cmd.arg(model);
-                }
-            }
-            // "auto": leave the CLI's own tools.approvalMode alone.
+            // "auto": leave the CLI's own tools.approvalMode alone. omp 的
+            // 显式 plan 请求已在上面改走 ACP 命令（build_omp_acp_plan_command
+            // 在 prepare_launch 的门禁之后），到不了这个 rpc 分支；pi 的
+            // plan 请求被 ensure_plan_approval 在构建命令前受控拒绝。
             _ => {}
         }
         if let Some(session_id) = req.session_id.as_deref() {
@@ -980,6 +1058,111 @@ fn parse_ui_request(value: &Value, out: &mut Vec<EngineEvent>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn plan_req(permission: Option<&str>) -> SendRequest {
+        SendRequest {
+            session_id: None,
+            workspace: std::path::PathBuf::from("/tmp/ccgui-pi-family-test"),
+            prompt: "规划一下".to_string(),
+            images: Vec::new(),
+            model: None,
+            effort: None,
+            service_tier: None,
+            permission: permission.map(str::to_string),
+            additional_dirs: Vec::new(),
+            provider_id: None,
+            computer_use: None,
+            allowed_tools: None,
+        }
+    }
+
+    fn argv_of(built: &BuiltCommand) -> Vec<String> {
+        built
+            .command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn omp_plan_capability_is_typed_and_pi_stays_unavailable() {
+        assert_eq!(omp().supported_permissions(), ["auto", "bypass", "plan"]);
+        assert_eq!(pi().supported_permissions(), ["auto"]);
+        let crate::engine::plan_review::PlanApproval::Typed {
+            review_kind,
+            limitations,
+            ..
+        } = omp().plan_approval()
+        else {
+            panic!("omp plan approval must be Typed once the ACP adapter is wired");
+        };
+        assert_eq!(
+            review_kind,
+            crate::engine::plan_review::PlanReviewKind::NativeRequest
+        );
+        // 限制说明必须向用户讲清：无文本反馈载体、审批点不可恢复、仅新会话。
+        assert!(limitations.contains("Refine"), "{limitations}");
+        assert!(matches!(
+            pi().plan_approval(),
+            crate::engine::plan_review::PlanApproval::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn acp_plan_requested_only_matches_explicit_plan() {
+        assert!(acp_plan_requested(&plan_req(Some("plan"))));
+        assert!(!acp_plan_requested(&plan_req(Some("auto"))));
+        assert!(!acp_plan_requested(&plan_req(Some("bypass"))));
+        assert!(!acp_plan_requested(&plan_req(None)));
+    }
+
+    #[test]
+    fn omp_plan_builds_the_acp_command_without_any_auto_approve_flag() {
+        let mut req = plan_req(Some("plan"));
+        req.model = Some("openai-codex/gpt-5.4".to_string());
+        req.service_tier = Some("priority".to_string());
+        let built = omp().build_command(&req, "fake-omp").unwrap();
+        let args = argv_of(&built);
+        // ACP 入口 flag（flag-tables.ts:123-127），stdin 由驱动接管。
+        let mode = args.iter().position(|arg| arg == "--mode").expect("--mode");
+        assert_eq!(args[mode + 1], "acp");
+        // 自动批准参数绝不出现在计划命令行（PRD §5-OMP.5）。
+        assert!(!args.contains(&"--plan-yolo".to_string()), "{args:?}");
+        assert!(!args.contains(&"--plan-yolo-into".to_string()), "{args:?}");
+        assert!(!args.contains(&"--auto-approve".to_string()), "{args:?}");
+        // rpc-ui 的 ask 桥不属于 ACP 传输。
+        assert!(!args.contains(&"--extension".to_string()), "{args:?}");
+        // 模型/effort 走 ACP 配置协议，不在 argv 上重复（不降级 smol）。
+        assert!(!args.contains(&"--model".to_string()), "{args:?}");
+        assert!(!args.contains(&"--thinking".to_string()), "{args:?}");
+        // service-tier 没有 ACP 等价物，保持启动 flag 且通过校验。
+        let tier = args
+            .iter()
+            .position(|arg| arg == "--service-tier")
+            .expect("--service-tier");
+        assert_eq!(args[tier + 1], "priority");
+        assert!(built.stdin_payload.is_none());
+        assert!(!built.keep_stdin_open);
+        // 非法 tier 与 rpc 路径同一校验。
+        req.service_tier = Some("flex".to_string());
+        assert!(omp().build_command(&req, "fake-omp").is_err());
+    }
+
+    #[test]
+    fn omp_plan_refuses_resume_and_computer_use_before_spawn() {
+        // 恢复的会话没有可核验的人工等待点（planModeState 纯内存）。
+        let mut req = plan_req(Some("plan"));
+        req.session_id = Some("01JOLD".to_string());
+        let error = omp().build_command(&req, "fake-omp").err().unwrap();
+        assert!(error.contains("全新会话"), "{error}");
+        // 操作电脑的 MCP 注入未在 ACP 传输验证。
+        let mut req = plan_req(Some("plan"));
+        req.computer_use = Some(true);
+        assert!(omp().build_command(&req, "fake-omp").is_err());
+        // auto/bypass 路径不受影响（回归护栏）。
+        assert!(omp().build_command(&plan_req(Some("auto")), "fake-omp").is_ok());
+    }
 
     #[test]
     fn message_end_reports_actual_thinking_effort() {

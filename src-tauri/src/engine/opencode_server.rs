@@ -11,6 +11,8 @@
 //! user's own `opencode serve`) is never touched.
 
 use std::process::Stdio;
+#[cfg(windows)]
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use serde_json::Value;
@@ -30,6 +32,12 @@ pub struct OpencodeServerState {
     origin: Mutex<Option<String>>,
     /// The child we spawned; `None` when adopted.
     spawned: Mutex<Option<Child>>,
+    /// Kill-on-close job owning the spawned tree. MUST live as long as the
+    /// server itself: dropping it (e.g. as a local in `ensure_server`) makes
+    /// the kernel sweep the freshly spawned tree the moment ensure returns,
+    /// so the session POST that follows hits a dead port.
+    #[cfg(windows)]
+    job: Mutex<Option<Arc<crate::engine::job::KillOnCloseJob>>>,
     /// Serializes ensure so concurrent sends never spawn twice.
     ensure: tokio::sync::Mutex<()>,
 }
@@ -49,6 +57,12 @@ impl OpencodeServerState {
                 crate::engine::kill_process_group(pid);
             }
             let _ = child.start_kill();
+        }
+        // Release the job last: closing the last handle sweeps any survivor
+        // of the tree, which is the same end state as the kills above.
+        #[cfg(windows)]
+        {
+            *lock(&self.job) = None;
         }
         *lock(&self.origin) = None;
     }
@@ -122,12 +136,18 @@ pub(crate) async fn ensure_server(
         format!("无法启动 opencode serve（{resolved}）：{e}。请确认已安装 opencode。")
     })?;
     #[cfg(windows)]
-    let _tree_guard = crate::engine::job::assign_kill_on_close(&child);
+    let tree_guard = crate::engine::job::assign_kill_on_close(&child);
 
     let deadline = Instant::now() + SPAWN_READY_TIMEOUT;
     loop {
         if healthy(&origin).await {
             *lock(&state.spawned) = Some(child);
+            // Hand the job guard to the server state: it must outlive this
+            // function. Dropping it here would sweep the tree immediately.
+            #[cfg(windows)]
+            {
+                *lock(&state.job) = tree_guard;
+            }
             *lock(&state.origin) = Some(origin.clone());
             return Ok(origin);
         }

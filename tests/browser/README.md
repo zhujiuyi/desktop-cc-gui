@@ -69,6 +69,29 @@ the totals summed. A cache-bearing turn is seeded too, so the summary row must
 read 累计 = 输入 + 输出 (输入 being the whole prompt side: fresh + cache). It
 also replays a live report (`usage://changed`) to show the page growing
 mid-turn. No app, no database, no saved state.
+Open `/tests/browser/plan-review.html` for the plan preview & approval UI:
+timeline cards in every lifecycle state (draft / awaiting / superseded /
+approved / expired) with accessible status text, the approval dock over the
+composer (three actions, exec-permission readout, no approve focus by
+default), and a long Markdown plan (Chinese, emoji, GFM table, code fences,
+超长文) both inline and in the full-preview side panel (Esc/backdrop close
+sends nothing). The store is seeded statically; no model, no backend, no
+saved conversation.
+
+Open `/tests/browser/split-layout.html` to check the conversation split view
+(Trellis-style tiling) against real layout: the real `SplitLayout`,
+`SplitDragProvider` and `ChatConversation` render one column first; dragging a
+sidebar session onto the right edge must create a second pane at the half-width
+divider (with its header and one divider, layout persisted in localStorage),
+「向下分屏」 must add an empty pane with the drag/new-chat hint, closing it must
+return to two panes, dragging a pane header onto another pane's center must swap
+their sessions, dragging a session tab from the real tab strip down into the
+conversation area must split there too (a horizontal drag inside the strip still
+reorders), dragging the divider must follow the pointer ratio and clamp at
+the 220px minimum pane, and closing down to one pane must return to the solo
+column and clear the stored layout. The chat store's `focusTab` and the git
+store's IPC actions are stubbed; no app, no backend, no model.
+
 Open `/tests/browser/collapsible-message.html` to check the long-message
 collapse: a user message taller than 480px clamps to 320px behind a bottom
 fade into the bubble fill with a centered chevron, the chevron toggles
@@ -156,8 +179,10 @@ as one dropdown row — no provider names in the DOM until it is opened — and
 the opened list must be height-capped (clientHeight ≤ 200 with a taller
 scrollHeight). The header's channel filter must narrow that list to the
 matching rows while holding it open, and a pick must clear the filter and
-close the list. The fixture drives the real CliMenu and reports PASS/FAIL
-with the measured heights. No app, no backend.
+close the list. With Claude first and Codex active, a focused channel pick
+must leave the Codex panel mounted and return focus to its channel trigger.
+The fixture drives the real CliMenu with controlled selection state and reports
+PASS/FAIL with measured heights and focus. No app, no backend.
 
 Open `/tests/browser/branch-picker.html` to check the changes-panel branch
 dropdown: filtering to `1.0.6` and clicking the `v1.0.6` row must run the
@@ -197,6 +222,15 @@ or staging it updates `lastAction` without touching a repository. Write a
 commit draft, switch to Files or collapse the sidebar, then return: the draft
 must survive, hidden rows must be removed, and the list must still scroll to
 the final file. The metrics output reports requests, mounted rows and actions.
+
+Open `/tests/browser/markdown-preview.html` to check the files-feature Markdown
+preview (Streamdown) against a document covering GFM tables, heading levels,
+lists, task list, blockquote, fenced code, KaTeX math and a Mermaid diagram:
+tables render with a bordered wrapper and styled header row, code blocks carry
+language header + copy/download controls with `files.markdown.*` labels, the
+block formula renders via KaTeX, and the Mermaid diagram stays an empty
+container until scrolled into view (IntersectionObserver lazy render), then
+draws the flow SVG. No app, no backend, no saved state.
 
 Open `/tests/browser/plugin-detail-rail.html` to check the plugin detail page
 at a desktop width (1145x731 in the verification run, with the app's 40px tab

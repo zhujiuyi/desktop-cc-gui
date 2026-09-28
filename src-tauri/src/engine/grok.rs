@@ -533,6 +533,21 @@ impl Engine for GrokEngine {
         &["bypass"]
     }
 
+    /// Grok ACP 的人工计划审批走 x.ai/toggle_plan_mode 进入、
+    /// x.ai/exit_plan_mode 扩展方法等待(1.0.40 二进制 strings 取证:方法名、
+    /// planFileContent/planFileUri/executePlan 字段名、awaiting_plan_approval
+    /// 状态与 resume re-park 均可确认)。但 P5 取证无法从二进制还原
+    /// ExitPlanModeExtResponse(2 字段)的字段名与批准/修改/放弃编码,也无法
+    /// 确认 toggle_plan_mode 进入计划模式的参数编码——没有实机抓报文就接线
+    /// 等于编造审批回复,故保持 Unavailable(fail-closed)。当前
+    /// supported_permissions 只有 bypass:显式 plan 请求若放行会被静默
+    /// 映射成 bypassPermissions——那是最坏的降级,必须受控拒绝。
+    fn plan_approval(&self) -> super::plan_review::PlanApproval {
+        super::plan_review::PlanApproval::Unavailable {
+            reason: "Grok plan review rides ACP x.ai/toggle_plan_mode + x.ai/exit_plan_mode (1.0.40 binary strings), but the ExitPlanModeExtResponse schema is not recoverable from the binary: its 2 field names (decision discriminant and feedback text) and the approve/revise/abandon encoding are unknown, and toggle_plan_mode's enter-plan-mode params encoding is unverified; wiring it without a live frame capture would fabricate the approval reply, and today a plan request would silently degrade to bypassPermissions",
+        }
+    }
+
     fn build_command(&self, req: &SendRequest, bin: &str) -> Result<BuiltCommand, String> {
         let mut cmd = command_for_binary(bin);
         cmd.arg("--output-format");
