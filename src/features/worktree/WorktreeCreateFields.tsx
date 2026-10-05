@@ -169,6 +169,9 @@ function PrPreviewCard({
               .filter(Boolean)
               .join(" · ")}
           </div>
+          <div className="text-caption-1-regular text-text-tertiary">
+            {t("worktree.prBranchSuffixHint")}
+          </div>
         </>
       )}
       {preview.branchConflict && (

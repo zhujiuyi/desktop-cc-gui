@@ -147,6 +147,40 @@ describe("worktree store", () => {
     expect(createMock).toHaveBeenLastCalledWith(state.pending[0].creationId, ARGS);
   });
 
+  it("retry after a name clash renames with a fresh 3-digit suffix", () => {
+    const id = startOne();
+    useWorktreeStore
+      .getState()
+      .applyProgress(progress(id, "failed", { errorKind: "branch_exists", error: "exists" }));
+
+    useWorktreeStore.getState().retry(id);
+
+    const row = useWorktreeStore.getState().pending[0];
+    expect(row.branch).toMatch(/^pr-1842-x-\d{3}$/);
+    expect(row.branch).not.toBe(ARGS.branch);
+    // 目录跟着分支名走，否则重试还会撞 dir_exists
+    expect(createMock).toHaveBeenLastCalledWith(
+      row.creationId,
+      expect.objectContaining({
+        branch: row.branch,
+        worktreePath: `/repo/app-worktrees/${row.branch}`,
+      }),
+    );
+  });
+
+  it("retry replaces an existing suffix instead of stacking a second one", () => {
+    const args = { ...ARGS, branch: "pr-1842-x-482", worktreePath: "/repo/app-worktrees/pr-1842-x-482" };
+    useWorktreeStore.getState().start(args, { parentPath: args.repoPath, openSessionAfter: true });
+    const id = useWorktreeStore.getState().pending.at(-1)!.creationId;
+    useWorktreeStore.getState().applyProgress(progress(id, "failed", { errorKind: "dir_exists" }));
+
+    useWorktreeStore.getState().retry(id);
+
+    const row = useWorktreeStore.getState().pending.at(-1)!;
+    expect(row.branch).toMatch(/^pr-1842-x-\d{3}$/);
+    expect(row.branch).not.toBe("pr-1842-x-482");
+  });
+
   it("retry on a still-running creation is a no-op", () => {
     const id = startOne();
     createMock.mockClear();

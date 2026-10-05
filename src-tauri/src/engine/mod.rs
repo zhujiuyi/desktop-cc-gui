@@ -1,6 +1,17 @@
 pub mod agy;
 pub mod claude;
 mod claude_channel;
+
+/// Claude 渠道下的实际模型名（opus/sonnet/haiku/fable 别名 → 渠道的槽位模型，
+/// `default` → 渠道默认）。后台复盘直接对渠道发 HTTP，需要和 spawn 用同一份
+/// 解析结果，否则会话里正常的别名到了复盘调用就成了未知模型。
+pub(crate) fn resolve_claude_channel_model(
+    selected: Option<&str>,
+    provider: &serde_json::Value,
+    env: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    claude_channel::resolve_model(selected, Some(provider), env)
+}
 pub mod codex;
 mod codex_app;
 mod codex_provider_env;
@@ -73,6 +84,9 @@ pub struct SendRequest {
     pub session_id: Option<String>,
     pub workspace: PathBuf,
     pub prompt: String,
+    /// True only for ccgui's intercepted `/compact`; a user-defined catalog
+    /// command with the same text remains an ordinary CLI prompt.
+    pub native_compact: bool,
     pub images: Vec<String>,
     pub model: Option<String>,
     /// Reasoning effort ("low" | "medium" | "high" | "xhigh" | "max" | "ultra"); engines without an
@@ -97,6 +111,11 @@ pub struct SendRequest {
     /// as an MCP server (see computer_use.rs). Engines without an
     /// MCP-config launch flag ignore it.
     pub computer_use: Option<bool>,
+    /// 记忆：把 `memory` MCP 工具（memory/mcp.rs）挂给本次会话，并绑定到这
+    /// 个 Bot 的账本。只在选中的 Bot 开启记忆、且引擎能挂 MCP 时由发送路径
+    /// 传入；引擎不能兑现时 prepare_launch 过滤掉（提示词里的记忆区块仍然
+    /// 注入，只是模型拿不到写入工具）。
+    pub memory_bot: Option<String>,
     /// 逐次调用的工具白名单（任务工作台只读节点）：引擎必须真正把它兑现
     /// 为运行时约束，否则 prepare_launch 直接拒绝——不允许用节点名假装。
     pub allowed_tools: Option<Vec<String>>,
@@ -175,6 +194,12 @@ pub trait Engine: Send + Sync {
     /// Whether the engine can hand the agent the app's computer-use driver
     /// (requires an MCP-server launch flag the CLI honors).
     fn supports_computer_use(&self) -> bool {
+        false
+    }
+    /// Whether the engine can mount the app's per-bot `memory` MCP server for
+    /// one launch. Same mechanism as computer use; a false answer means the
+    /// prompt block still carries MEMORY/USER but no tool claims to write.
+    fn supports_memory(&self) -> bool {
         false
     }
     /// Whether this engine supports reasoning effort configuration.
@@ -302,6 +327,9 @@ pub struct EngineInfo {
     /// Drives the composer's computer-use toggle: engines without an
     /// MCP-config launch flag cannot receive the driver.
     pub supports_computer_use: bool,
+    /// Whether the engine can mount the per-bot memory tool. The send path
+    /// reads it so a bot's memory guide only promises a tool that exists.
+    pub supports_memory: bool,
     /// Whether this engine supports reasoning effort configuration.
     pub supports_effort: bool,
     /// Whether this engine can enforce a per-call tool whitelist (mission
@@ -388,6 +416,7 @@ fn list_engines_blocking() -> Vec<EngineInfo> {
                     != Some(crate::config::DISABLED_PROVIDER_ID),
                 supports_images: engine.supports_images(),
                 supports_computer_use: engine.supports_computer_use(),
+                supports_memory: engine.supports_memory(),
                 supports_effort: engine.supports_effort(),
                 supports_tool_constraints: engine.supports_tool_constraints(),
                 permissions: engine
@@ -437,6 +466,7 @@ fn prepare_launch(
     workspace_path: &str,
     session_id: Option<String>,
     prompt: String,
+    native_compact: Option<bool>,
     image_paths: Option<Vec<String>>,
     model: Option<String>,
     effort: Option<String>,
@@ -444,6 +474,7 @@ fn prepare_launch(
     additional_dirs: Vec<String>,
     provider_id: Option<String>,
     computer_use: Option<bool>,
+    memory_bot: Option<String>,
     allowed_tools: Option<Vec<String>>,
     wsl: bool,
 ) -> Result<Launch, String> {
@@ -452,6 +483,12 @@ fn prepare_launch(
     // native CLI files remain the official configuration.
     crate::config::ensure_engine_enabled(engine)?;
     ensure_plan_approval(engine, engine_impl.as_ref(), permission.as_deref())?;
+    // 记忆工具注入的是本机 exe + 本机数据库,远端(WSL)CLI 拉不起来。
+    // 发送时提示词快照已经冻结(里面写着「用 memory 工具」),所以这里显式
+    // 拒绝,而不是挂一个起不来的服务器让模型自己发现工具不存在。
+    if wsl && memory_bot.as_deref().is_some_and(|id| !id.trim().is_empty()) {
+        return Err("记忆工具不支持远程工作区(WSL):注入的是本机程序".into());
+    }
     // 工具白名单是硬约束：引擎不能兑现就直接拒绝启动（不降级为无约束）。
     let allowed_tools = match allowed_tools {
         Some(tools) if !tools.is_empty() => {
@@ -497,6 +534,7 @@ fn prepare_launch(
         session_id: session_id.filter(|s| !s.trim().is_empty()),
         workspace: PathBuf::from(workspace_path),
         prompt,
+        native_compact: native_compact.unwrap_or(false) && engine == "omp",
         images: image_paths.unwrap_or_default(),
         model,
         effort,
@@ -517,6 +555,19 @@ fn prepare_launch(
         provider_id,
         // Only honored by engines that can actually mount the driver.
         computer_use: computer_use.filter(|on| *on && engine_impl.supports_computer_use()),
+        // Same rule for the memory tool: a bot id is only useful to an engine
+        // that can mount the server. Shape-checked (it becomes argv/env on the
+        // child) and capped like the run id.
+        memory_bot: memory_bot
+            .map(|id| id.trim().to_string())
+            .filter(|id| {
+                !id.is_empty()
+                    && id.len() <= 128
+                    && id
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+            })
+            .filter(|_| engine_impl.supports_memory()),
         allowed_tools,
     };
     let bin = engine_bin(&settings, engine);
@@ -578,6 +629,7 @@ pub async fn send_message(
     workspace_path: String,
     session_id: Option<String>,
     prompt: String,
+    native_compact: Option<bool>,
     image_paths: Option<Vec<String>>,
     model: Option<String>,
     effort: Option<String>,
@@ -585,6 +637,7 @@ pub async fn send_message(
     provider_id: Option<String>,
     run_id: Option<String>,
     computer_use: Option<bool>,
+    memory_bot: Option<String>,
 ) -> Result<SendResult, String> {
     send_message_inner(
         &state,
@@ -592,6 +645,7 @@ pub async fn send_message(
         workspace_path,
         session_id,
         prompt,
+        native_compact,
         image_paths,
         model,
         effort,
@@ -599,6 +653,7 @@ pub async fn send_message(
         provider_id,
         run_id,
         computer_use,
+        memory_bot,
     )
     .await
 }
@@ -635,11 +690,13 @@ pub(crate) async fn plugin_agent_send(
         session_id,
         prompt,
         None,
+        None,
         model,
         None,
         permission,
         provider_id,
         Some(run_id),
+        None,
         None,
         allowed_tools,
     )
@@ -694,11 +751,13 @@ pub(crate) async fn mission_agent_send(
         session_id,
         prompt,
         None,
+        None,
         model,
         effort,
         None,
         provider_id,
         Some(run_id),
+        None,
         None,
         allowed_tools,
     )
@@ -712,6 +771,7 @@ pub async fn send_message_inner(
     workspace_path: String,
     session_id: Option<String>,
     prompt: String,
+    native_compact: Option<bool>,
     image_paths: Option<Vec<String>>,
     model: Option<String>,
     effort: Option<String>,
@@ -719,6 +779,7 @@ pub async fn send_message_inner(
     provider_id: Option<String>,
     run_id: Option<String>,
     computer_use: Option<bool>,
+    memory_bot: Option<String>,
 ) -> Result<SendResult, String> {
     send_message_inner_with_sink(
         state,
@@ -727,6 +788,7 @@ pub async fn send_message_inner(
         workspace_path,
         session_id,
         prompt,
+        native_compact,
         image_paths,
         model,
         effort,
@@ -734,6 +796,7 @@ pub async fn send_message_inner(
         provider_id,
         run_id,
         computer_use,
+        memory_bot,
         None,
     )
     .await
@@ -747,6 +810,7 @@ async fn send_message_inner_with_sink(
     workspace_path: String,
     session_id: Option<String>,
     prompt: String,
+    native_compact: Option<bool>,
     image_paths: Option<Vec<String>>,
     model: Option<String>,
     effort: Option<String>,
@@ -754,6 +818,7 @@ async fn send_message_inner_with_sink(
     provider_id: Option<String>,
     run_id: Option<String>,
     computer_use: Option<bool>,
+    memory_bot: Option<String>,
     allowed_tools: Option<Vec<String>>,
 ) -> Result<SendResult, String> {
     let run_id = run_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -807,6 +872,7 @@ async fn send_message_inner_with_sink(
         workspace_path,
         session_id,
         prompt,
+        native_compact,
         image_paths,
         model,
         effort,
@@ -816,6 +882,7 @@ async fn send_message_inner_with_sink(
         killed,
         reader_abort,
         computer_use,
+        memory_bot,
         allowed_tools,
     )
     .await;
@@ -836,6 +903,7 @@ async fn send_reserved(
     workspace_path: String,
     session_id: Option<String>,
     prompt: String,
+    native_compact: Option<bool>,
     image_paths: Option<Vec<String>>,
     model: Option<String>,
     effort: Option<String>,
@@ -845,6 +913,7 @@ async fn send_reserved(
     killed: Arc<std::sync::atomic::AtomicBool>,
     reader_abort: Arc<std::sync::OnceLock<tokio::task::AbortHandle>>,
     computer_use: Option<bool>,
+    memory_bot: Option<String>,
     allowed_tools: Option<Vec<String>>,
 ) -> Result<SendResult, String> {
     // WSL 远程工作区:引擎进程经 ssh 在发行版内执行(见 wsl_transport)。
@@ -854,6 +923,7 @@ async fn send_reserved(
         &workspace_path,
         session_id,
         prompt,
+        native_compact,
         image_paths,
         model,
         effort,
@@ -864,6 +934,7 @@ async fn send_reserved(
         state.db.granted_roots().unwrap_or_default(),
         provider_id,
         computer_use,
+        memory_bot,
         allowed_tools,
         wsl_tp.is_some(),
     )?;
@@ -890,11 +961,11 @@ async fn send_reserved(
     }
     let (mut command, extra_cleanup, skip_local_cwd) = match &wsl_tp {
         Some(tp) => {
-            // 操作电脑注入的是本机 .omp/mcp.json 与本机 exe:WSL 远端 omp 都
-            // 用不上,先恢复再拒绝,不留下被改过的工作区文件。
+            // 注入的是本机 .omp/mcp.json 与本机 exe:WSL 远端 omp 都用不上,
+            // 先恢复再拒绝,不留下被改过的工作区文件。
             if let Some(restore) = &launch.built.mcp_restore {
                 restore.restore();
-                return Err("操作电脑不支持远程工作区(WSL):注入的是本机驱动".into());
+                return Err("操作电脑/记忆工具不支持远程工作区(WSL):注入的是本机程序".into());
             }
             // 依赖本机 staging 文件的引擎(grok 等 cleanup_files 非空):
             // 远端 CLI 读不到本机文件,直接拒绝而非跑出莫名其妙的失败;
@@ -1728,6 +1799,7 @@ mod permission_tests {
             session_id: None,
             workspace: PathBuf::from("/tmp"),
             prompt: "hi".to_string(),
+            native_compact: false,
             images: Vec::new(),
             model: None,
             effort: None,
@@ -1736,6 +1808,7 @@ mod permission_tests {
             additional_dirs: Vec::new(),
             provider_id: None,
             computer_use: None,
+            memory_bot: None,
             allowed_tools: None,
         }
     }
@@ -1870,6 +1943,81 @@ mod permission_tests {
     }
 
     #[test]
+    fn claude_memory_mounts_tool_mcp_and_preapproves_it() {
+        let mut request = req(None);
+        request.memory_bot = Some("bot-1".into());
+        let args = argv(&claude::ClaudeEngine::new(), &request);
+        let at = args
+            .iter()
+            .position(|a| a == "--mcp-config")
+            .unwrap_or_else(|| panic!("{args:?}"));
+        let config: Value =
+            serde_json::from_str(&args[at + 1]).expect("mcp config must be inline JSON");
+        let server = &config["mcpServers"]["ccgui-memory"];
+        assert_eq!(
+            server["args"],
+            serde_json::json!(["--memory-mcp", "--bot-id", "bot-1"])
+        );
+        // 单条 --allowedTools 前缀覆盖该服务器的全部工具。
+        let tools_at = args
+            .iter()
+            .position(|a| a == "--allowedTools")
+            .unwrap_or_else(|| panic!("{args:?}"));
+        assert!(
+            args[tools_at + 1..].contains(&"mcp__ccgui-memory".to_string()),
+            "{args:?}"
+        );
+        // 两个工具同时开启时合并进同一个 --mcp-config。
+        let mut both = request.clone();
+        both.computer_use = Some(true);
+        let args = argv(&claude::ClaudeEngine::new(), &both);
+        assert_eq!(
+            args.iter().filter(|a| *a == "--mcp-config").count(),
+            1,
+            "{args:?}"
+        );
+        let at = args.iter().position(|a| a == "--mcp-config").unwrap();
+        let config: Value = serde_json::from_str(&args[at + 1]).unwrap();
+        assert!(config["mcpServers"]["ccgui-memory"].is_object());
+        assert!(config["mcpServers"]["ccgui-computer"].is_object());
+        // 默认不挂：也没有任何 mcp__ 前缀被预批准。
+        let off = argv(&claude::ClaudeEngine::new(), &req(None));
+        assert!(!off.contains(&"--mcp-config".to_string()));
+        assert!(!off.iter().any(|a| a.starts_with("mcp__")));
+    }
+
+    #[test]
+    fn codex_memory_mounts_tool_mcp_through_process_overrides() {
+        let mut request = req(None);
+        request.memory_bot = Some("bot-1".into());
+        let built = codex::CodexEngine
+            .host_command(&request, "fake-bin")
+            .unwrap();
+        let args: Vec<String> = built
+            .command
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            args.iter()
+                .any(|a| a.starts_with("mcp_servers.ccgui-memory.command=")),
+            "{args:?}"
+        );
+        let args_value = args
+            .iter()
+            .find(|a| a.starts_with("mcp_servers.ccgui-memory.args="))
+            .unwrap_or_else(|| panic!("{args:?}"));
+        assert!(args_value.contains("--memory-mcp"), "{args_value}");
+        assert!(args_value.contains("\"bot-1\""), "{args_value}");
+        // 默认不挂。
+        let off = codex::CodexEngine.host_command(&req(None), "fake-bin").unwrap();
+        assert!(!off.command.as_std().get_args().any(|a| a
+            .to_string_lossy()
+            .contains("ccgui-memory")));
+    }
+
+    #[test]
     fn engine_info_exposes_computer_use_support_under_its_camel_case_key() {
         // The composer's /ccgui-cua gate reads `supportsComputerUse` off
         // list_engines; a rename (or a lost rename_all) would make the field
@@ -1881,12 +2029,14 @@ mod permission_tests {
             plan: PlanApproval::Legacy,
             supports_images: true,
             supports_computer_use: true,
+            supports_memory: true,
             supports_effort: true,
             supports_tool_constraints: false,
             permissions: vec!["auto".into()],
         };
         let json = serde_json::to_value(&info).expect("EngineInfo serializes");
         assert_eq!(json["supportsComputerUse"], serde_json::json!(true));
+        assert_eq!(json["supportsMemory"], serde_json::json!(true));
         assert!(json.get("supports_computer_use").is_none());
     }
 

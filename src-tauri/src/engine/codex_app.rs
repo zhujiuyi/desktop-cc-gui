@@ -1689,6 +1689,7 @@ pub(crate) async fn run_plan_decision(
         session_id: Some(thread_id.clone()),
         workspace: PathBuf::from(&review.workspace_path),
         prompt: spec.prompt,
+        native_compact: false,
         images: Vec::new(),
         // Settings inherit the thread's reported model/effort instead.
         model: None,
@@ -1698,6 +1699,7 @@ pub(crate) async fn run_plan_decision(
         additional_dirs: state.db.granted_roots().unwrap_or_default(),
         provider_id,
         computer_use: None,
+        memory_bot: None,
         allowed_tools: None,
     };
     let mut built = super::codex::CodexEngine.host_command(&req, &bin)?;
@@ -2027,6 +2029,7 @@ mod tests {
             session_id: None,
             workspace: workspace.clone(),
             prompt: "not sent".into(),
+            native_compact: false,
             images: vec![],
             model: Some("probe".into()),
             effort: None,
@@ -2035,6 +2038,7 @@ mod tests {
             additional_dirs: vec![],
             provider_id: None,
             computer_use: None,
+            memory_bot: None,
             allowed_tools: None,
         };
         assert!(crate::engine::codex::CodexEngine
@@ -2109,6 +2113,7 @@ mod tests {
             session_id: None,
             workspace: directory.clone(),
             prompt: "hi".into(),
+            native_compact: false,
             images: vec![],
             model: None,
             effort: None,
@@ -2117,6 +2122,7 @@ mod tests {
             additional_dirs: vec![],
             provider_id: None,
             computer_use: None,
+            memory_bot: None,
             allowed_tools: None,
         };
         let built = BuiltCommand {

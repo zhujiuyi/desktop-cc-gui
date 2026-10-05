@@ -43,10 +43,13 @@ vi.mock("@/lib/ipc", () => ({
 vi.mock("@/lib/transport", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/transport")>()),
   isWeb: false,
+  // Skills bypasses ipc; do not open a real WebSocket while rendering its rows.
+  invoke: vi.fn(async () => ({ skills: [], targets: [] })),
 }));
 
 import i18n from "@/lib/i18n";
-import { AgentsPromptsSection } from "./agents-prompts/AgentsPromptsSection";
+import { BotsPane } from "./agents-prompts/BotsPane";
+import { PromptsPane } from "./agents-prompts/PromptsPane";
 import { BetaFeaturesSection } from "./BetaFeaturesSection";
 import { builtinSearchEntries } from "./builtin-search";
 import { CliConfigBody } from "./CliConfigBody";
@@ -66,8 +69,8 @@ import { SkillsSection } from "@/features/skills/SkillsSection";
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT =
   true;
 
-// jsdom has no ResizeObserver; PillTabList (the Skills / 智能体与提示词 tab
-// strips) measures its selection thumb with one.
+// jsdom has no ResizeObserver; PillTabList (the Skills / 智能体 tab strips)
+// measures its selection thumb with one.
 class ResizeObserverStub {
   observe() {}
   unobserve() {}
@@ -141,7 +144,8 @@ const PAGES: PageSpec[] = [
   { page: "update", render: () => <UpdateSection /> },
   { page: "betaFeatures", render: () => <BetaFeaturesSection /> },
   { page: "diagnostics", render: () => <PerformanceDiagnosticsSection /> },
-  { page: "agentsPrompts", render: () => <AgentsPromptsSection /> },
+  { page: "agents", render: () => <BotsPane /> },
+  { page: "prompts", render: () => <PromptsPane /> },
   { page: "skills", render: () => <SkillsSection /> },
   { page: "workspaces", render: () => <WorkspacesSection /> },
   {

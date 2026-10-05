@@ -32,6 +32,14 @@ export function sessionKey(
     : `new:${engine}:${workspacePath}`;
 }
 
+/** `sessionKey` 待发键的逆：插件轮次（ctx.sessions.startRun）不占标签页，
+ *  会话事件里的工作区只能从路由键取（见 engine-events onSession）。非待发
+ *  键返回 ""，调用方继续走原来的回落。 */
+export function pendingWorkspaceOfKey(engine: string, key: string): string {
+  const prefix = `new:${engine}:`;
+  return key.startsWith(prefix) ? key.slice(prefix.length) : "";
+}
+
 /** Inverse of `sessionKey` for pending (never-sent) tabs. */
 export function parseDraftSessionKey(
   key: string,

@@ -3,8 +3,14 @@ import { useTranslation } from "react-i18next";
 import FolderInput from "lucide-react/dist/esm/icons/folder-input";
 import Loader2 from "lucide-react/dist/esm/icons/loader-2";
 import { Input } from "@/components/base/input/input";
+import { Select, SelectItem } from "@/components/base/select/select";
 import { CenteredSpinner } from "@/components/base/empty-state";
 import { PluginInstalledRow } from "./PluginInstalledRow";
+import {
+  filterInstalledPlugins,
+  INSTALLED_FILTERS,
+  type InstalledFilter,
+} from "./installed-filter";
 import { usePluginsStore } from "../manager/usePlugins";
 import { useMarketplaceStore } from "../marketplace/store";
 
@@ -15,6 +21,7 @@ export function PluginInstalledView({ onOpenDetail }: { onOpenDetail: (id: strin
     usePluginsStore();
   const fetchIndex = useMarketplaceStore((s) => s.fetchIndex);
   const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState<InstalledFilter>("all");
 
   useEffect(() => {
     void refresh();
@@ -30,14 +37,17 @@ export function PluginInstalledView({ onOpenDetail }: { onOpenDetail: (id: strin
 
   const filtered = useMemo(() => {
     const needle = query.trim().toLowerCase();
-    if (!needle) return installed;
-    return installed.filter((plugin) =>
-      [plugin.id, plugin.name, plugin.description, plugin.author]
-        .join("\n")
-        .toLowerCase()
-        .includes(needle),
-    );
-  }, [installed, query]);
+    const searched = !needle
+      ? installed
+      : installed.filter((plugin) =>
+          [plugin.id, plugin.name, plugin.description, plugin.author]
+            .join("\n")
+            .toLowerCase()
+            .includes(needle),
+        );
+    return filterInstalledPlugins(searched, filter);
+  }, [installed, query, filter]);
+  const filtering = query.trim().length > 0 || filter !== "all";
 
   return (
     <div className="flex w-full flex-col gap-4">
@@ -47,9 +57,23 @@ export function PluginInstalledView({ onOpenDetail }: { onOpenDetail: (id: strin
         </div>
       )}
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <h3 className="px-1 text-body-medium text-text-primary">
-          {t("plugins.hub.sectionInstalled")}
-        </h3>
+        <div className="flex flex-wrap items-center gap-2">
+          <h3 className="px-1 text-body-medium text-text-primary">
+            {t("plugins.hub.sectionInstalled")}
+          </h3>
+          <Select
+            aria-label={t("plugins.hub.installedFilter.label")}
+            selectedKey={filter}
+            onSelectionChange={(key) => setFilter(String(key) as InstalledFilter)}
+            triggerClassName="min-w-32"
+          >
+            {INSTALLED_FILTERS.map((option) => (
+              <SelectItem key={option} id={option}>
+                {t(`plugins.hub.installedFilter.${option}`)}
+              </SelectItem>
+            ))}
+          </Select>
+        </div>
         <Input
           value={query}
           onChange={setQuery}
@@ -84,9 +108,21 @@ export function PluginInstalledView({ onOpenDetail }: { onOpenDetail: (id: strin
             </button>
           </div>
         ) : (
-          <p className="px-4 py-10 text-center text-body-regular text-text-tertiary">
-            {t("plugins.hub.noMatch")}
-          </p>
+          <div className="flex flex-col items-center gap-3 px-4 py-12">
+            <p className="text-body-regular text-text-tertiary">{t("plugins.hub.noMatch")}</p>
+            {filtering && (
+              <button
+                type="button"
+                onClick={() => {
+                  setQuery("");
+                  setFilter("all");
+                }}
+                className="cursor-pointer rounded-lg bg-background-secondary-default px-3 py-1.5 text-body-2-medium text-text-primary transition-colors hover:bg-background-secondary-hover"
+              >
+                {t("plugins.hub.clearFilters")}
+              </button>
+            )}
+          </div>
         )}
       </div>
     </div>

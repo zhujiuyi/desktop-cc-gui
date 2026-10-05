@@ -233,6 +233,7 @@ mod channel_tests {
             session_id: None,
             workspace: std::env::temp_dir(),
             prompt: "ask".into(),
+            native_compact: false,
             images: vec![],
             model: Some("native-model".into()),
             effort: Some("medium".into()),
@@ -241,6 +242,7 @@ mod channel_tests {
             additional_dirs: vec![],
             provider_id: None,
             computer_use: None,
+            memory_bot: None,
             allowed_tools: None,
         };
         let built = KimiEngine.host_command(&req, "kimi").unwrap();
@@ -255,6 +257,7 @@ mod channel_tests {
             session_id: Some("existing-session".into()),
             workspace: std::env::temp_dir(),
             prompt: "routing probe".into(),
+            native_compact: false,
             images: vec![],
             model: Some("selected-model".into()),
             effort: None,
@@ -263,6 +266,7 @@ mod channel_tests {
             additional_dirs: vec![],
             provider_id: Some("plugin_model-switcher_probe".into()),
             computer_use: None,
+            memory_bot: None,
             allowed_tools: None,
         };
         let mut env = HashMap::from([

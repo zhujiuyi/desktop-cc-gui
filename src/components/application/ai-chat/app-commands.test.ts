@@ -67,18 +67,21 @@ describe("matchAppCommand", () => {
     expect(matchAppCommand("/new", null)).toBe("new");
   });
 
-  it("defers to a user-defined catalog command of the same name", () => {
+  it("defers to user-defined catalog commands of the same name", () => {
     useSlashCommandStore.setState({
       byRoot: {
         [WS]: {
-          entries: [{ name: "new", description: null, source: "workspace", kind: "command" }],
+          entries: [
+            { name: "new", description: null, source: "workspace", kind: "command" },
+            { name: "compact", description: null, source: "workspace", kind: "command" },
+          ],
           status: "ready",
           fetchedAt: Date.now(),
         },
       },
     });
     expect(matchAppCommand("/new", WS)).toBeNull();
-    expect(matchAppCommand("/compact", WS)).toBe("compact");
+    expect(matchAppCommand("/compact", WS)).toBeNull();
     expect(matchAppCommand("/mcp", WS)).toBe("mcp");
   });
 });
@@ -198,7 +201,12 @@ describe("compaction progress", () => {
       expect(useChatStore.getState().bySession[KEY]?.compaction).toMatchObject({ automatic: false });
     });
     expect(vi.mocked(ipc.sendMessage)).toHaveBeenCalledWith(
-      expect.objectContaining({ engine: "omp", sessionId: "s-1", prompt: "/compact" }),
+      expect.objectContaining({
+        engine: "omp",
+        sessionId: "s-1",
+        prompt: "/compact",
+        nativeCompact: true,
+      }),
     );
     // The store routes events by its own requested run id, not the mocked
     // response — replay the id sendMessage actually received.

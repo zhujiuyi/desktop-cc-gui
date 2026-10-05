@@ -17,7 +17,20 @@ vi.mock("./CommitFooter", () => ({
     <footer><textarea value={commitMsg} onChange={(event) => onCommitMsgChange(event.target.value)} /><button onClick={() => onCommitMsgChange("saved draft")}>write draft</button></footer>
   ),
 }));
-vi.mock("react-aria-components", () => ({ Focusable: ({ children }: { children: ReactNode }) => children }));
+vi.mock("react-aria-components", () => ({
+  Focusable: ({ children }: { children: ReactNode }) => children,
+  Checkbox: ({ children, isSelected, onChange, ...props }: any) => (
+    <label>
+      <input
+        type="checkbox"
+        checked={!!isSelected}
+        onChange={(e) => onChange?.(e.target.checked)}
+        aria-label={props["aria-label"]}
+      />
+      {typeof children === "function" ? children({ isSelected: !!isSelected, isIndeterminate: false }) : children}
+    </label>
+  ),
+}));
 vi.mock("@/components/base/tooltip/tooltip", () => ({
   Tooltip: ({ children }: { children: ReactNode }) => children,
   TooltipContent: () => null,
@@ -71,7 +84,7 @@ describe("ChangesPanel virtual rows", () => {
           branch: "main", ahead: 0, behind: 0,
           staged: [{ path: "staged.ts", status: "M" }],
           unstaged: Array.from({ length: 2000 }, (_, index) => ({ path: `file-${index}.ts`, status: "M" })),
-          untracked: [{ path: "new.ts", status: "??" }],
+          untracked: [{ path: "new.ts", status: "added" }],
         },
       },
       refresh: vi.fn().mockResolvedValue(undefined),

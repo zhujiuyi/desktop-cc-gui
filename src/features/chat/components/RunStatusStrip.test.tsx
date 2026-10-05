@@ -491,6 +491,8 @@ describe("RunStatusStrip", () => {
 
     // Settled over total: 1 running, 1 completed, 1 failed → 2/3.
     expect(pill("子代理").textContent).toContain("2/3");
+    // Real background tasks keep breathing after the parent stops streaming.
+    expect(pill("子代理").querySelector(".animate-ping")).not.toBeNull();
     await click(pill("子代理"));
     const panel = container.querySelector("[data-testid='run-status-subagents']")?.textContent;
     expect(panel).toContain("general-purpose");
@@ -766,10 +768,16 @@ describe("RunStatusStrip", () => {
     expect(pill("子代理").textContent).toContain("3/4");
     expect(container.querySelectorAll(".animate-ping").length).toBeGreaterThanOrEqual(2);
 
-    // When turn ends (streaming: false): breathing lights MUST turn off
+    // When turn ends (streaming: false): breathing lights MUST turn off.
+    // There is no live background task; the old message snapshot alone must
+    // not keep promising progress after the host stops speaking.
     await act(async () => seed(messages, false));
     expect(pill("任务").textContent).toContain("0/1");
-    expect(pill("子代理").textContent).toContain("4/4");
+    // Subagent D was explicitly reported as "running" by the hub snapshot.
+    // Settling the parent turn must NOT promote it to complete — it stays
+    // 3/4 until the hub reports a real completion. (Without this fix the
+    // pill would show 4/4 with the green tick the moment streaming flipped.)
+    expect(pill("子代理").textContent).toContain("3/4");
     expect(container.querySelector(".animate-ping")).toBeNull();
 
     // Inside panel: when not live, active item displays 待处理 instead of 运行中
@@ -777,6 +785,10 @@ describe("RunStatusStrip", () => {
     const todoPanel = container.querySelector("[data-testid='run-status-todos']")?.textContent;
     expect(todoPanel).toContain("待处理");
     expect(todoPanel).not.toContain("运行中");
+    await click(pill("子代理"));
+    const subagentPanel = container.querySelector("[data-testid='run-status-subagents']");
+    expect(subagentPanel?.querySelector(".animate-ping")).toBeNull();
+    expect(subagentPanel?.textContent).toContain("待处理");
   });
 
   it("reads completed todo snapshot from message.result without pre-set message.todos", async () => {

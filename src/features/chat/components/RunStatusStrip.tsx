@@ -498,14 +498,14 @@ function TodoRows({ items, live }: { items: TodoItem[]; live: boolean }) {
 /** One step's status text. The settled-without-success states reuse the
  *  background-task status keys so the report panel and the pill panel name
  *  the same state the same way. */
-function agentStatusText(t: TFunction, state: AgentTaskStepState): string {
+function agentStatusText(t: TFunction, state: AgentTaskStepState, live = true): string {
   if (state === "complete") return t("chat.agentStatusDone");
-  if (state === "active") return t("chat.agentStatusRunning");
+  if (state === "active") return live ? t("chat.agentStatusRunning") : t("chat.todoStatusPending");
   return t(`chat.tasks.status.${state}`);
 }
 /** One agent's full assignment, overlaid on the list inside the same panel:
  *  task briefs run long, and leaving the strip to read one loses the panel. */
-function SubagentDetail({ step, onBack }: { step: AgentTaskStep; onBack: () => void }) {
+function SubagentDetail({ step, live, onBack }: { step: AgentTaskStep; live: boolean; onBack: () => void }) {
   const { t } = useTranslation();
   // Settled steps step down so their name does not fight the status beside
   // it; a dead run (failed/interrupted) goes red, a stopped one gray.
@@ -555,7 +555,7 @@ function SubagentDetail({ step, onBack }: { step: AgentTaskStep; onBack: () => v
                   : "font-medium text-blue-500",
           )}
         >
-          {agentStatusText(t, step.state)}
+          {agentStatusText(t, step.state, live)}
         </span>
       </div>
       <pre className="max-h-52 overflow-y-auto rounded bg-background-secondary-default px-2 py-1.5 text-caption-1-medium break-words whitespace-pre-wrap text-text-secondary">
@@ -565,7 +565,7 @@ function SubagentDetail({ step, onBack }: { step: AgentTaskStep; onBack: () => v
   );
 }
 
-function SubagentRows({ steps }: { steps: AgentTaskStep[] }) {
+function SubagentRows({ steps, live }: { steps: AgentTaskStep[]; live: boolean }) {
   const { t } = useTranslation();
   // Open detail lives here, not in the strip: closing the panel unmounts this
   // component, so reopening always starts on the list.
@@ -591,7 +591,7 @@ function SubagentRows({ steps }: { steps: AgentTaskStep[] }) {
   const open = openKey ? steps.find((step) => step.key === openKey) : undefined;
   if (open) return (
     <div data-testid="run-status-subagents">
-      <SubagentDetail step={open} onBack={() => setOpenKey(null)} />
+      <SubagentDetail step={open} live={live} onBack={() => setOpenKey(null)} />
     </div>
   );
   return (
@@ -618,7 +618,7 @@ function SubagentRows({ steps }: { steps: AgentTaskStep[] }) {
                     <span className="grid size-3.5 place-items-center">
                       <span className="size-1.5 rounded-full bg-text-error-primary" />
                     </span>
-                  ) : stopped ? (
+                  ) : stopped || (!complete && !live) ? (
                     <span className="grid size-3.5 place-items-center">
                       <span className="size-1.5 rounded-full bg-foreground-icon-tertiary" />
                     </span>
@@ -655,7 +655,7 @@ function SubagentRows({ steps }: { steps: AgentTaskStep[] }) {
                           : "font-medium text-blue-500",
                   )}
                 >
-                  {agentStatusText(t, step.state)}
+                  {agentStatusText(t, step.state, live)}
                 </span>
               </button>
             </li>
@@ -717,6 +717,7 @@ function RunStatusPanel({
   perFile,
   total,
   live,
+  subagentsLive,
 }: {
   section: SectionId | null;
   steps: AgentTaskStep[];
@@ -725,6 +726,7 @@ function RunStatusPanel({
   perFile: Map<string, FileStat>;
   total: FileStat | null;
   live: boolean;
+  subagentsLive: boolean;
 }) {
   return (
     <div
@@ -738,7 +740,7 @@ function RunStatusPanel({
           role="tabpanel"
           className="mb-1.5 max-h-[min(40vh,280px)] overflow-y-auto rounded-md border border-dashed border-border-button-default bg-background-primary-default shadow-[0_8px_24px_rgba(0,0,0,0.08)]"
         >
-          {section === "subagent" && <SubagentRows steps={steps} />}
+          {section === "subagent" && <SubagentRows steps={steps} live={subagentsLive} />}
           {section === "todo" && <TodoRows items={todos} live={live} />}
           {section === "files" && (
             <FileRows files={files} perFile={perFile} total={total} live={live} />
@@ -758,6 +760,7 @@ function RunStatusPills({
   files,
   stats,
   streaming,
+  subagentsLive,
   onToggle,
 }: {
   section: SectionId | null;
@@ -766,6 +769,7 @@ function RunStatusPills({
   files: string[];
   stats: FileStat | null;
   streaming: boolean;
+  subagentsLive: boolean;
   onToggle: (id: SectionId) => void;
 }) {
   const { t } = useTranslation();
@@ -775,7 +779,7 @@ function RunStatusPills({
   const settledCount = steps.filter((step) => step.state !== "active").length;
   // "Still working" is the active state, not "not complete": a pill that keeps
   // breathing after a failure promises progress that is not coming.
-  const anyRunning = steps.some((step) => step.state === "active");
+  const anyRunning = subagentsLive && steps.some((step) => step.state === "active");
   const todosDone = todos.filter((item) => item.status === "complete").length;
   const todosRunning = streaming && todos.some((item) => item.status === "active");
   return (
@@ -850,6 +854,12 @@ export const RunStatusStrip = memo(function RunStatusStrip({
   const streaming = useChatStore((s) =>
     sessionKey ? (s.bySession[sessionKey]?.streaming ?? false) : false,
   );
+  const backgroundActive = useChatStore((s) =>
+    sessionKey ? (s.bySession[sessionKey]?.backgroundActive ?? false) : false,
+  );
+  // A message snapshot can remain unfinished after its process has settled;
+  // only a live turn or a running background task warrants animation.
+  const subagentsLive = streaming || backgroundActive;
   const allHistory = useMemo(
     () => (subagentHistory.length ? [...subagentHistory, ...messages] : messages),
     [subagentHistory, messages],
@@ -940,6 +950,7 @@ export const RunStatusStrip = memo(function RunStatusStrip({
         perFile={perFile}
         total={total}
         live={streaming}
+        subagentsLive={subagentsLive}
       />
       <div className="flex min-h-7 items-center gap-1.5">
         {chromeOpen ? (
@@ -950,6 +961,7 @@ export const RunStatusStrip = memo(function RunStatusStrip({
             files={files}
             stats={total}
             streaming={streaming}
+            subagentsLive={subagentsLive}
             onToggle={toggleSection}
           />
         ) : (

@@ -171,6 +171,7 @@ async fn send(
         prompt.to_string(),
         None,
         None,
+        None,
         (engine_id == "kimi").then(|| "medium".to_string()),
         Some(
             if engine_id == "kimi" {
@@ -182,6 +183,7 @@ async fn send(
         ),
         None,
         Some(run_id.to_string()),
+        None,
         None,
     )
     .await
@@ -423,12 +425,14 @@ async fn send_with_images(
         workspace.to_string_lossy().to_string(),
         None,
         prompt.to_string(),
+        None,
         Some(images),
         None,
         None,
         Some("bypass".to_string()),
         None,
         Some(run_id.to_string()),
+        None,
         None,
     )
     .await
@@ -504,11 +508,13 @@ async fn kimi_explicit_k3_256k_medium_official_channel() {
         None,
         PROMPT.into(),
         None,
+        None,
         Some("kimi-code/k3-256k".into()),
         Some("medium".into()),
         Some("auto".into()),
         Some("__local_settings_json__".into()),
         Some("run-kimi-explicit-model".into()),
+        None,
         None,
     )
     .await
@@ -607,11 +613,13 @@ async fn kimi_invalid_model_exposes_the_setup_error() {
         None,
         "do not run".into(),
         None,
+        None,
         Some("ccgui-nonexistent-model".into()),
         None,
         Some("auto".into()),
         Some("__local_settings_json__".into()),
         Some("run-kimi-invalid-model".into()),
+        None,
         None,
     )
     .await

@@ -845,6 +845,7 @@ mod tests {
             session_id: None,
             workspace: std::path::PathBuf::from("/tmp"),
             prompt: "测试提问".to_string(),
+            native_compact: false,
             images: Vec::new(),
             model: None,
             effort: None,
@@ -853,6 +854,7 @@ mod tests {
             additional_dirs: Vec::new(),
             provider_id: None,
             computer_use: None,
+            memory_bot: None,
             allowed_tools: None,
         };
         let turn = tokio::spawn(run_server_turn_with_probe_port(

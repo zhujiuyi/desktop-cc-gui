@@ -1,5 +1,5 @@
 pub mod agent_catalog;
-pub mod agents;
+pub mod bots;
 pub mod baidu_tongji;
 pub mod browser;
 pub mod cc_switch;
@@ -19,6 +19,7 @@ pub mod git;
 pub mod git_worktree;
 pub mod history;
 pub mod mcp;
+pub mod memory;
 pub mod metrics;
 pub mod mission;
 pub mod open_app;
@@ -80,6 +81,15 @@ pub fn run() {
         }
         return;
     }
+    // MCP server mode: engine CLIs spawn this binary as the per-bot memory
+    // tool (`--memory-mcp --bot-id <id>`, see engine/*). Same stdout rule.
+    if std::env::args().any(|arg| arg == "--memory-mcp") {
+        if let Err(error) = memory::mcp::serve_stdio() {
+            eprintln!("[memory] MCP server exited: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     engine::images::sweep_pasted_images();
     // Restore workspace .omp/mcp.json files left injected by a crash
     // (computer use writes them per send and restores on run exit).
@@ -134,9 +144,16 @@ pub fn run() {
                 eprintln!("[settings] legacy group import failed: {error}");
             }
 
-            if let Err(error) = agents::import_legacy_agents_once(&db) {
+            if let Err(error) = bots::import_legacy_app_agents_once(&db) {
                 // Same non-fatal rule: the `#` picker simply starts empty.
-                eprintln!("[agents] legacy agent import failed: {error}");
+                eprintln!("[bots] legacy agent import failed: {error}");
+            }
+            // v1 agents.json → bots/<id>/ (idempotent, keeps a .bak). Runs
+            // after the legacy-app import so both sources land in one pass.
+            match bots::migrate_agents_once(&db) {
+                Ok(0) => {}
+                Ok(count) => eprintln!("[bots] migrated {count} agent(s) to bots"),
+                Err(error) => eprintln!("[bots] agent→bot migration failed: {error}"),
             }
             if let Err(error) = prompts::import_legacy_prompts_once(&db) {
                 // Same non-fatal rule: the `!` picker simply starts empty.
@@ -235,6 +252,19 @@ pub fn run() {
                     };
                     if let Err(error) = relay::web_relay_start(handle, url, key).await {
                         eprintln!("[relay] autostart failed: {error}");
+                    }
+                });
+            }
+            // Web access autostart (设置 → 远程访问 → 内网访问: 随应用自动开启)
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let settings = settings::read_settings().unwrap_or_default();
+                    if settings.web_access_auto_start == Some(true) {
+                        match web::web_access_start(handle).await {
+                            Ok(info) => println!("[web] autostart: {}", info.url),
+                            Err(error) => eprintln!("[web] autostart failed: {error}"),
+                        }
                     }
                 });
             }
@@ -449,10 +479,20 @@ pub fn run() {
             // 创建插件 entry; idempotent per-engine install)
             creator_skill::creator_skill_install,
             // agents & prompts (composer `#`/`!` pickers)
-            agents::agent_list,
-            agents::agent_add,
-            agents::agent_update,
-            agents::agent_delete,
+            bots::bot_list,
+            bots::bot_create,
+            bots::bot_update,
+            bots::bot_delete,
+            bots::bot_duplicate,
+            // 记忆（设置 → 智能体 → 记忆页签）
+            memory::commands::memory_list,
+            memory::commands::memory_add,
+            memory::commands::memory_update,
+            memory::commands::memory_remove,
+            memory::commands::memory_clear,
+            memory::commands::memory_pending_approve,
+            memory::commands::memory_pending_reject,
+            memory::commands::memory_review,
             // built-in agent catalog (agency-agents pack)
             agent_catalog::list_built_in_agents,
             agent_catalog::set_built_in_agent_enabled,
@@ -520,6 +560,8 @@ pub fn run() {
             web::web_access_start,
             web::web_access_stop,
             web::web_access_status,
+            web::web_access_available_ips,
+            web::web_access_rotate_token,
             // Device rows: the bridge already dispatched these for phones,
             // but the desktop page invokes them over IPC too — without this
             // registration its list silently stayed empty.

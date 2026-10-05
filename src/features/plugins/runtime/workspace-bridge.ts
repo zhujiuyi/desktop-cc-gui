@@ -1,6 +1,7 @@
-import { ipc } from "@/lib/ipc";
+import { ipc, worktreeMetaOf } from "@/lib/ipc";
 import { dismissCenterSurfaces } from "@/features/chat/center-surfaces";
 import { useChatStore } from "@/features/chat/store";
+import type { PluginWorkspaceRow } from "@ccgui/plugin-sdk";
 
 /**
  * ctx.workspaces.add 的宿主实现：把任意路径登记为侧栏工作区（可选携带
@@ -17,6 +18,39 @@ import { useChatStore } from "@/features/chat/store";
  * `host:workspace:remote` 权限（requireRemotePermission 由 context.ts
  * 注入），不接受只有 host:workspace 的插件设置。
  */
+/**
+ * ctx.workspaces.list 的宿主实现：侧栏同一份 store 的只读快照。
+ *
+ * 刻意只投影契约里的字段——`meta` 是宿主/其它插件写入的私有载荷（如
+ * wsl 远程凭据指向），不进读接口；分组定义也不出（插件要的是展示与路径
+ * 解析，不是侧栏结构）。返回的是拷贝，插件改它动不到 store。
+ */
+export function listPluginWorkspaces(): PluginWorkspaceRow[] {
+  return useChatStore.getState().workspaces.map((workspace) => {
+    // worktree 子行另外投影出分支 / 来源 PR（meta.worktree 的公开部分）：插件
+    // 要用它把 PR 绑到本地 worktree（如 git-tasks 的 WORKTREE 列）。其余 meta
+    // （wsl 等宿主/其它插件的私有载荷）仍然不出。
+    const meta = worktreeMetaOf(workspace);
+    return {
+      id: workspace.id,
+      path: workspace.path,
+      name: workspace.name,
+      ...(workspace.kind ? { kind: workspace.kind } : {}),
+      groupId: workspace.groupId,
+      ...(workspace.parentId ? { parentId: workspace.parentId } : {}),
+      lastOpenedAt: workspace.lastOpenedAt,
+      ...(meta
+        ? {
+            worktree: {
+              branch: meta.branch,
+              ...(meta.prNumber != null ? { prNumber: meta.prNumber } : {}),
+            },
+          }
+        : {}),
+    };
+  });
+}
+
 export async function addPluginWorkspace(
   pluginId: string,
   path: string,

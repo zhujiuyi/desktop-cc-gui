@@ -1,7 +1,7 @@
 <!-- 由 src/features/plugins/skill/creator-skill-docs.ts 从源码生成，请勿手改。 -->
 <!-- 重新生成：pnpm plugin-skill:docs（测试 creator-skill-docs.test.ts 会断言本文件与源码一致）。 -->
 
-# CC GUI 插件 SDK 参考（SDK 0.3.15）
+# CC GUI 插件 SDK 参考（SDK 0.3.18）
 
 本文件由脚本从 `packages/plugin-sdk`（公共契约）与宿主运行时（权限门禁）派生，属于 `ccgui-plugin-creator` skill。
 字段、方法、权限以本文件为准：**文中没有的 API 一律视为不存在**，不要凭记忆猜测方法名或权限名。
@@ -71,9 +71,13 @@ export default function activate(ctx: PluginContext): void | (() => void) {
 | `ctx.events.emit` | `events` | — |
 | `ctx.composer.setDraft` | `composer:draft` | — |
 | `ctx.workspaces.add` | `host:workspace`（`host:workspace:remote` 按需） | — |
+| `ctx.workspaces.list` | `host:workspace` | 侧栏工作区快照（只读；权限 `host:workspace`，0.3.16 起）。 worktree 子行额外带 `worktree: { branch, prNumber? }` 只读投影 （0.3.17 起），用来把 PR 绑到本地 worktree；字段定义见 `PluginWorkspaceRow`，`meta` 本体仍不输出。 |
+| `ctx.worktrees.create` | `host:worktree` | — |
 | `ctx.sessions.selectSession` | `host:session` | — |
 | `ctx.sessions.refresh` | `host:session` | 请求宿主立即刷新会话目录（侧栏/标签页），0.3.7 起。 插件绕过宿主直写会话数据（如 sqlite custom_title、转录 title 行）后 调用——否则变更要等用户手动同步或下次常规刷新才可见。 |
 | `ctx.sessions.setEffort` | `host:session` | 修改已有会话的 effort 档位，0.3.10 起。直写宿主会话状态并持久化 （等价于用户在会话内切换档位，refreshSessions 不会回滚）。未知会话 或空 effort 以 rejection 失败——不会创建幽灵会话条目。 |
+| `ctx.sessions.startRun` | `host:session` | 把一个 AI 轮次跑成**宿主聊天会话**（0.3.18 起，权限 `host:session`）： 会话立刻出现在侧栏（带运行中状态，不需要手动同步），打开就是实时 流式输出；停止既能在聊天里点，也能用 `interruptRun`。会话挂在 `workspacePath` 工作区下，模型/强度/渠道只覆盖这一轮，不动用户的 全局默认。 与 `ctx.agent.start` 的分工：那个是插件自有的后台轮次（事件只回 插件，不进聊天）；这个就是「像用户自己发了一条」。需要用户看得见、 随时能接管/停止的轮次用本方法。 spawn 成功后 resolve `{ runId, sessionId }`（引擎稍后才 announce sessionId 时为 null）；轮次终止经 `plugin-run://<pluginId>` 事件回执： `{ runId, sessionId, engine, workspacePath, kind: "done" \| "error", error }`。 被用户/插件中断的轮次同样以 `done` 收尾。 |
+| `ctx.sessions.interruptRun` | `host:session` | 停止 `startRun` 起的轮次（等价于聊天里的停止按钮）。 |
 | `ctx.sessions.registerSource` | `host:session` | — |
 | `ctx.agent.catalog` | `agent` | — |
 | `ctx.agent.start` | `agent` | 启动一个 agent 轮次；返回的 runId 用于事件过滤与 interrupt。 |
@@ -178,12 +182,25 @@ composer: {
 
 ### ctx.workspaces
 
-工作区登记（权限 `host:workspace`，0.3.3 起）。把任意路径登记为侧栏 工作区——不要求本机存在该目录（如经 ssh 管理的远程机/WSL 发行版内 路径）。`meta` 透传存储在宿主工作区行上，形状由写入方与消费方约定。 `meta` 携带 `wsl` 键（远程工作区，宿主引擎经 ssh 把会话流量导到 meta.wsl 指定的主机与发行版）需要额外权限 `host:workspace:remote` （0.3.4 起）——这等效于出网 + 远程执行导向，远超登记一行侧栏数据。 信任权衡：远程通道首连采用 StrictHostKeyChecking=accept-new （首连自动记录 host key，之后变更才拒绝），插件作者应知晓这是 TOFU 而非严格 pinning。
+工作区登记与读取（权限 `host:workspace`，0.3.3 起； `list` 0.3.16 起）。把任意路径登记为侧栏工作区——不要求本机存在该 目录（如经 ssh 管理的远程机/WSL 发行版内路径）。`meta` 透传存储在 宿主工作区行上，形状由写入方与消费方约定。 `list` 返回侧栏当前的工作区行（含 worktree 子行，`kind` 区分）。它是 *只读快照**：不含 `meta`（远程/其它插件写入的私有载荷）、不含分组 定义，只给插件做「按本机工作区解析仓库/路径」这类用途。需要跟随宿主 变更时重新调用，宿主不为插件广播工作区变更事件。 `meta` 携带 `wsl` 键（远程工作区，宿主引擎经 ssh 把会话流量导到 meta.wsl 指定的主机与发行版）需要额外权限 `host:workspace:remote` （0.3.4 起）——这等效于出网 + 远程执行导向，远超登记一行侧栏数据。 信任权衡：远程通道首连采用 StrictHostKeyChecking=accept-new （首连自动记录 host key，之后变更才拒绝），插件作者应知晓这是 TOFU 而非严格 pinning。
 
 ```ts
 workspaces: {
   /** 权限：host:workspace、host:workspace:remote */
   add(path: string, meta?: Record<string, unknown>): Promise<void>;
+  /** 权限：host:workspace */
+  list(): Promise<PluginWorkspaceRow[]>;
+}
+```
+
+### ctx.worktrees
+
+Worktree 创建（权限 `host:worktree`，0.3.17 起）：经宿主「新建 Worktree」 管线（validate → fetch → add → register）创建，宿主侧栏出现同一份进度 行与取消/重试语义；成功后 worktree 以 `kind="worktree"` 登记进侧栏 （父行是 `parentWorkspaceId` 对应的工作区），resolve 已注册的路径。 `prNumber` 存在时 fetch `pull/<n>/head` 再检出；`existingBranch` 表示 `branch` 是已存在的本地分支（检出而非新建）。路径缺省 = 宿主默认布局 `<仓库同级>/<仓库名>-worktrees/<branch>`。 失败/取消以 `Error` reject，message 形如 `"<errorKind>: <detail>"` （kind 与宿主错误分类一致：not_a_repo / invalid_branch / branch_not_found / branch_exists / branch_checked_out / dir_exists / pr_not_found / fetch_failed / register_failed / sparse_checkout_empty / canceled / unknown），插件据此给用户可读文案。
+
+```ts
+worktrees: {
+  /** 权限：host:worktree */
+  create(def: { repoPath: string; parentWorkspaceId: string; branch: string; baseRef?: string | null; prNumber?: number | null; prTitle?: string | null; prUrl?: string | null; existingBranch?: boolean }): Promise<{ worktreePath: string }>;
 }
 ```
 
@@ -199,6 +216,10 @@ sessions: {
   refresh(): Promise<void>;
   /** 权限：host:session */
   setEffort(engine: string, sessionId: string, workspacePath: string, effort: string): Promise<void>;
+  /** 权限：host:session */
+  startRun(def: { engine: string; prompt: string; workspacePath: string; model?: string | null; effort?: string | null; providerId?: string | null }): Promise<{ runId: string; sessionId: string | null }>;
+  /** 权限：host:session */
+  interruptRun(def: { engine: string; workspacePath: string; sessionId?: string | null }): Promise<void>;
   /** 权限：host:session */
   registerSource(def: { id: string; list(): Promise<ExternalSessionRow[]> }): Disposer;
 }
@@ -274,9 +295,10 @@ ctx.react: typeof React; // Shared host React instance: external bundles can't r
 | `events` | `ctx.events.on`、`ctx.events.emit` |
 | `network:none` | — |
 | `composer:draft` | `ctx.composer.setDraft` |
-| `host:session` | `ctx.sessions.selectSession`、`ctx.sessions.refresh`、`ctx.sessions.setEffort`、`ctx.sessions.registerSource` |
-| `host:workspace` | `ctx.workspaces.add` |
+| `host:session` | `ctx.sessions.selectSession`、`ctx.sessions.refresh`、`ctx.sessions.setEffort`、`ctx.sessions.startRun`、`ctx.sessions.interruptRun`、`ctx.sessions.registerSource` |
+| `host:workspace` | `ctx.workspaces.add`、`ctx.workspaces.list` |
 | `host:workspace:remote` | `ctx.workspaces.add` |
+| `host:worktree` | `ctx.worktrees.create` |
 
 ### network: / exec: 授权形状
 

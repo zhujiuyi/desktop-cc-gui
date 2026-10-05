@@ -8,6 +8,7 @@ import {
   type WorktreeErrorKind,
 } from "@/lib/ipc";
 import { listen } from "@/lib/transport";
+import { randomBranchSuffix, sanitizeDirName } from "./pr-input";
 
 /** 进行中的创建阶段（后端 validate/fetch/add/register）之外，前端只关心
  *  「还在跑」；failed/canceled 是终态，行保留到用户关闭。 */
@@ -31,6 +32,25 @@ interface WorktreePrefs {
   /** 上次自定义的位置（null = 用默认 <repo>-worktrees 布局）。 */
   location: string | null;
   openSessionAfter: boolean;
+}
+
+/** 撞名失败的重试：把末尾三位随机后缀换一个新值（目录还指向旧名字时同步换），
+ *  否则「重试」会拿同一个名字再撞一次，永远出不来。只针对 branch_exists /
+ *  dir_exists——其它失败原因的参数原样重放。 */
+function renameOnConflict(entry: PendingCreation): PendingCreation {
+  const kind = entry.errorKind;
+  if (kind !== "branch_exists" && kind !== "dir_exists") return entry;
+  const base = entry.args.branch.replace(/-\d{3}$/, "");
+  let branch = `${base}-${randomBranchSuffix()}`;
+  while (branch === entry.args.branch) branch = `${base}-${randomBranchSuffix()}`;
+  const oldDir = sanitizeDirName(entry.args.branch);
+  const nextPath =
+    entry.args.worktreePath && entry.args.worktreePath.endsWith(oldDir)
+      ? entry.args.worktreePath.slice(0, entry.args.worktreePath.length - oldDir.length) +
+        sanitizeDirName(branch)
+      : entry.args.worktreePath;
+  // 顶层 branch 是侧栏行显示的名字，必须跟着 args 一起换。
+  return { ...entry, branch, args: { ...entry.args, branch, worktreePath: nextPath } };
 }
 
 const PREFS_KEY = "ccgui-next.worktreePrefs:v1";
@@ -84,8 +104,9 @@ interface WorktreeStore {
     deleteBranch: boolean;
   }) => void;
   /** 创建完成后的后续动作（刷新工作区列表/开新会话）。对话框提交即返回，
-   *  后续的 git 进度全靠事件驱动。 */
-  start: (args: WorktreeCreateArgs, opts: { parentPath: string; openSessionAfter: boolean }) => void;
+   *  后续的 git 进度全靠事件驱动。返回本次创建的 creationId：进度事件、
+   *  取消与终态都以它为准（插件 bridge 据此等待注册完成）。 */
+  start: (args: WorktreeCreateArgs, opts: { parentPath: string; openSessionAfter: boolean }) => string;
   cancel: (creationId: string) => void;
   retry: (creationId: string) => void;
   dismiss: (creationId: string) => void;
@@ -186,8 +207,9 @@ export const useWorktreeStore = create<WorktreeStore>((set, get) => {
     },
 
     start: (args, opts) => {
+      const creationId = newCreationId();
       launch({
-        creationId: newCreationId(),
+        creationId,
         parentWorkspaceId: args.parentWorkspaceId,
         parentPath: opts.parentPath,
         branch: args.branch,
@@ -195,6 +217,7 @@ export const useWorktreeStore = create<WorktreeStore>((set, get) => {
         args,
         openSessionAfter: opts.openSessionAfter,
       });
+      return creationId;
     },
 
     cancel: (creationId) => {
@@ -205,7 +228,8 @@ export const useWorktreeStore = create<WorktreeStore>((set, get) => {
       const failed = get().pending.find((p) => p.creationId === creationId);
       if (!failed || (failed.stage !== "failed" && failed.stage !== "canceled")) return;
       set((s) => ({ pending: s.pending.filter((p) => p.creationId !== creationId) }));
-      launch({ ...failed, creationId: newCreationId(), stage: "validate", errorKind: undefined, error: undefined });
+      const next = renameOnConflict(failed);
+      launch({ ...next, creationId: newCreationId(), stage: "validate", errorKind: undefined, error: undefined });
     },
 
     dismiss: (creationId) => {

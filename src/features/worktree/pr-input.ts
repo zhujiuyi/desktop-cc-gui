@@ -36,9 +36,22 @@ export function slugifyTitle(title: string): string {
     .join("-");
 }
 
-export function suggestPrBranch(prNumber: number, prTitle?: string | null): string {
+/** 三位随机后缀（100–999）。本地残留的同名分支/目录会让「从 PR 创建」反复
+ *  失败（branch_exists / dir_exists），所以默认建议名带一个随机后缀。随机值
+ *  由调用方持有：同一次对话框内必须保持不变，否则每次重算都换名字，PR 解析
+ *  会在两个 key 之间来回打转。 */
+export function randomBranchSuffix(): string {
+  return String(Math.floor(Math.random() * 900) + 100);
+}
+
+export function suggestPrBranch(
+  prNumber: number,
+  prTitle?: string | null,
+  suffix?: string,
+): string {
   const slug = prTitle ? slugifyTitle(prTitle) : "";
-  return slug ? `pr-${prNumber}-${slug}` : `pr-${prNumber}`;
+  const base = slug ? `pr-${prNumber}-${slug}` : `pr-${prNumber}`;
+  return suffix ? `${base}-${suffix}` : base;
 }
 /** Frontend sanity check matching git check-ref-format's common failures; the
  *  backend remains the final gate (it emits invalid_branch). */

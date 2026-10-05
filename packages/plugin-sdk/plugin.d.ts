@@ -6,7 +6,7 @@
  * 插件仓用法（包未发布 npm 前的过渡方案）：复制本文件为插件仓的
  * `src/ccgui-plugin.d.ts`，首行版本戳必须与所用宿主 SDK 一致。
  *
- * @ccgui/plugin-sdk v0.3.15
+ * @ccgui/plugin-sdk v0.3.18
  */
 
 /** 宿主实现的 SDK 契约版本。 */
@@ -29,7 +29,32 @@ export interface PluginAgentCatalogEntry {
   available: boolean;
   readOnly: boolean;
   providers: { id: string; label: string }[];
-  models: { id: string; label: string }[];
+  /** 引擎当前可用模型。provider 是模型所属渠道 id（与 providers[].id 对齐，
+   *  0.3.18 起），插件可据此分组；label 已是显示名。 */
+  models: { id: string; label: string; provider?: string }[];
+  /** 该引擎支持的推理强度档位（滑块顺序；空数组 = 不支持配置）。 */
+  efforts: string[];
+}
+
+/** 侧栏工作区行(ctx.workspaces.list())。刻意不含 meta:那是宿主与其它插件
+ *  写入的私有载荷,读接口只给展示与路径解析需要的字段。 */
+export interface PluginWorkspaceRow {
+  id: string;
+  /** 本机绝对路径(远程/WSL 工作区的路径在本机不存在,但字符串原样可用)。 */
+  path: string;
+  /** 侧栏显示名(目录名或用户重命名后的名字)。 */
+  name: string;
+  /** "worktree" = git worktree 子行;undefined = 普通工作区。 */
+  kind?: "worktree";
+  /** 侧栏分组 id;null = 未分组。 */
+  groupId: string | null;
+  /** 父工作区 id;仅 kind="worktree" 时存在。 */
+  parentId?: string;
+  /** 上次打开时间(Unix 毫秒);从未打开为 null。 */
+  lastOpenedAt: number | null;
+  /** worktree 子行的只读投影(0.3.17 起):分支名与来源 PR 编号。kind 为
+   *  "worktree" 时存在;meta 里的其它私有载荷(如 wsl)仍然不出。 */
+  worktree?: { branch: string; prNumber?: number };
 }
 
 /** 信任层级（ADR-1）：declarative = 零 JS 声明式。 */
@@ -281,6 +306,10 @@ export interface PluginContext {
    *  路径)。meta 透传存储在宿主工作区行上(如 { wsl: { hostId, distro } }),
    *  会话/文件等宿主能力按需消费;形状由写入方与消费方约定。
    *
+   *  list 返回侧栏当前的工作区行(含 worktree 子行,kind 区分),是只读快照:
+   *  不含 meta、不含分组定义。需要跟随变更时重新调用,宿主不为插件广播
+   *  工作区变更事件。
+   *
    *  meta 携带 `wsl` 键(远程工作区,宿主引擎经 ssh 把会话流量导到
    *  meta.wsl 指定的主机与发行版)需要额外权限 `host:workspace:remote`
    *  (0.3.4 起)——这等效于出网 + 远程执行导向,远超登记一行侧栏数据。
@@ -289,6 +318,42 @@ export interface PluginContext {
    *  TOFU 而非严格 pinning。 */
   workspaces: {
     add(path: string, meta?: Record<string, unknown>): Promise<void>;
+    /** 侧栏工作区快照(只读;权限 host:workspace,0.3.16 起)。worktree 子行
+     *  额外带 worktree: { branch, prNumber? } 只读投影(0.3.17 起),用来把
+     *  PR 绑到本地 worktree;meta 本体仍不输出。 */
+    list(): Promise<PluginWorkspaceRow[]>;
+  };
+  /** Worktree 创建(权限 host:worktree,0.3.17 起):经宿主「新建 Worktree」
+   *  管线(validate → fetch → add → register)创建,宿主侧栏出现同一份进度
+   *  行与取消/重试语义;成功后 worktree 以 kind="worktree" 登记进侧栏
+   *  (父行是 parentWorkspaceId 对应的工作区),resolve 已注册的路径。
+   *
+   *  prNumber 存在时 fetch pull/<n>/head 再检出;existingBranch 表示
+   *  branch 是已存在的本地分支(检出而非新建)。路径缺省 = 宿主默认布局
+   *  <仓库同级>/<仓库名>-worktrees/<branch>。
+   *
+   *  失败/取消以 Error reject,message 形如 "<errorKind>: <detail>"
+   *  (kind 与宿主错误分类一致:not_a_repo / invalid_branch /
+   *  branch_not_found / branch_exists / branch_checked_out / dir_exists /
+   *  pr_not_found / fetch_failed / register_failed / sparse_checkout_empty /
+   *  canceled / unknown),插件据此给用户可读文案。 */
+  worktrees: {
+    create(def: {
+      /** 本地仓库路径(父工作区目录,必须是 git 仓库)。 */
+      repoPath: string;
+      /** 侧栏父工作区 id:新 worktree 作为子行挂在它下面。 */
+      parentWorkspaceId: string;
+      /** 新 worktree 检出的分支名。 */
+      branch: string;
+      /** 新建分支时的起点;缺省 = 仓库 HEAD。 */
+      baseRef?: string | null;
+      /** 从 PR 创建:fetch pull/<n>/head 到 branch。 */
+      prNumber?: number | null;
+      prTitle?: string | null;
+      prUrl?: string | null;
+      /** true = branch 是已存在的本地分支(检出而非新建)。 */
+      existingBranch?: boolean;
+    }): Promise<{ worktreePath: string }>;
   };
   /** 会话打开 + 外部会话源(权限 host:session;selectSession 0.3.3 起,
    *  registerSource 0.3.4 起)。registerSource:登记异步会话源,宿主在会话
@@ -305,6 +370,37 @@ export interface PluginContext {
      *  （等价于用户在会话内切换档位，refreshSessions 不会回滚）。未知会话
      *  或空 effort 以 rejection 失败——不会创建幽灵会话条目。 */
     setEffort(engine: string, sessionId: string, workspacePath: string, effort: string): Promise<void>;
+    /** 把一个 AI 轮次跑成**宿主聊天会话**(0.3.18 起,权限 host:session):
+     *  会话立刻出现在侧栏(带运行中状态,不需要手动同步),打开就是实时流式
+     *  输出;停止既能在聊天里点,也能用 interruptRun。会话挂在 workspacePath
+     *  工作区下,模型/强度/渠道只覆盖这一轮,不动用户的全局默认。
+     *
+     *  与 ctx.agent.start 的分工:那个是插件自有的后台轮次(事件只回插件,
+     *  不进聊天);这个就是「像用户自己发了一条」。需要用户看得见、随时
+     *  能接管/停止的轮次用本方法。
+     *
+     *  spawn 成功后 resolve { runId, sessionId }(引擎稍后才 announce
+     *  sessionId 时为 null);轮次终止经 plugin-run://<pluginId> 事件回执:
+     *  { runId, sessionId, engine, workspacePath, kind: "done" | "error", error }。
+     *  被用户/插件中断的轮次同样以 done 收尾。 */
+    startRun(def: {
+      engine: string;
+      prompt: string;
+      /** 会话所属工作区路径(如某个 worktree)。 */
+      workspacePath: string;
+      /** 本轮模型 id(ctx.agent.catalog 的 models[].id)。 */
+      model?: string | null;
+      /** 本轮推理强度(catalog 的 efforts 里的一档)。 */
+      effort?: string | null;
+      /** 本轮渠道 id(catalog 的 providers[].id)。 */
+      providerId?: string | null;
+    }): Promise<{ runId: string; sessionId: string | null }>;
+    /** 停止 startRun 起的轮次(等价于聊天里的停止按钮)。 */
+    interruptRun(def: {
+      engine: string;
+      workspacePath: string;
+      sessionId?: string | null;
+    }): Promise<void>;
     registerSource(def: {
       /** 源 id,插件内唯一;同 id 重复登记覆盖(热重载语义)。 */
       id: string;

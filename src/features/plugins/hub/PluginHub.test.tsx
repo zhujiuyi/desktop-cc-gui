@@ -76,6 +76,15 @@ class ResizeObserverStub {
 }
 vi.stubGlobal("ResizeObserver", ResizeObserverStub);
 
+// jsdom lacks CSS.escape, which react-aria's listbox calls when the 已安装筛选
+// Select opens (useSelectableCollection). The ids here are plain words, so a
+// minimal polyfill suffices (same guard as font-settings.test.tsx).
+if (typeof window.CSS === "undefined" || typeof window.CSS.escape !== "function") {
+  const css = (window.CSS ?? {}) as { escape?: (value: string) => string };
+  css.escape = (value: string) => value.replace(/[^a-zA-Z0-9_-]/g, (ch) => `\\${ch}`);
+  window.CSS = css as typeof CSS;
+}
+
 const DOWNLOADS = 47;
 const UPDATED_AT = "2026-09-20T08:30:00Z";
 
@@ -111,7 +120,8 @@ function installedPlugin(overrides: Partial<PluginInfo> & { id: string }): Plugi
     quarantined: false,
     lastError: null,
     permissions: ["storage"],
-    installedAt: 1_700_000_000_000,
+    // Unix 秒：与 backend 的 plugins.json 同单位（毫秒值会被当成未来时间）。
+    installedAt: 1_700_000_000,
     minAppVersion: "1.0.2",
     icon: null,
     screenshots: [],
@@ -139,6 +149,28 @@ function buttonContaining(text: string): HTMLButtonElement {
   );
   if (!button) throw new Error(`button containing ${text} not found`);
   return button;
+}
+
+/** react-aria pairs pointerdown + click when PointerEvent exists and the
+ *  mousedown/up pair otherwise; dispatching the whole sequence keeps presses
+ *  working regardless of the jsdom code path (same pattern as
+ *  font-settings.test.tsx). */
+async function press(el: Element) {
+  await act(async () => {
+    for (const type of ["pointerdown", "mousedown", "mouseup", "click"]) {
+      el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true }));
+    }
+  });
+}
+
+/** Open the 已安装页头的筛选 Select and pick the option with the given text. */
+async function selectInstalledFilter(optionText: string) {
+  await press(buttonByLabel(i18n.t("plugins.hub.installedFilter.label")));
+  const option = [...document.body.querySelectorAll<HTMLElement>('[role="option"]')].find(
+    (el) => el.textContent?.trim() === optionText,
+  );
+  if (!option) throw new Error(`option not rendered: ${optionText}`);
+  await press(option);
 }
 
 describe("PluginHub", () => {
@@ -526,6 +558,73 @@ describe("PluginHub", () => {
 
     // No stamp means no row — the rail never shows a placeholder date.
     expect(document.body.textContent).not.toContain(i18n.t("plugins.hub.updatedAt"));
+  });
+
+  it("filters installed plugins by source and recency from the header select", async () => {
+    usePluginHubStore.setState({ view: "installed" });
+    // installedAt 是 Unix 秒，和 backend 同单位。
+    const nowSecs = Math.floor(Date.now() / 1000);
+    pluginList.mockImplementation(async () => [
+      installedPlugin({
+        id: "auto-title",
+        name: "会话自动命名",
+        source: "marketplace",
+        installedAt: nowSecs - 3600,
+      }),
+      installedPlugin({
+        id: "kimi-lb",
+        name: "Kimi LB",
+        source: "local",
+        installedAt: nowSecs - 20 * 24 * 3600,
+      }),
+      installedPlugin({
+        id: "git-tasks",
+        name: "Git 任务管理",
+        source: "local",
+        installedAt: nowSecs - 3600,
+      }),
+    ]);
+    await render();
+    // refresh() runs in an effect; flush the mocked IPC round-trip.
+    await act(async () => {});
+
+    const shows = (name: string) => document.body.textContent?.includes(name) ?? false;
+    expect(shows("会话自动命名")).toBe(true);
+    expect(shows("Kimi LB")).toBe(true);
+    expect(shows("Git 任务管理")).toBe(true);
+
+    // 最近安装：只留 3 天窗口内的，20 天前的本地插件出局。
+    await selectInstalledFilter(i18n.t("plugins.hub.installedFilter.recent"));
+    expect(shows("会话自动命名")).toBe(true);
+    expect(shows("Git 任务管理")).toBe(true);
+    expect(shows("Kimi LB")).toBe(false);
+
+    // 市场安装：来源为 marketplace 的只剩一个。
+    await selectInstalledFilter(i18n.t("plugins.hub.installedFilter.marketplace"));
+    expect(shows("会话自动命名")).toBe(true);
+    expect(shows("Git 任务管理")).toBe(false);
+
+    // 本地安装 + 搜索无命中：空状态把搜索框与下拉一起复位。
+    await selectInstalledFilter(i18n.t("plugins.hub.installedFilter.local"));
+    const search = document.body.querySelector<HTMLInputElement>(
+      `input[placeholder="${i18n.t("plugins.hub.searchPlaceholder")}"]`,
+    )!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(
+        search,
+        "not-a-plugin",
+      );
+      search.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    expect(document.body.textContent).toContain(i18n.t("plugins.hub.noMatch"));
+    await act(async () => {
+      buttonByText(i18n.t("plugins.hub.clearFilters")).dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+    });
+    expect(shows("会话自动命名")).toBe(true);
+    expect(shows("Kimi LB")).toBe(true);
+    expect(shows("Git 任务管理")).toBe(true);
   });
 
   it("manages installed plugins: uninstall confirmation and quarantine retry", async () => {

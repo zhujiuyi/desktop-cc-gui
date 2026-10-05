@@ -1,4 +1,5 @@
 import type { PluginAgentCatalogEntry } from "@ccgui/plugin-sdk";
+import { EFFORT_LEVELS, supportsEffort } from "@/components/application/ai-chat/effort-levels";
 import type { ipc } from "@/lib/ipc";
 import { providerEntries, PSEUDO_LOCAL, type EngineId } from "@/features/settings/providers";
 
@@ -33,7 +34,15 @@ export async function buildAgentCatalog(
         ...providerEntries(engine.id as EngineId, config[engine.id as EngineId])
           .map((entry) => ({ id: entry.id, label: entry.name })),
       ],
-      models: (catalog?.models ?? []).map((model) => ({ id: model.id, label: model.name || model.id })),
+      // provider 一并给出，插件才能像宿主选择器一样按渠道分组；其余字段
+      // （description 等）不进插件目录（见 agent-catalog.test 的不泄露断言）。
+      models: (catalog?.models ?? []).map((model) => ({
+        id: model.id,
+        label: model.name || model.id,
+        provider: model.provider,
+      })),
+      // 引擎支持时给完整推理强度档位（滑块顺序），不支持则为空。
+      efforts: supportsEffort(engine.id, engines) ? [...EFFORT_LEVELS] : [],
     };
   }));
 }

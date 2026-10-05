@@ -76,9 +76,12 @@ describe("agent catalog", () => {
     const source = backend();
     const result = await buildAgentCatalog(source, "/workspace", (key) => key);
     expect(result.map((entry) => entry.engine)).toEqual(["codex", "pi"]);
+    // provider 随模型一并给出（选择器要按渠道分组）；description 等其余
+    // 字段不进插件目录（下面的 SECRET 断言守住这条边界）。
     expect(result[0]).toEqual({ engine: "codex", label: "settings.engines.codex", available: true, readOnly: false,
       providers: [{ id: "__local_settings_json__", label: "settings.cliOfficial" }, { id: "custom", label: "Display" }],
-      models: [{ id: "model", label: "Model" }] });
+      models: [{ id: "model", label: "Model", provider: "hidden" }],
+      efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] });
     expect(result[1]).toMatchObject({ available: false, readOnly: true, models: [] });
     expect(JSON.stringify(result)).not.toContain("SECRET");
     expect(source.listEngineModels).toHaveBeenCalledExactlyOnceWith("codex", "/workspace");

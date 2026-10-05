@@ -96,6 +96,10 @@ pub struct SessionFile {
 }
 
 pub fn stat_signature(path: &Path) -> Option<(i64, i64)> {
+    // OpenCode ≥1.18 keeps every session in one SQLite file; the virtual
+    // address below carries the session id, so stat the shared database.
+    let target = split_opencode_db_path(path).map(|(db, _)| db);
+    let path = target.as_deref().unwrap_or(path);
     let meta = std::fs::metadata(path).ok()?;
     let mtime_ms = meta
         .modified()
@@ -104,6 +108,33 @@ pub fn stat_signature(path: &Path) -> Option<(i64, i64)> {
         .ok()?
         .as_millis() as i64;
     Some((meta.len() as i64, mtime_ms))
+}
+
+/// Separator between the OpenCode SQLite database path and the session id in
+/// a history row's `file_path`. The record separator is illegal in filenames
+/// on Windows and vanishingly rare elsewhere, so it cannot collide with a
+/// real on-disk path — the virtual address is never opened directly.
+const OPENCODE_DB_SEP: char = '\u{1f}';
+
+/// Virtual history address for one SQLite-backed OpenCode session:
+/// `<…/opencode.db>\u{1f}<sessionId>`. Keeps the path-keyed scan/read/delete
+/// pipeline working while the transcript itself lives in one shared db.
+pub(crate) fn opencode_db_session_path(db: &Path, session_id: &str) -> PathBuf {
+    let mut address = db.to_string_lossy().into_owned();
+    address.push(OPENCODE_DB_SEP);
+    address.push_str(session_id);
+    PathBuf::from(address)
+}
+
+/// Split a virtual address back into `(db_path, session_id)`. None for every
+/// real on-disk path (the OpenCode storage-tree layout included).
+pub(crate) fn split_opencode_db_path(path: &Path) -> Option<(PathBuf, String)> {
+    let text = path.to_str()?;
+    let (db, session_id) = text.split_once(OPENCODE_DB_SEP)?;
+    if db.is_empty() || session_id.is_empty() {
+        return None;
+    }
+    Some((PathBuf::from(db), session_id.to_string()))
 }
 
 /// &str entry point: skips the `Value::String` wrapper allocation the
@@ -292,6 +323,36 @@ pub(crate) fn slash_command_display(text: &str) -> Option<String> {
     } else {
         format!("{name} {args}")
     })
+}
+
+/// The turn is nothing but the command tags. Extra typed text stays a real
+/// user message even when it mentions the tags.
+pub(crate) fn slash_command_envelope_only(text: &str) -> bool {
+    if slash_command_display(text).is_none() {
+        return false;
+    }
+    let mut rest = text.to_string();
+    for tag in ["command-message", "command-name", "command-args"] {
+        rest = strip_one_tag_pair(&rest, tag);
+    }
+    rest.trim().is_empty()
+}
+
+fn strip_one_tag_pair(text: &str, tag: &str) -> String {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let Some(start) = text.find(&open) else {
+        return text.to_string();
+    };
+    let after = start + open.len();
+    let Some(rel) = text[after..].find(&close) else {
+        return text.to_string();
+    };
+    let end = after + rel + close.len();
+    let mut out = String::with_capacity(text.len() - (end - start));
+    out.push_str(&text[..start]);
+    out.push_str(&text[end..]);
+    out
 }
 
 /// Body of the first `<tag>…</tag>` pair, trimmed. None when absent or
@@ -557,6 +618,17 @@ mod tests {
     fn clean_keeps_typed_body_mentioning_one_command_tag() {
         let text = "帮我看看 <command-name> 这个标签是什么意思";
         assert_eq!(clean_user_turn(text), text);
+    }
+
+    #[test]
+    fn envelope_only_requires_both_command_tags() {
+        let text = "<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args></command-args>";
+        assert!(slash_command_envelope_only(text));
+        assert!(!slash_command_envelope_only(
+            "帮我看看 <command-name> 这个标签是什么意思"
+        ));
+        let with_tail = format!("{text}\n然后再看看这个报错");
+        assert!(!slash_command_envelope_only(&with_tail));
     }
 
     #[test]

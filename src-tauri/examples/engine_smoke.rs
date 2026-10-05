@@ -33,6 +33,7 @@ async fn run_one(engine_id: &str, workspace: &PathBuf) -> Result<(), String> {
         session_id: None,
         workspace: workspace.clone(),
         prompt: "Reply with exactly: ok".to_string(),
+        native_compact: false,
         images: Vec::new(),
         model: None,
         effort: None,

@@ -4,6 +4,7 @@ import {
   defaultWorktreePath,
   dirNameOf,
   isPlausibleBranchName,
+  randomBranchSuffix,
   joinPath,
   parentDirOf,
   parsePrInput,
@@ -56,6 +57,22 @@ describe("suggestPrBranch", () => {
     expect(suggestPrBranch(1842, "修复")).toBe("pr-1842");
     expect(suggestPrBranch(1842, null)).toBe("pr-1842");
     expect(suggestPrBranch(1842)).toBe("pr-1842");
+  });
+
+  it("keeps the three-digit suffix at the end (avoids stale local branch clashes)", () => {
+    expect(suggestPrBranch(1842, "Add worktree support for parallel review", "482")).toBe(
+      "pr-1842-add-worktree-support-for-482",
+    );
+    expect(suggestPrBranch(1842, "修复", "007")).toBe("pr-1842-007");
+    expect(suggestPrBranch(1842, null, "119")).toBe("pr-1842-119");
+  });
+});
+
+describe("randomBranchSuffix", () => {
+  it("is always three digits, never a leading zero", () => {
+    for (let i = 0; i < 200; i += 1) {
+      expect(randomBranchSuffix()).toMatch(/^[1-9]\d{2}$/);
+    }
   });
 });
 
