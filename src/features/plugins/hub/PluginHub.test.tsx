@@ -1,9 +1,10 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { MarketPlugin, PluginInfo, PluginUpdate } from "@/lib/ipc";
+import type { FeaturedPlugin, MarketPlugin, PluginInfo, PluginUpdate } from "@/lib/ipc";
 
 const pluginFetchIndex = vi.fn(async (_force?: boolean): Promise<MarketPlugin[]> => []);
+const pluginFetchFeatured = vi.fn(async (_force?: boolean): Promise<FeaturedPlugin[]> => []);
 const pluginCheckUpdates = vi.fn(async (): Promise<PluginUpdate[]> => []);
 const pluginFetchMarketReadme = vi.fn(
   async (_id: string): Promise<string> => "# React Doctor\n\n一键运行代码体检。",
@@ -22,6 +23,7 @@ const pluginReadArtwork = vi.fn(
 vi.mock("@/lib/ipc", () => ({
   ipc: {
     pluginFetchIndex: (force?: boolean) => pluginFetchIndex(force),
+    pluginFetchFeatured: (force?: boolean) => pluginFetchFeatured(force),
     pluginFetchMarketReadme: (id: string) => pluginFetchMarketReadme(id),
     pluginCheckUpdates: () => pluginCheckUpdates(),
     pluginList: () => pluginList(),
@@ -185,6 +187,7 @@ describe("PluginHub", () => {
     usePluginsStore.setState({ installed: [], loaded: true, error: null, installing: null });
     useMarketplaceStore.setState({
       entries: [],
+      featured: [],
       loaded: true,
       error: null,
       updates: [],
@@ -209,6 +212,36 @@ describe("PluginHub", () => {
       root!.render(<PluginHub />);
     });
   }
+
+  it("renders the featured carousel above the table with the editorial copy", async () => {
+    pluginFetchFeatured.mockImplementation(async () => [
+      { id: "react-doctor", tagline: "一条命令给项目做体检", note: "发版前跑一次", image: null },
+    ]);
+
+    await render();
+
+    const body = document.body.textContent ?? "";
+    expect(body).toContain(i18n.t("plugins.hub.spotlight"));
+    expect(body).toContain("一条命令给项目做体检");
+    // 轮播在表格之前：推荐位是编辑层，表格仍是精确查找的入口。
+    const carousel = document.body.querySelector('[aria-roledescription="carousel"]');
+    const table = document.body.querySelector("table");
+    expect(carousel).not.toBeNull();
+    expect(table).not.toBeNull();
+    expect(
+      carousel!.compareDocumentPosition(table!) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("hides the carousel when the featured file is unavailable", async () => {
+    pluginFetchFeatured.mockRejectedValue(new Error("404"));
+
+    await render();
+
+    expect(document.body.querySelector('[aria-roledescription="carousel"]')).toBeNull();
+    // 表格照常：装饰数据拿不到不影响浏览与安装
+    expect(document.body.textContent).toContain("React Doctor");
+  });
 
   it("browses the market table: column headers, counted chips, install from the row", async () => {
     await render();

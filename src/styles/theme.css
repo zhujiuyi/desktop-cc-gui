@@ -130,6 +130,16 @@
   @keyframes refresh-spin {
     to { transform: rotate(360deg); }
   }
+
+  /* 编辑精选轮播的进度条：跑满一圈就是“换下一张”，所以**它就是计时器**
+   * （animationend 触发翻页，悬停暂停时条与翻页同时冻结）。
+   * 用 scaleX 而不是 width：不每帧触发布局。见 docs/ui-ux-spec.zh-CN.md §3
+   * 的「编辑精选轮播」规则。 */
+  --animate-spotlight-progress: spotlight-progress 6s linear forwards;
+  @keyframes spotlight-progress {
+    from { transform: scaleX(0); }
+    to { transform: scaleX(1); }
+  }
 }
 
 /* ---------------------------------------------------------------------------

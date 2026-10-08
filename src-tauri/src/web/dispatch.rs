@@ -1300,6 +1300,7 @@ pub(super) async fn dispatch(
         // Marketplace browsing is read-only too, so the web client renders
         // the market page; plugin_install_from_marketplace stays desktop-only.
         "plugin_fetch_index" => ser(crate::plugins::market::plugin_fetch_index(false).await),
+        "plugin_fetch_featured" => ser(crate::plugins::market::plugin_fetch_featured(false).await),
         "plugin_fetch_market_readme" => {
             let a: PluginIdArgs = parse_args(&raw)?;
             ser(crate::plugins::market::plugin_fetch_market_readme(a.id).await)

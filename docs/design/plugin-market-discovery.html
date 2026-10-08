@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="zh-CN" class="mk">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>插件市场 · 精选与发现流（三套方案）</title>
+<!--
+  交互设计稿（不是产品代码）。三套方案共用：同一份索引数据、同一套视觉 token、
+  同一个表格与状态语言；差异只在「精选区 + 信息架构」。
+
+  打开方式：直接双击本文件（纯静态，无构建、无网络请求）。
+  预览开关在顶部评审栏：深色 / 封面缺失 / 精选拉取失败 / 窄窗口 / 减少动效。
+-->
+<link rel="stylesheet" href="./plugin-market-discovery.css" />
+</head>
+<body>
+
+<!-- ============================================================ 评审栏 -->
+<header class="review">
+  <div class="review__lead">
+    <span class="review__kicker">design review · v1</span>
+    <h1>插件市场 · 精选与发现流</h1>
+    <p>三个方案回答同一个问题：插件从 18 个长到 180 个时，首屏靠什么帮用户发现好东西。表格与精选数据是上方索引的线上快照，封面直连插件仓库里的真图。</p>
+  </div>
+
+  <div class="review__ctrl">
+    <div class="seg" role="tablist" aria-label="方案">
+      <button type="button" role="tab" data-scheme="A" aria-selected="true">A · Spotlight 轮播</button>
+      <button type="button" role="tab" data-scheme="B" aria-selected="false">B · 编辑精选拼图</button>
+      <button type="button" role="tab" data-scheme="C" aria-selected="false">C · 合集发现流</button>
+    </div>
+
+    <div class="seg" role="group" aria-label="精选素材">
+      <button type="button" data-art="concept" aria-pressed="false">概念图</button>
+      <button type="button" data-art="real" aria-pressed="true">真图 · 框内</button>
+      <button type="button" data-art="cover" aria-pressed="false">真图 · 满铺</button>
+    </div>
+
+    <div class="toggles" role="group" aria-label="预览开关">
+      <span class="toggles__label">预览</span>
+      <button type="button" class="tg" data-toggle="dark" aria-pressed="false"></button>
+      <button type="button" class="tg" data-toggle="missing" aria-pressed="false">封面缺失</button>
+      <button type="button" class="tg" data-toggle="offline" aria-pressed="false">精选拉取失败</button>
+      <button type="button" class="tg" data-toggle="narrow" aria-pressed="false">窄窗口 900</button>
+      <button type="button" class="tg" data-toggle="reduced" aria-pressed="false">减少动效</button>
+    </div>
+
+    <button type="button" class="review__link" data-action="compare">取舍对比 ↗</button>
+  </div>
+</header>
+<p class="review__hint">按 <kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> 切换方案 · <kbd>←</kbd> <kbd>→</kbd> 在轮播获得焦点时翻页 · 悬停精选区会暂停自动播放 · 素材三种模式可随时切</p>
+
+<!-- ============================================================ 方案说明 -->
+<section class="note" id="note" aria-live="polite"></section>
+
+<!-- ============================================================ 应用框架 -->
+<div class="stage">
+  <div class="app" id="app">
+    <div class="app__chrome">
+      <div class="traffic" aria-hidden="true"><i></i><i></i><i></i></div>
+      <h2 class="app__title">插件</h2>
+      <div class="pilltabs" role="tablist" aria-label="插件视图">
+        <button type="button" role="tab" class="pillt is-selected" aria-selected="true">市场</button>
+        <button type="button" role="tab" class="pillt" aria-selected="false">已安装</button>
+      </div>
+      <div class="app__actions">
+        <button type="button" class="ghostbtn" data-static>创建插件</button>
+        <button type="button" class="ghostbtn" data-static>从本地目录安装</button>
+        <button type="button" class="ghostbtn" data-static>插件开发指南</button>
+      </div>
+    </div>
+
+    <div class="app__scroll">
+      <!-- ---------------------------------------------- 方案 A -->
+      <section class="view" data-view="A">
+        <div class="placeholder" data-placeholder></div>
+
+        <div class="hero" id="hero" role="group" aria-roledescription="carousel" aria-label="编辑精选" tabindex="0">
+          <div class="hero__track" id="hero-track"></div>
+          <div class="hero__chrome">
+            <div class="hero__bars" id="hero-bars" role="tablist" aria-label="精选条目"></div>
+            <span class="hero__count" id="hero-count">1 / 5</span>
+            <div class="hero__nav">
+              <button type="button" class="round" data-hero="prev" aria-label="上一条精选" title="上一条精选"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg></button>
+              <button type="button" class="round" data-hero="next" aria-label="下一条精选" title="下一条精选"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg></button>
+            </div>
+          </div>
+        </div>
+
+        <div class="toolbar" data-toolbar></div>
+        <div class="table-card" data-table></div>
+        <p class="hint">安装量来自索引统计，包含更新次数。<span class="hint__sep">精选与筛选互不干扰：推荐位不参与过滤，表格始终是完整索引。</span></p>
+      </section>
+
+      <!-- ---------------------------------------------- 方案 B -->
+      <section class="view" data-view="B" hidden>
+        <div class="placeholder" data-placeholder></div>
+
+        <div class="sechead">
+          <div>
+            <h3>编辑精选</h3>
+            <p class="sechead__sub" data-featured-count></p>
+          </div>
+          <button type="button" class="linkbtn" data-static>查看全部精选</button>
+        </div>
+        <div class="bento" id="bento"></div>
+        <div class="expander" id="bento-more">
+          <div class="expander__clip"><div class="expander__pad"><div class="bento__grid" id="bento-grid"></div></div></div>
+        </div>
+        <button type="button" class="morebtn" id="bento-toggle" aria-expanded="false" aria-controls="bento-more"></button>
+
+        <div class="toolbar" data-toolbar></div>
+        <div class="table-card" data-table></div>
+        <p class="hint">安装量来自索引统计，包含更新次数。</p>
+      </section>
+
+      <!-- ---------------------------------------------- 方案 C -->
+      <section class="view" data-view="C" hidden>
+        <div class="placeholder" data-placeholder></div>
+        <div id="rails" class="rails" aria-label="精选合集"></div>
+
+        <div class="sechead sechead--sticky">
+          <div class="sechead__inline">
+            <h3>全部插件</h3>
+            <span class="sechead__count" data-total></span>
+          </div>
+          <div class="toolbar toolbar--bare" data-toolbar></div>
+        </div>
+        <div class="table-card" data-table></div>
+        <p class="hint">安装量来自索引统计，包含更新次数。<span class="hint__sep">合集是「逛」的入口，表格是「找」的入口：两者读同一份索引。</span></p>
+      </section>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+  </div>
+</div>
+
+<!-- ============================================================ 取舍对比 -->
+<aside class="drawer" id="drawer" hidden>
+  <div class="drawer__head">
+    <div>
+      <span class="review__kicker">decision sheet</span>
+      <h2>三方案取舍对比</h2>
+    </div>
+    <button type="button" class="round round--dark" data-action="compare" aria-label="关闭对比" title="关闭对比">✕</button>
+  </div>
+
+  <table class="compare">
+    <thead>
+      <tr><th>维度</th><th>A · 轮播</th><th>B · 拼图</th><th>C · 合集流</th></tr>
+    </thead>
+    <tbody>
+      <tr><th>首屏精选可见数</th><td class="weak">1（其余靠轮播）</td><td>4 常驻 + 4 展开</td><td class="good">5 + 2 层横向</td></tr>
+      <tr><th>是否需要自动播放</th><td class="weak">需要，否则一半内容看不到</td><td class="good">不需要</td><td class="good">不需要</td></tr>
+      <tr><th>无障碍 / 动效风险</th><td class="weak">高：自动播放、动态内容必须有暂停与 reduced-motion 分支</td><td class="good">低</td><td>中：横向滚动要补键盘与可见滚动条</td></tr>
+      <tr><th>编辑维护成本</th><td class="good">低：一个有序数组</td><td>中：要定主次、控文案长度</td><td>中：要维护合集归属</td></tr>
+      <tr><th>规模上限</th><td>精选 ≤ 6 才好用</td><td>精选 ≤ 8，再多要分页</td><td class="good">无上限，合集可无限加</td></tr>
+      <tr><th>纵向占用</th><td class="good">≈ 296px</td><td>≈ 380px</td><td class="weak">≈ 560px（首屏要滚）</td></tr>
+      <tr><th>表格的角色</th><td>唯一查找入口</td><td>与精选并列</td><td>降级为「全部插件」兜底</td></tr>
+      <tr><th>实现成本</th><td>中（轮播 + 暂停规则）</td><td class="good">低</td><td class="weak">高（两套卡片 + 合集合约）</td></tr>
+      <tr><th>最适合</th><td>官方运营位，「本周焦点」给它一个舞台</td><td>精选少而精，一次讲完</td><td>插件上百后的长期形态</td></tr>
+    </tbody>
+  </table>
+
+  <div class="drawer__call">
+    <h3>素材现状（本仓实测，2026-10-08）</h3>
+    <p>索引 18 个插件里，<strong>只有 6 个带截图、6 个带 icon</strong>（且是同一批），其余 12 个什么都没有。截图比例从 <code>3600×740</code>（Token 速度表，一条状态栏）到 <code>357×425</code>（AI 配额，竖屏）不等。</p>
+    <p>所以轮播位不能默认「一张能裁切的图」：<strong>直接用截图 cover 满铺会糊</strong>（点“真图·满铺”能直接看到）。两条路：编辑在 <code>featured.json</code> 里补一张 16:9 封面，或者像本稿这样让截图按原比例自成一张卡（截图 → icon → 渐变块三级回落）。</p>
+  </div>
+
+  <div class="drawer__call">
+    <h3>如果让我选</h3>
+    <p><strong>先上 B（偶发一屏就能讲完），数据结构一次定成 C 的超集。</strong>
+      <code>featured.json</code> 同时带 <code>spotlight[]</code>（有序）与 <code>collections[]</code>（分组）：
+      B 只读 spotlight；A 只读 spotlight 并加轮播；C 读 collections 并支持 <code>hero: true</code> 的合集排在最前。
+      三种形态同一份数据，换 UI 不用改契约。</p>
+    <p class="drawer__muted">完整条目拍板后再补 i18n key、空态与失败路径测试。</p>
+  </div>
+</aside>
+<div class="scrim" id="scrim" hidden data-action="compare"></div>
+
+<script src="./plugin-market-discovery.data.js"></script>
+<script src="./plugin-market-discovery.concept.js"></script>
+<script src="./plugin-market-discovery.js"></script>
+</body>
+</html>

@@ -7,14 +7,17 @@ import { useTranslation } from "react-i18next";
 import { ipc, type FileContent } from "@/lib/ipc";
 import { errorText } from "@/lib/errors";
 import { Button } from "@/components/base/buttons/button";
+import { useActionFeedback } from "@/components/base/action-feedback";
 import { CenteredSpinner, EmptyState } from "@/components/base/empty-state";
+import { isWeb } from "@/lib/platform";
 import { fileName, useFilesStore } from "./store";
 import { BinaryFileView, ImageFileView } from "./EditorFallbackViews";
 import { FileEditorHeader } from "./FileEditorHeader";
+import { HtmlPreview } from "./HtmlPreview";
 import { MarkdownPreview } from "./MarkdownPreview";
+import { isHtmlFile, isMarkdownFile, opensInPreview, type EditorViewMode } from "./editor-view-mode";
 import { registerShortcutHandler } from "@/features/shortcuts/runtime";
 
-const MARKDOWN_RE = /\.(md|markdown)$/i;
 const CM_BASIC_SETUP = { foldGutter: false, highlightActiveLine: true };
 
 /** Tracks the app theme class on <html> so CodeMirror follows light/dark. */
@@ -70,17 +73,24 @@ function FileEditor({ path, content }: { path: string; content: FileContent }) {
   const isActiveTab = useFilesStore((s) => s.activeFilePath === path);
   const dark = useIsDark();
 
+  const name = fileName(path);
+  const isMarkdown = isMarkdownFile(name);
+  const isHtml = isHtmlFile(name);
+  // HTML opens rendered too, but only where the asset protocol serves real
+  // paths — web-access mode keeps the code view (see editor-view-mode.ts).
+  const canPreview = opensInPreview(name, !isWeb);
+
   const [draft, setDraft] = useState(content.text ?? "");
   const [savedText, setSavedText] = useState(content.text ?? "");
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
-  const [mdMode, setMdMode] = useState<"edit" | "preview">(() => (MARKDOWN_RE.test(path) ? "preview" : "edit"));
+  const [viewMode, setViewMode] = useState<EditorViewMode>(canPreview ? "preview" : "edit");
+  // HTML preview reload: bumped to remount the iframe (the frame reads the
+  // saved file itself, so there is nothing else to refresh).
+  const [previewReloadKey, setPreviewReloadKey] = useState(0);
   // Find bar for the markdown preview (⌘F / header button); closing the
   // preview drops it so switching back to read mode starts clean.
   const [previewSearchOpen, setPreviewSearchOpen] = useState(false);
-
-  const name = fileName(path);
-  const isMarkdown = MARKDOWN_RE.test(name);
   const [langExt, setLangExt] = useState<Extension[]>([]);
   // Truncated files are partial (editing + saving would clobber the tail);
   // remote-readOnly files are complete but unwritable — both stay read-only.
@@ -93,10 +103,20 @@ function FileEditor({ path, content }: { path: string; content: FileContent }) {
     return () => setFileDirty(path, false);
   }, [dirty, path, setFileDirty]);
 
-  const handleMdModeChange = useCallback((mode: "edit" | "preview") => {
+  const handleViewModeChange = useCallback((mode: EditorViewMode) => {
     setPreviewSearchOpen(false);
-    setMdMode(mode);
+    setViewMode(mode);
   }, []);
+
+  // 刷新走 §4.1 转圈 → 对号：iframe 重挂载没有可等待的完成事件，对号 = 重新
+  // 加载指令已下发（与内置浏览器的刷新语义一致）。
+  const reloadPreview = useActionFeedback({ spin: true });
+  const handleReloadPreview = () => {
+    void reloadPreview.start(() => {
+      setPreviewReloadKey((key) => key + 1);
+      return Promise.resolve();
+    });
+  };
 
   // Resolve a CodeMirror grammar from the file extension (lazy-loaded).
   useEffect(() => {
@@ -165,9 +185,13 @@ function FileEditor({ path, content }: { path: string; content: FileContent }) {
         name={name}
         dirty={dirty}
         readOnly={readOnly}
+        canPreview={canPreview}
         isMarkdown={isMarkdown}
-        mdMode={mdMode}
-        onMdModeChange={handleMdModeChange}
+        isHtml={isHtml}
+        viewMode={viewMode}
+        onViewModeChange={handleViewModeChange}
+        reloadFeedback={reloadPreview.feedback}
+        onReloadPreview={handleReloadPreview}
         saving={saving}
         onSave={save}
         searchOpen={previewSearchOpen}
@@ -178,15 +202,24 @@ function FileEditor({ path, content }: { path: string; content: FileContent }) {
           {saveError}
         </p>
       )}
-      {isMarkdown && mdMode === "preview" ? (
-        <MarkdownPreview
-          path={path}
-          draft={draft}
-          active={isActiveTab}
-          searchOpen={previewSearchOpen}
-          onSearchOpenChange={setPreviewSearchOpen}
-          bindSearchShortcut={isActiveTab}
-        />
+      {canPreview && viewMode === "preview" ? (
+        isMarkdown ? (
+          <MarkdownPreview
+            path={path}
+            draft={draft}
+            active={isActiveTab}
+            searchOpen={previewSearchOpen}
+            onSearchOpenChange={setPreviewSearchOpen}
+            bindSearchShortcut={isActiveTab}
+          />
+        ) : (
+          <HtmlPreview
+            path={path}
+            name={name}
+            reloadKey={previewReloadKey}
+            active={isActiveTab}
+          />
+        )
       ) : (
         <CodeMirror
           className="min-h-0 flex-1 overflow-hidden [&_.cm-editor]:h-full"

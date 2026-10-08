@@ -1,9 +1,12 @@
 import { useTranslation } from "react-i18next";
 import Eye from "lucide-react/dist/esm/icons/eye";
 import PencilLine from "lucide-react/dist/esm/icons/pencil-line";
+import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw";
 import Save from "lucide-react/dist/esm/icons/save";
 import Search from "lucide-react/dist/esm/icons/search";
+import { ActionFeedbackIcon, type ActionFeedback } from "@/components/base/action-feedback";
 import { Button } from "@/components/base/buttons/button";
+import type { EditorViewMode } from "./editor-view-mode";
 import { cx } from "@/utils/cx";
 
 export function FileEditorHeader({
@@ -11,9 +14,13 @@ export function FileEditorHeader({
   name,
   dirty,
   readOnly,
+  canPreview,
   isMarkdown,
-  mdMode,
-  onMdModeChange,
+  isHtml,
+  viewMode,
+  onViewModeChange,
+  reloadFeedback,
+  onReloadPreview,
   saving,
   onSave,
   searchOpen,
@@ -23,9 +30,17 @@ export function FileEditorHeader({
   name: string;
   dirty: boolean;
   readOnly: boolean;
+  /** File kinds with a rendered preview (Markdown anywhere, HTML on desktop)
+   *  get the 编辑 / 预览 toggle. */
+  canPreview: boolean;
+  /** Markdown preview additionally owns the find-bar toggle (⌘F). */
   isMarkdown: boolean;
-  mdMode: "edit" | "preview";
-  onMdModeChange: (mode: "edit" | "preview") => void;
+  /** HTML preview owns the reload button. */
+  isHtml: boolean;
+  viewMode: EditorViewMode;
+  onViewModeChange: (mode: EditorViewMode) => void;
+  reloadFeedback: ActionFeedback;
+  onReloadPreview: () => void;
   saving: boolean;
   onSave: () => void;
   /** Markdown preview find bar visibility / toggle (⌘F). */
@@ -50,7 +65,24 @@ export function FileEditorHeader({
         </span>
       )}
       <div className="flex-1" />
-      {isMarkdown && mdMode === "preview" && (
+      {isHtml && viewMode === "preview" && (
+        <button
+          type="button"
+          onClick={onReloadPreview}
+          disabled={reloadFeedback === "running"}
+          aria-label={t("common.refresh")}
+          title={t("common.refresh")}
+          className="flex h-6 shrink-0 items-center justify-center rounded-lg border border-border-button-default px-2 text-text-tertiary transition-colors duration-150 ease hover:text-text-primary"
+        >
+          <ActionFeedbackIcon
+            icon={RefreshCw}
+            feedback={reloadFeedback}
+            spin
+            iconClassName="size-3.5"
+          />
+        </button>
+      )}
+      {isMarkdown && viewMode === "preview" && (
         <button
           type="button"
           onClick={onToggleSearch}
@@ -67,14 +99,14 @@ export function FileEditorHeader({
           <Search className="size-3.5" aria-hidden />
         </button>
       )}
-      {isMarkdown && (
+      {canPreview && (
         <div className="flex shrink-0 items-center rounded-lg border border-border-button-default">
           <button
             type="button"
-            onClick={() => onMdModeChange("edit")}
+            onClick={() => onViewModeChange("edit")}
             className={cx(
               "flex h-6 items-center gap-1 rounded-l-lg px-2 text-caption-1-medium",
-              mdMode === "edit"
+              viewMode === "edit"
                 ? "bg-background-tertiary-default text-text-primary"
                 : "text-text-tertiary hover:text-text-primary",
             )}
@@ -84,10 +116,10 @@ export function FileEditorHeader({
           </button>
           <button
             type="button"
-            onClick={() => onMdModeChange("preview")}
+            onClick={() => onViewModeChange("preview")}
             className={cx(
               "flex h-6 items-center gap-1 rounded-r-lg px-2 text-caption-1-medium",
-              mdMode === "preview"
+              viewMode === "preview"
                 ? "bg-background-tertiary-default text-text-primary"
                 : "text-text-tertiary hover:text-text-primary",
             )}

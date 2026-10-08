@@ -36,6 +36,11 @@ const MAX_DETAIL_BYTES: u64 = 256 * 1024;
 /// READMEs are docs, not bundles: 512KB is a generous ceiling that still
 /// bounds a hostile index row.
 const MAX_README_BYTES: u64 = 512 * 1024;
+/// featured.json is an editorial list, not a data feed: eight slots is already
+/// more than a 30s carousel can carry. A longer file is truncated (and logged)
+/// instead of pushing the market table off the first screen.
+const MAX_FEATURED_ROWS: usize = 8;
+const MAX_FEATURED_BYTES: u64 = 64 * 1024;
 
 const INDEX_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Assets run to the 16MB bundle cap; slow links need real headroom.
@@ -53,6 +58,38 @@ static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .build()
         .expect("HTTP client builds from static config")
 });
+
+/// featured.json: the editorial layer over the index (方案 A 轮播). Every row
+/// names an index id — a spotlight slot that cannot install is worse than an
+/// empty slot, so unknown ids are dropped here rather than rendered.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FeaturedRow {
+    id: String,
+    /// One-line pitch; falls back to the index description in the UI.
+    #[serde(default)]
+    tagline: Option<String>,
+    /// Why it is featured (editor voice, optional).
+    #[serde(default)]
+    note: Option<String>,
+    /// Editorial cover: absolute https URL or a repo-relative path in the
+    /// plugin's own repo. Optional — the UI falls back to the plugin's own
+    /// screenshot, then its icon, then its letter tile.
+    #[serde(default)]
+    image: Option<String>,
+}
+
+/// Featured entry as the UI consumes it: the editorial copy plus the image
+/// URL already resolved to an absolute https value (the webview never guesses
+/// repo paths, same rule as screenshots/icon).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FeaturedPlugin {
+    pub id: String,
+    pub tagline: Option<String>,
+    pub note: Option<String>,
+    pub image: Option<String>,
+}
 
 /// Row of community-plugins.json.
 #[derive(Debug, Clone, Deserialize)]
@@ -139,6 +176,17 @@ struct IndexCache {
 }
 
 static INDEX_CACHE: LazyLock<Mutex<Option<IndexCache>>> = LazyLock::new(|| Mutex::new(None));
+
+/// Raw featured.json rows, same 1h TTL as the index. Only the *parse* is
+/// cached: id validation and image resolution run per call against the
+/// (cached) index, so a plugin that leaves the index also leaves the carousel
+/// instead of pointing at a row that can no longer be installed.
+struct FeaturedCache {
+    fetched_at: std::time::Instant,
+    rows: Arc<Vec<FeaturedRow>>,
+}
+
+static FEATURED_CACHE: LazyLock<Mutex<Option<FeaturedCache>>> = LazyLock::new(|| Mutex::new(None));
 
 /// READMEs fetched on demand (detail page open), keyed by plugin id. Same
 /// 1h TTL as the index; the map is wiped wholesale past `README_CACHE_MAX`
@@ -357,6 +405,100 @@ pub async fn plugin_fetch_index(force: bool) -> Result<Vec<MarketPlugin>, String
         .iter()
         .map(|entry| entry.info.clone())
         .collect())
+}
+
+/// Editorial copy is display text: trim it, drop empties, and never let a
+/// hostile row inject control characters into the carousel.
+fn clean_featured_text(raw: Option<String>) -> Option<String> {
+    let text = raw?.trim().to_string();
+    if text.is_empty() || text.chars().any(char::is_control) {
+        return None;
+    }
+    Some(text)
+}
+
+/// Pull the raw spotlight rows out of featured.json (network + 1h cache).
+/// A missing or unparsable file is an error the caller swallows: the carousel
+/// is decoration, the market table must render without it.
+async fn featured_rows(force: bool) -> Result<Arc<Vec<FeaturedRow>>, String> {
+    if !force {
+        if let Some(cache) = &*FEATURED_CACHE.lock() {
+            if cache.fetched_at.elapsed() < INDEX_CACHE_TTL {
+                return Ok(Arc::clone(&cache.rows));
+            }
+        }
+    }
+    let raw = get_capped(
+        &format!("{INDEX_RAW_BASE}/featured.json"),
+        MAX_FEATURED_BYTES,
+        INDEX_REQUEST_TIMEOUT,
+    )
+    .await?;
+    let parsed: Vec<FeaturedRow> =
+        serde_json::from_slice(&raw).map_err(|e| format!("parse featured.json: {e}"))?;
+    let rows = Arc::new(parsed);
+    *FEATURED_CACHE.lock() = Some(FeaturedCache {
+        fetched_at: std::time::Instant::now(),
+        rows: Arc::clone(&rows),
+    });
+    Ok(rows)
+}
+
+/// Spotlight rows for the market carousel: raw rows filtered against the live
+/// index (unknown / duplicate ids dropped), capped, with the editorial cover
+/// resolved to an absolute URL. Drop order is stable — the file order is the
+/// editor's priority, so the first row is the one the carousel opens on.
+fn merge_featured(
+    rows: &[FeaturedRow],
+    entries: &[CachedEntry],
+) -> Vec<FeaturedPlugin> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for row in rows {
+        if out.len() >= MAX_FEATURED_ROWS {
+            eprintln!("[market] featured.json has more than {MAX_FEATURED_ROWS} rows — ignoring the rest");
+            break;
+        }
+        if !seen.insert(row.id.clone()) {
+            continue;
+        }
+        let Some(entry) = entries.iter().find(|entry| entry.info.id == row.id) else {
+            eprintln!("[market] featured row {:?} is not in the index — skipped", row.id);
+            continue;
+        };
+        out.push(FeaturedPlugin {
+            id: row.id.clone(),
+            tagline: clean_featured_text(row.tagline.clone()),
+            note: clean_featured_text(row.note.clone()),
+            image: row
+                .image
+                .as_deref()
+                .and_then(|raw| resolve_asset_url(&entry.info.repo, raw)),
+        });
+    }
+    out
+}
+
+/// 编辑精选（方案 A 轮播）。软依赖：file 缺失/坏掉都返回空列表，调用方
+/// （marketplace store）把空列表当作「没有精选」，市场表格照常渲染。
+///
+/// `force` 只穿 featured 自己的 1h 缓存：id 校验读的是索引缓存，而索引缓存
+/// 由 `plugin_fetch_index` 负责刷新（前端按先后顺序调两个命令，featured 落在
+/// 刚写好的索引缓存上——另起一次 18 条详情的全量拉取才是真的浪费）。
+#[tauri::command]
+pub async fn plugin_fetch_featured(force: bool) -> Result<Vec<FeaturedPlugin>, String> {
+    let rows = match featured_rows(force).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            eprintln!("[market] featured list unavailable: {error}");
+            Vec::new().into()
+        }
+    };
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let entries = index_entries(false).await?;
+    Ok(merge_featured(&rows, &entries))
 }
 
 fn readme_cache_get(id: &str) -> Option<String> {
@@ -749,6 +891,122 @@ mod tests {
 
         // Malformed paths are refused, not rendered.
         assert_eq!(resolve_asset_url("owner/demo", "../icon.png"), None);
+    }
+
+    /// Minimal index row for the featured-merge cases: the merge only reads
+    /// id + repo (image paths resolve against the latter).
+    fn cached_entry(id: &str, repo: &str) -> CachedEntry {
+        CachedEntry {
+            info: MarketPlugin {
+                id: id.to_string(),
+                repo: repo.to_string(),
+                name: id.to_string(),
+                description: String::new(),
+                author: String::new(),
+                tier: "js".to_string(),
+                version: "1.0.0".to_string(),
+                updated_at: None,
+                min_app_version: None,
+                sdk_version: None,
+                permissions: Vec::new(),
+                downloads: None,
+                screenshots: Vec::new(),
+                icon: None,
+            },
+            sha256: HashMap::new(),
+        }
+    }
+
+    fn featured_row(id: &str, image: Option<&str>) -> FeaturedRow {
+        FeaturedRow {
+            id: id.to_string(),
+            tagline: Some(format!("{id} 的一句话")),
+            note: None,
+            image: image.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn featured_json_parses_camel_case_and_tolerates_missing_fields() {
+        let rows: Vec<FeaturedRow> = serde_json::from_str(
+            r#"[
+              { "id": "a", "tagline": "一句话", "note": "推荐语", "image": "docs/cover.png", "extra": 1 },
+              { "id": "b" }
+            ]"#,
+        )
+        .expect("featured.json parses");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].image.as_deref(), Some("docs/cover.png"));
+        // Unknown keys are ignored, and a copy-less row still parses: the UI
+        // falls back to the index description and the plugin's own art.
+        assert_eq!(rows[1].tagline, None);
+        assert_eq!(rows[1].note, None);
+        assert_eq!(rows[1].image, None);
+    }
+
+    #[test]
+    fn featured_rows_drop_ids_the_index_does_not_carry() {
+        let entries = vec![cached_entry("known", "owner/known")];
+        let rows = vec![featured_row("known", None), featured_row("ghost", None)];
+        let merged = merge_featured(&rows, &entries);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, "known");
+    }
+
+    #[test]
+    fn featured_images_resolve_against_the_plugin_repo() {
+        let entries = vec![cached_entry("known", "owner/known")];
+        let rows = vec![
+            featured_row("known", Some("docs/cover.png")),
+            featured_row("known", Some("https://cdn.test/cover.png")),
+            featured_row("known", Some("http://cdn.test/cover.png")),
+        ];
+        let merged = merge_featured(&rows, &entries);
+        // 去重：同一 id 只留第一条，所以后面两条只用于断言解析规则本身
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].image.as_deref(),
+            Some("https://raw.githubusercontent.com/owner/known/HEAD/docs/cover.png")
+        );
+        assert_eq!(
+            resolve_asset_url("owner/known", "https://cdn.test/cover.png").as_deref(),
+            Some("https://cdn.test/cover.png")
+        );
+        assert_eq!(resolve_asset_url("owner/known", "http://cdn.test/cover.png"), None);
+    }
+
+    #[test]
+    fn featured_rows_are_deduplicated_and_capped() {
+        let ids: Vec<String> = (0..MAX_FEATURED_ROWS + 3).map(|i| format!("p{i}")).collect();
+        let entries: Vec<CachedEntry> = ids
+            .iter()
+            .map(|id| cached_entry(id, &format!("owner/{id}")))
+            .collect();
+        let mut rows: Vec<FeaturedRow> = ids.iter().map(|id| featured_row(id, None)).collect();
+        rows.insert(1, featured_row("p0", None)); // 重复项：只保留第一次出现的位置
+        let merged = merge_featured(&rows, &entries);
+        assert_eq!(merged.len(), MAX_FEATURED_ROWS);
+        assert_eq!(merged[0].id, "p0");
+        assert_eq!(merged[1].id, "p1");
+    }
+
+    #[test]
+    fn featured_copy_is_trimmed_and_control_characters_are_refused() {
+        let entries = vec![cached_entry("known", "owner/known")];
+        let mut row = featured_row("known", None);
+        row.tagline = Some("  一句话  ".to_string());
+        row.note = Some("   ".to_string());
+        let merged = merge_featured(&[row], &entries);
+        assert_eq!(merged[0].tagline.as_deref(), Some("一句话"));
+        // 纯空白与含控制字符的文案都当“没有”，不把噪声渲染进轮播
+        assert_eq!(merged[0].note, None);
+
+        let mut row = featured_row("known", None);
+        row.tagline = Some("bad\u{7}copy".to_string());
+        row.note = Some("ok".to_string());
+        let merged = merge_featured(&[row], &entries);
+        assert_eq!(merged[0].tagline, None);
+        assert_eq!(merged[0].note.as_deref(), Some("ok"));
     }
 
     #[test]

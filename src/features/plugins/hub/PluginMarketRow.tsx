@@ -1,13 +1,8 @@
 import { useTranslation } from "react-i18next";
-import Check from "lucide-react/dist/esm/icons/check";
-import Loader2 from "lucide-react/dist/esm/icons/loader-2";
-import { Button } from "@/components/base/buttons/button";
-import { isWeb } from "@/lib/platform";
 import type { MarketPlugin } from "@/lib/ipc";
 import { githubAvatarUrl, githubLoginFor, isOfficialPlugin } from "./catalog";
+import { MarketActionButton } from "./MarketActionButton";
 import { PluginAvatar } from "./PluginAvatar";
-import { usePluginsStore } from "../manager/usePlugins";
-import { useMarketplaceStore } from "../marketplace/store";
 
 const BADGE =
   "rounded-md bg-background-secondary-default px-1.5 py-0.5 text-xs text-text-secondary";
@@ -18,87 +13,8 @@ const BADGE =
 const OFFICIAL_BADGE =
   "shrink-0 rounded-md bg-status-purple-background px-1.5 py-0.5 text-xs text-status-purple-text";
 
-/** Progress placeholder keeps the secondary shape of the button it replaces,
- *  so the row's action column does not resize mid-install. */
-const INSTALLING_BUTTON =
-  "flex h-8 items-center gap-1.5 rounded-lg border border-border-button-default bg-background-primary-default px-2.5 text-body-2-medium whitespace-nowrap text-text-tertiary";
-
 const CELL = "px-4 py-2.5";
 const NUM_CELL = `${CELL} text-right text-body-2-regular text-text-secondary tabular-nums`;
-
-/**
- * The row's action cell — one button per state: installing shows the byte
- * progress, an indexed update wins over the plain installed state, an
- * installed plugin opens its details (settings / uninstall live there), and
- * anything else installs.
- */
-function MarketRowAction({
-  entry,
-  onOpenDetail,
-}: {
-  entry: MarketPlugin;
-  onOpenDetail: (id: string) => void;
-}) {
-  const { t } = useTranslation();
-  const installed = usePluginsStore((s) => s.installed.some((p) => p.id === entry.id));
-  const update = useMarketplaceStore((s) => s.updates.find((u) => u.id === entry.id));
-  const installing = useMarketplaceStore((s) =>
-    s.installing?.id === entry.id ? s.installing : null,
-  );
-  const install = useMarketplaceStore((s) => s.install);
-
-  if (installing) {
-    const pct = installing.total > 0 ? Math.round((installing.done / installing.total) * 100) : null;
-    return (
-      <button type="button" disabled className={INSTALLING_BUTTON}>
-        <Loader2 className="size-4 animate-spin" aria-hidden />
-        {pct != null ? t("plugins.installingPct", { pct }) : t("plugins.installing")}
-      </button>
-    );
-  }
-
-  if (installed && update) {
-    return (
-      <Button
-        variant="primary"
-        size="small"
-        disabled={isWeb}
-        title={isWeb ? t("plugins.market.desktopOnly") : undefined}
-        onClick={() => void install(entry.id)}
-      >
-        {t("plugins.hub.updateTo", { version: update.latestVersion })}
-      </Button>
-    );
-  }
-
-  // Installed and current (builtins included — they never update): the detail
-  // page is where settings and uninstall live, so the button opens it.
-  if (installed) {
-    return (
-      <Button
-        variant="ghost"
-        size="small"
-        leadingIcon={Check}
-        title={t("plugins.hub.installedHint")}
-        onClick={() => onOpenDetail(entry.id)}
-      >
-        {t("plugins.hub.installed")}
-      </Button>
-    );
-  }
-
-  return (
-    <Button
-      variant="primary"
-      size="small"
-      disabled={isWeb}
-      title={isWeb ? t("plugins.market.desktopOnly") : t("plugins.hub.install")}
-      onClick={() => void install(entry.id)}
-    >
-      {t("plugins.hub.install")}
-    </Button>
-  );
-}
 
 /**
  * One row of the market table. Identity is a button (opens details) and the
@@ -183,7 +99,7 @@ export function PluginMarketRow({
 
       <td className={CELL}>
         <div className="flex justify-end">
-          <MarketRowAction entry={entry} onOpenDetail={onOpenDetail} />
+          <MarketActionButton entry={entry} onOpenDetail={onOpenDetail} />
         </div>
       </td>
     </tr>

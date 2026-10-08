@@ -133,6 +133,7 @@
 - **进程折叠行的工作中提示与一键收起**：思考过程/工具调用的折叠摘要行在「该行还有活在干」时带跑马灯/流光（`.process-live-*`：边框流光 + 文字扫光 + 脑图标微光，`prefers-reduced-motion` 降为静态环）——条件是行处于折叠且（思考流式中 **或** 该行是时间线最后一条过程行、回合仍在流式、末步工具尚未出结果），工具出结果/回合结束立即熄灭；行展开时其底部中央吸附一枚「收起过程」圆钮（`sticky bottom-3`，图标按钮，`aria-label` + `title` 走 i18n `chat.collapseProcess`），在该行任意滚动位置都能一键折回摘要行，等效于点行头。回归：`ProcessDisclosure.test.tsx`。
 - **后台任务面板的清空与单任务停止**：面板顶部右侧「清空已结束」按钮只清非 `running` 的任务行（无已结束任务时禁用；CLI 之后若再报同一任务，行会按 REPLACE 语义重新出现）；每个运行中任务行尾有「停止任务」图标按钮（`aria-label` + `title`，i18n `chat.tasks.stopTask`），点击经 `stop_background_task` 向承载该任务的进程投 `stop_task` 控制帧，请求在飞时按钮禁用，任务以 `task_notification(stopped)` 收敛为「已停止」；进程已死/写不进 stdin 时按钮自动恢复可点并保持行可重试，不摆假按钮。回归：`BackgroundTasksPanel.test.tsx`、`background-tasks-store.test.ts`、`background-turn-lifecycle.test.ts`。
 - **文件 Markdown 预览用 Streamdown 渲染**：`MarkdownPreview.tsx` 用 Vercel Streamdown（`mode="static"` + `code`/`math`/`mermaid`/`cjk` 插件），不再是裸 react-markdown 加手写标题样式（旧预览的 GFM 表格渲染成无边框纯文本）。它的 shadcn token（`bg-background`、`text-muted-foreground`、`border-border` 等）在 `src/styles/globals.css` 桥接到语义 token（`:root` 映射 + `@theme inline` 导出、`@source` 扫描 dist），暗色随 `.dark` 翻转，不另写 `dark:`。表格/代码块/图表的复制、下载、全屏按钮文案走 `files.markdown.*` i18n；外链一律 `openExternal` 交系统浏览器（内置 link-safety 弹层关闭，避免双重确认）；本地相对图片仍解析到 Markdown 文件旁的真实路径（`resolveMarkdownImageSrc`）。Mermaid 图滚入视口才渲染（IntersectionObserver 懒渲染），离屏留白是设计行为；编辑预览用 deferred 草稿整篇重解析，不逐键击卡顿。**正文链接必须自己带可见样式**：组件替换了 Streamdown 内建的 link 组件，它的 `text-primary underline` 类不会跟过来，所以锚点显式挂 `.md-preview-link`（`src/index.css`：绿色 `--md-link-color` + 点状下划线，与聊天 Markdown 的链接观感一致）；`https:` / `mailto:` 交 `openExternal`，相对 / 绝对文件路径按 Markdown 文件所在目录解析后开成编辑器页签（`resolveMarkdownLinkPath`），目录、无扩展名目标、`#anchor` 与未知 scheme 渲染为惰性文本——绝不让 webview 导航替换应用外壳。**预览支持 ⌘F 查找**：页头预览模式有放大镜按钮，快捷键与对话内搜索共用 `chatSearch` 动作（各面按可见性让位）；命中用独立 highlight 名的 Custom Highlight API 画（`src/features/files/markdown-search.ts`：全部黄色、当前项橙色，与对话搜索可同时开启互不覆盖），输入框是右上角共用的 `ContentSearchBar`，Enter / Shift+Enter 逐个跳转、Esc 关闭，命中计数实时显示。回归：`markdown-search.test.ts`、`TimelineSearchBar.test.tsx`、`tests/browser/markdown-preview.html`。
+- **HTML 文件点开即渲染预览（桌面 `ccgui-preview` 协议 iframe + sandbox）**：`.html` / `.htm` / `.xhtml` 与 Markdown 走同一套头部「编辑 / 预览」切换，初始模式由 `src/features/files/editor-view-mode.ts` 的 `opensInPreview(name, !isWeb)` 决定，预览本体是 `HtmlPreview.tsx` 指向 `previewFileUrl(path)` 的 `<iframe>`。**不能用 Tauri 的 asset 协议**：`convertFileSrc` 把整条绝对路径编码进一个 URL 段（`asset://localhost/%2F…%2Findex.html`），文档的相对引用（`draft.css`、`<script src>`）会被解析成 `asset://localhost/draft.css` 而全部 404，页面只剩无样式裸 HTML——所以 `src-tauri/src/preview_protocol.rs` 注册了保留真实路径结构的 `ccgui-preview` 协议（每段单独解码；解码出 `/`、`\`、NUL 或 `.` / `..` 的段直接拒绝，不静默改目标），浏览器就能按目录解析同级资源、module script 与 `fetch`。访问范围沿用 asset 协议作用域（`$HOME/**` 减 deny，`Scope::is_allowed` 会 canonicalize 并跟随符号链接），响应带 `Cache-Control: no-store`（草稿靠刷新迭代，不许回放旧副本）与 `Access-Control-Allow-Origin: null`（sandbox 帧的不透明来源能用，带真实来源的远程页不匹配）；分支支持单段 Range（媒体拖动），多段 Range 按规范允许的方式忽略。sandbox 取 `allow-scripts allow-same-origin allow-forms allow-modals`——脚本、表单与 `alert` 能跑，但帧与宿主不同源、进不了 CC GUI 状态，顶层导航与弹窗始终被拦。`tauri.conf.json` 的 CSP 必须放行 `frame-src 'self' ccgui-preview: http://ccgui-preview.localhost`（缺了帧直接空白）。**预览渲染的是磁盘上已保存的内容**（与 Markdown 预览的实时草稿语义不同）：未保存改动靠头部「未保存」徽标与「保存」按钮提示，改完点「刷新」（§7 登记，点击重挂载 iframe）才可见；切到别的页签时 iframe 整个卸载（不在屏上的预览页不许在后台跑 rAF/定时器），切回来重新从盘上加载。**web 访问模式不提供 HTML 预览**（没有对应的原生协议），那里的 HTML 保持源码视图；作用域外的文件预览为空、源码视图与编辑不受影响。回归：`editor-view-mode.test.ts`、`preview-url.test.ts`、`HtmlPreview.test.tsx`、`FileEditorHeader.test.tsx`、Rust `preview_protocol::tests`。
 
 - **内网访问自启、访问 IP 切换与端口/Token配置**：设置「远程访问 / 内网访问」（`WebAccessSection.tsx`）提供「随应用自动开启」滑动开关（`Switch`），开启时客户端启动即自动运行内网 Web 服务（后端持久化于 `AppSettings.web_access_auto_start`，前端启动时带兜底探测与自启保障）。运行态下提供「访问 IP / 网卡」下拉框（`Select`），通过平台原生接口（Windows `GetAdaptersAddresses` / Unix `getifaddrs`）动态枚举本机网络接口 IPv4 列表，优先置顶 Tailscale 虚拟网卡与 CGNAT IP（100.64.0.0/10），并列出物理网卡及 Localhost 回环地址；切换 IP 联动实时更新访问地址、复制内容与二维码，并在本地持久化所选偏好（`WEB_ACCESS_SELECTED_IP_KEY`）。支持自定义监听端口（`web_access_port`，留空为自动分配随机端口）与持久化鉴权 Token（`web_access_token`，支持一键「重新生成」）；服务运行中修改配置在卡片内展示重启提示与快捷「立即重启服务」动作，绑定失败时在界面显式展示端口冲突原因。回归：`WebAccessSection.test.tsx`、`web::tests::*`。
 
@@ -147,6 +148,12 @@
 - **阈值控件按会话保存，无会话时可见但不可操作**：阈值数字输入（1–100 整数，`normalizeAutoCompactThreshold` 统一夹取与取整）与闪电开关在状态栏上下文弹层的用量卡底部（`AutoCompactControls`，`agent-limits-card.tsx`），存储键 `ccgui-next.chat.autoCompactBySession`（`auto-compact-context.ts`，默认阈值 `DEFAULT_AUTO_COMPACT_THRESHOLD = 80`），按 `sessionKey` 读写，换会话即换设置、新建待发会话的设置在拿到真实 sessionId 时随会话迁移。没有会话时两个控件保持可见（首启就能看到入口、卡片行高不跳）但禁用：`cursor-not-allowed opacity-50`，输入框走原生 `disabled`；开关**刻意不用原生 `disabled`**——原生禁用收不到 hover/focus，解释禁用原因的 tooltip 就永远读不到，所以用 `aria-disabled` + press 守卫（`agent-limits-card.tsx` 注释），tooltip 文案换成 `chat.autoCompactNoSession`（「新建或打开一个会话后可设置；阈值按会话保存」），可用态才显示「开启 / 关闭自动压缩」。
 - **续接只回到原来那个会话标签页**：自动压缩完成后由 footer 发一次 `chat.autoCompactResume` 把任务接回去，条件收在 `shouldResumeAfterAutoCompact`：必须是阈值触发、同一个会话的标签页仍在 `openTabs` 里、压缩没有报错、用户没有按停止、没有排队消息、会话没有停在问答 / 审批 dock。压缩期间用户关掉了标签页就什么都不做，绝不回落到当前活动会话（`ConversationFooter.tsx` 的 `resumeAfterAutoCompact`，与 `refreshSessionUsage` 的「closed tab 不得回退到 active」是同一条约束）——那条续接指令是一条真实用户消息，落到别的会话会让它真的开始续作。
 
+- **编辑精选轮播（市场首屏）**：首屏轮播是**编辑层**，数据来自索引仓的 `featured.json`（实现见 `src/features/plugins/hub/PluginSpotlight.tsx`）。三条硬约定：
+  - **装饰数据不挡路**：文件缺失/坏掉，或某一行的 `id` 不在索引里，就整块/该行不渲染——不弹错误、不占位、不影响下方表格与筛选（`marketplaceStore.featured` 为空即整块 `return null`，索引本身的失败才进 `error`）。
+  - **进度条就是计时器**：自动播放由 `theme.css` 的 `--animate-spotlight-progress`（6s，`scaleX` 不触发布局）驱动，`animationend` 才翻页。悬停、焦点进入、切到后台、`prefers-reduced-motion`（`useReducedMotion` + `motion-reduce:animate-none`）四路都作用在同一条进度条上，条停 = 翻页停，不存在「条停了还在翻」。手动翻页把进度条重新起跑（进度段 `key={index}`），不接力上一张的进度。
+  - **封面素材链**：编辑封面 `image`（`object-cover` 铺满）→ 插件第一张截图（按原比例 `object-contain` 装帧，**不裁切**——索引里的截图从 3600×740 到 357×425 都有）→ 插件 `icon` → 品牌色首字块；任一环 `onError` 降一级，卡片永远画满。18 个已登记插件只有 6 个带截图，所以「没有图」是正常状态，不是错误态。
+  - 文案压左侧压暗层（`from-black/85 via-black/55`）之上，对比度不依赖封面本身；轮播内键盘 ←/→ 翻页（做法同 `PluginScreenshotCarousel`），`aria-roledescription="carousel"` / `slide` + 非当前页 `aria-hidden`，圆点带「第 n 条精选：名称」。
+
 ## 4. 动作反馈
 
 - **子代理运行反馈**：输入框上方状态条保留上游报告的未完成计数，父回合结束不把子代理自动标成完成。呼吸灯仅在回合流式进行或真实后台任务仍运行时显示；仅剩历史消息快照时，pill 与展开面板停止呼吸，未完成项显示「待处理」，详情状态一致。回归：`RunStatusStrip.test.tsx`。
@@ -156,6 +163,8 @@
 - **渲染性能面板（react-scan）**：设置 → 其他 → 性能诊断页内的独立开关，**默认关闭**，手动开启后即时生效并持久化。打包（生产）版只提供重渲染高亮与次数，不含单次渲染耗时（开发版 `pnpm dev` 才有）。react-scan 必须在 React/react-dom 首次导入前接管 instrumentation，因此入口 `src/main.tsx` 只做启动编排：先装轻量 devtools hook，再按开关决定是否加载 overlay，应用体经动态导入的 `src/bootstrap.tsx` 加载；`src/lib/react-scan.ts` 只在开关开启时拉取 react-scan 本体 chunk（未开启时只多取几 KB 的 hook chunk，开关无需重启即生效）。
 
 异步动作必须让用户看到三件事：**正在进行**、**成功**、**失败**。失败要么有对号以外的显式反馈（错误文案 / 状态标记），要么保持原样不误导。
+
+- **顶栏外部应用打开**：`HeaderOpenActions.tsx` 的固定按钮和更多菜单共用打开入口；启动失败用 `ModalShell` 展示目标应用及错误原因，允许关闭后重试，不静默吞掉失败。macOS 的 IntelliJ IDEA 使用应用包内 `Contents/MacOS/idea` 命令行入口，使已打开的项目复用窗口；其他预置应用继续使用 `open -a`。
 
 ### 4.1 刷新 / 重新加载：转圈 → 对号
 
@@ -247,12 +256,13 @@ const feedback = useRunningFeedback(store.loading);
 |---|---|---|---|
 | 变更（git）刷新 | `src/features/git/ChangesPanelHeader.tsx` | `useActionFeedback({ spin: true })` | **参考实现**；pull/push 只做 click → 对号 |
 | 文件树刷新 | `src/features/files/FileTreeRow.tsx` | `useRunningFeedback(filesStore.refreshing)` | 入口在工作区根行（合成根节点），随该行悬停出现（同该行「添加到聊天」加号）；刷新可能由别处触发，故走状态驱动 |
-| 插件市场索引 | `src/features/plugins/hub/PluginMarketView.tsx` | `useActionFeedback` | 图标按钮位于筛选工具条（分类 chips + 排序 + 搜索）右侧；`isFailure` 读 `marketplaceStore.error` |
+| 插件市场索引 | `src/features/plugins/hub/PluginMarketView.tsx` | `useActionFeedback` | 图标按钮位于筛选工具条（分类 chips + 排序 + 搜索）右侧；`isFailure` 读 `marketplaceStore.error`。一次刷新同时重读索引与 `featured.json`（精选是软依赖：拉不到只清空轮播，不写 `error`） |
 | 插件重新加载 | `src/features/plugins/hub/PluginInstalledRow.tsx` | `useActionFeedback` | 成功后该行转为健康态、按钮消失 |
 | CLI 版本信息 | `src/features/settings/CliHeaderActions.tsx` | `useRunningFeedback(loading \|\| updating)` | 挂载时的自动探测同样转圈 → 对号 |
 | 刷新用量 | `src/components/application/agent-limits/agent-limits-card.tsx` | `useRunningFeedback(refreshing)` | 带文字标签的卡片按钮，图标区放反馈 |
 | 模型目录 | `src/components/application/ai-chat/engine-model-panel.tsx` | `useActionFeedback` | — |
 | 浏览器刷新 | `src/features/browser/BrowserPane.tsx` | `useActionFeedback` | webview 无加载完成事件，对号 = 指令已下发 |
+| HTML 预览刷新 | `src/features/files/FileEditorHeader.tsx` | `useActionFeedback({ spin: true })` | 重挂载 iframe 重新读盘；iframe 同样没有可等待的加载完成事件，对号 = 指令已下发 |
 | 状态栏「立即同步」 | `src/components/application/app-status-bar/app-status-bar.tsx` | `useRunningFeedback(syncing)` | 进度由 `scan://progress` 事件驱动 |
 | Skills 刷新 | `src/features/skills/InstalledPane.tsx` | `useActionFeedback({ spin: true })` | 一次动作同时重读已安装列表与更新信号；失败走行内 `role="alert"` |
 | Bot「刷新上下文」 | `src/features/settings/agents-prompts/bot-prompt-preview.tsx` | **不加反馈**（就地换成一行说明） | 丢弃已冻结的提示词区块，下次发送重新拼装；语义是「放弃这次会话的快照」而非重读数据，所以不进转圈→对号那套，点击后按钮旁写明「已刷新，下次发送重新拼装」与「会让前缀缓存失效」 |
@@ -282,6 +292,8 @@ const feedback = useRunningFeedback(store.loading);
 
 | 版本 | 时间 | 内容 |
 |---|---|---|
+| v0.80 | 2026-10-08 | 插件市场首屏新增**编辑精选轮播**（方案 A）：数据走索引仓新增的 `featured.json`（后端 `plugin_fetch_featured`，与索引共用 1h 缓存且串行调用以复用同一次索引拉取；id 不在索引 / 重复 / 超 8 条由后端与索引仓 `validate.mjs` 双重拦下）。市场行与轮播共用抽出的 `MarketActionButton`，两处安装/更新/已安装状态永不打架。自动播放由进度条关键帧驱动（悬停 / 焦点 / 后台 / reduced-motion 同点冻结），封面按「编辑封面 → 插件截图（原比例）→ icon → 品牌首字块」四级回落，缺图不留空洞；`plugin_fetch_featured` 同时进 web 只读白名单；§3 补规则、§7 登记刷新范围 |
+| v0.79 | 2026-10-08 | HTML 文件点开即渲染预览：`.html/.htm/.xhtml` 走新增的桌面 `ccgui-preview` 协议（`preview_protocol.rs` 保留真实路径结构，`draft.css` / 脚本 / module / fetch 按浏览器语义解析；asset 协议的单段编码会让同级资源全 404）、iframe sandbox 允许脚本/表单但进不了应用状态，头部与 Markdown 共用「编辑/预览」并新增「刷新」（§7 登记）；`tauri.conf.json` CSP 放行 `frame-src`；web 访问模式保持源码视图；§3 补充规则 |
 | v0.78 | 2026-10-08 | ⌘W 改为关闭当前标签页（新增 `closeTab` 快捷键动作，默认 ⌘W；macOS 由 `app_menu.rs` 重建应用菜单拿掉原生 Close Window，键事件回到 webview）；文件 Markdown 预览链接恢复可见样式并安全处理点击（外链系统浏览器、相对路径开成编辑器页签、锚点 / 未知 scheme 惰性），新增 ⌘F 查找（右上角查找条、全部命中 + 当前项双色高亮、Enter / Shift+Enter 跳转，与对话搜索互不覆盖）；对话内 ⌘F 只在对话面在视时响应；§3 补两条规则 |
 | v0.77 | 2026-10-06 | 项目右键菜单渲染插件注册条目：`workspace-context-menu.tsx` 消费 `workspaceMenuRegistry`（内置项 → 分隔线 → 插件项，`compareByOrder`），目标恒为右键那一行且不改变活动项目；`label` 支持 `{ text, status: { text, tone } }` 状态小字（`success` / `muted` 语义 token）；`label` / `visible` 抛错只丢该条目、`onSelect` 失败只记日志、图标包 `PluginBoundary`；opener 与挂载不再要求宿主回调，仅插件条目也能开菜单，末个插件卸载时自动关闭。修复 CCB 等插件声明 `ui:workspace-menu` 却无入口（宿主只实现注册未消费注册表）；§3 补充规则 |
 | v0.76 | 2026-10-06 | 自动压缩的用户可见契约（§3.1）：宿主 `/compact` 在时间线原位留下常驻幕布行、引擎回合中压缩挂尾部；压缩期间尾部 `AgentThinking` 隐藏但槽位保留；阈值输入与闪电开关按会话保存，无会话时可见但禁用（`aria-disabled` + `chat.autoCompactNoSession` tooltip，不用原生 `disabled`）；续接只发回原会话标签页，压缩期间关掉标签页不续接也不落到活动会话 |

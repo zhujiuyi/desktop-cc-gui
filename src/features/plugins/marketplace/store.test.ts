@@ -1,13 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { MarketPlugin, PluginInfo } from "@/lib/ipc";
+import type { FeaturedPlugin, MarketPlugin, PluginInfo } from "@/lib/ipc";
 import type { PluginInstallProgress } from "@/lib/events";
 
 const pluginFetchIndex = vi.fn(async (_force = false): Promise<MarketPlugin[]> => []);
+const pluginFetchFeatured = vi.fn(async (_force = false): Promise<FeaturedPlugin[]> => []);
 const pluginCheckUpdates = vi.fn(async () => [] as { id: string }[]);
 const pluginInstallFromMarketplace = vi.fn();
 vi.mock("@/lib/ipc", () => ({
   ipc: {
     pluginFetchIndex: (force: boolean) => pluginFetchIndex(force),
+    pluginFetchFeatured: (force: boolean) => pluginFetchFeatured(force),
     pluginCheckUpdates: () => pluginCheckUpdates(),
     pluginInstallFromMarketplace: (id: string) => pluginInstallFromMarketplace(id),
   },
@@ -83,6 +85,7 @@ beforeEach(() => {
   progressCb = null;
   useMarketplaceStore.setState({
     entries: [],
+    featured: [],
     loaded: false,
     error: null,
     updates: [],
@@ -108,6 +111,49 @@ describe("fetchIndex", () => {
 
     expect(useMarketplaceStore.getState().error).toContain("offline");
     expect(useMarketplaceStore.getState().loaded).toBe(true);
+  });
+
+  it("loads the featured list after the index (one index fetch, not two)", async () => {
+    const order: string[] = [];
+    pluginFetchIndex.mockImplementationOnce(async () => {
+      order.push("index");
+      return [entry()];
+    });
+    pluginFetchFeatured.mockImplementationOnce(async (force) => {
+      order.push("featured");
+      expect(force).toBe(true); // 手动刷新要把精选一起刷掉，否则轮播会停在旧文案
+      return [{ id: "react-doctor", tagline: "一句话", note: null, image: null }];
+    });
+
+    await useMarketplaceStore.getState().fetchIndex(true);
+
+    // 顺序有意义：featured 的 id 校验读的是刚写好的索引缓存，并行会多拉一遍索引
+    expect(order).toEqual(["index", "featured"]);
+    expect(useMarketplaceStore.getState().featured).toHaveLength(1);
+  });
+
+  it("keeps the table usable when the featured file is unavailable", async () => {
+    pluginFetchIndex.mockResolvedValueOnce([entry()]);
+    pluginFetchFeatured.mockRejectedValueOnce(new Error("404"));
+
+    await useMarketplaceStore.getState().fetchIndex();
+
+    expect(useMarketplaceStore.getState().error).toBeNull();
+    expect(useMarketplaceStore.getState().entries).toHaveLength(1);
+    expect(useMarketplaceStore.getState().featured).toEqual([]);
+  });
+
+  it("keeps the last featured list when the index refresh fails (offline tolerance)", async () => {
+    useMarketplaceStore.setState({
+      featured: [{ id: "react-doctor", tagline: "旧文案", note: null, image: null }],
+    });
+    pluginFetchIndex.mockRejectedValueOnce(new Error("offline"));
+
+    await useMarketplaceStore.getState().fetchIndex();
+
+    // 与 entries 同一取舍：刷新失败时表格继续显示上一次的数据，精选也不清空
+    expect(pluginFetchFeatured).not.toHaveBeenCalled();
+    expect(useMarketplaceStore.getState().featured).toHaveLength(1);
   });
 });
 

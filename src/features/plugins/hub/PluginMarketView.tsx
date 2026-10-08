@@ -14,6 +14,7 @@ import {
   type PluginSort,
 } from "./catalog";
 import { PluginMarketRow } from "./PluginMarketRow";
+import { PluginSpotlight } from "./PluginSpotlight";
 import { usePluginsStore } from "../manager/usePlugins";
 import { useMarketplaceStore } from "../marketplace/store";
 
@@ -55,11 +56,13 @@ function CategoryChip({
 /**
  * 市场 tab: category chips + search/sort toolbar over the market table.
  *
- * The table replaced the hero/section storefront (plan A): one row per plugin,
- * columns that can be compared down the page, and the install/update/installed
- * state carried by the action button instead of duplicated badges. Everything
- * the old layout still owns — index refresh, install progress, the web-only
- * guard — keeps its existing behaviour.
+ * 市场 tab: 编辑精选轮播 + category chips + search/sort toolbar over the market
+ * table.
+ *
+ * 表格是主体（一行一个插件，列可比较，安装/更新/已安装状态由动作按钮承担，
+ * 不重复徽标）。轮播是上面的编辑层：没有精选数据时它自己不渲染，工具栏与表格
+ * 的位置不变 —— 推荐位不是表格的替代品。索引刷新、安装进度、web 只读护栏都沿用
+ * 原来的行为。
  */
 export function PluginMarketView({ onOpenDetail }: { onOpenDetail: (id: string) => void }) {
   const { t } = useTranslation();
@@ -117,6 +120,8 @@ export function PluginMarketView({ onOpenDetail }: { onOpenDetail: (id: string) 
 
   return (
     <div className="flex w-full flex-col gap-4">
+      <PluginSpotlight onOpenDetail={onOpenDetail} />
+
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
         <div
           role="group"

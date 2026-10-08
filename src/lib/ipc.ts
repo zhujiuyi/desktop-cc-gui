@@ -1225,6 +1225,22 @@ export interface MarketPlugin {
   icon: string | null;
 }
 
+/** One editorial spotlight row (featured.json), already joined to the index by
+ *  the backend: ids the index does not carry are dropped there, so every row
+ *  the UI receives is installable. The carousel still looks the entry up in
+ *  `entries` for the version/install state it renders. */
+export interface FeaturedPlugin {
+  id: string;
+  /** One-line pitch; null = fall back to the index description. */
+  tagline: string | null;
+  /** Why it is featured (editor voice); null = render no note line. */
+  note: string | null;
+  /** Editorial cover, absolute https URL resolved by the backend from the
+   *  index's repo-relative paths. Null = the carousel falls back to the
+   *  plugin's own screenshot, then its icon, then its letter tile. */
+  image: string | null;
+}
+
 /** One installed marketplace plugin with a newer indexed version. */
 export interface PluginUpdate {
   id: string;
@@ -1877,6 +1893,12 @@ export const ipc = {
   // web bridge; fetch/checkUpdates ride the read-only whitelist.
   pluginFetchIndex: (force = false) =>
     invoke<MarketPlugin[]>("plugin_fetch_index", { force }),
+  /** 编辑精选（featured.json）。软依赖：后端把「文件缺失 / 拉不到」都折成空
+   *  数组，前端拿空数组就不渲染轮播区 —— 市场表格不受影响。调用顺序上要排在
+   *  pluginFetchIndex 之后：它校验 id 用的是索引缓存，先拿到索引就不会重复
+   *  拉取那一批详情。 */
+  pluginFetchFeatured: (force = false) =>
+    invoke<FeaturedPlugin[]>("plugin_fetch_featured", { force }),
   /** Long-form intro (README.md from the plugin repo's default branch) for
    *  the market detail page. Fetched on open, cached backend-side for 1h. */
   pluginFetchMarketReadme: (id: string) =>

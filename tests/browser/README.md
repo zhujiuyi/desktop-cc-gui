@@ -306,3 +306,20 @@ instead of the wave indicator. The four buttons switch idle / host / engine /
 resume states; the readout reports the rendered bubbles against the five
 stored rows, the hint's computed colour and alignment, and PASS/FAIL. No model,
 no IPC, no saved conversation.
+
+Open `/tests/browser/plugin-spotlight.html` for the real 编辑精选轮播
+(`PluginSpotlight`) over a synthetic market whose six covers span the whole
+素材链: an editorial `image` (full-bleed `object-cover`), a 3600×740 and a
+357×425 screenshot (original aspect, `object-contain`), icon-only, no-art at
+all, and one whose cover *and* screenshot both fail. Every image is an inline
+SVG data URL, so the page never touches the network. The readout asserts what
+jsdom cannot: the progress bar's keyframe really is the autoplay timer
+(`getAnimations().playState`), hovering pauses it *and* freezes the advance,
+the shipped `motion-reduce:animate-none` declaration stops both, and no
+screenshot is cropped (a `cover` would cut the two ends off the 4.86:1 status
+bar and blow the 357×425 shot up into a strip). PASS/FAIL lands on
+`<body data-status>` and the title. It measures animation effects in a real
+browser — not CPU/GPU cost, and not the native WKWebView. Drive it with a
+real-clock runner: Chrome's `--virtual-time-budget` fast-forwards `setTimeout`
+without advancing CSS animation clocks, so an autoplay check under it reports a
+false failure.
