@@ -58,10 +58,19 @@ function BotRow({
 
   return (
     <div
-      data-testid="bot-row"
-      className={cx(ROW, "cursor-pointer")}
-      onClick={onOpen}
+      className={cx(ROW, "relative")}
     >
+      {/* Full-row open target as its own button, with every other control a
+          sibling instead of a descendant: no interactive element is nested in
+          another, and a click anywhere on the row still opens the editor.
+          `data-testid` sits on this button so row clicks land here. */}
+      <button
+        type="button"
+        data-testid="bot-row"
+        aria-label={`${bot.name} ${t("settings.agentEdit")}`}
+        onClick={onOpen}
+        className="absolute inset-0 cursor-pointer rounded-xl outline-none focus-visible:ring-2 focus-visible:ring-border-focus-ring"
+      />
       <BotAvatarView avatar={bot.avatar} seed={bot.id} size={36} />
       <div className="flex min-w-0 flex-1 flex-col">
         <p className="flex min-w-0 items-center gap-1.5 text-body-regular text-text-primary">
@@ -88,7 +97,7 @@ function BotRow({
           </p>
         )}
       </div>
-      <div className="flex shrink-0 items-center gap-2">
+      <div className="relative flex shrink-0 items-center gap-2">
         <span className="hidden text-caption-1-regular text-text-quaternary sm:inline">
           {t("settings.botMetaLineShort", { runtime, skills })}
         </span>

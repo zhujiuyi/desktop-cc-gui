@@ -4,6 +4,7 @@ import { HashRouter, Route, Routes } from "react-router-dom";
 import ChatPage from "@/features/chat/ChatPage";
 import { CommandPalette } from "@/features/commands/CommandPalette";
 import PluginPageHost from "@/features/plugins/manager/PluginPageHost";
+import { PluginOverlayHost } from "@/features/plugins/runtime/overlay-host";
 import { bindSystemThemeSync, bindThemeChangePersistence } from "@/features/settings/theme";
 import { announceReleaseAfterUpgrade } from "@/features/update/upgrade-announcement";
 import { GrantAccessDialogHost } from "@/components/dialogs";
@@ -121,6 +122,8 @@ function MainApp() {
               underneath, same as the /settings overlay. */}
           <Route path="/p/:pageId" element={<PluginPageHost />} />
         </Routes>
+        {/* Non-modal plugin viewport mounts, independent of the route. */}
+        <PluginOverlayHost />
       </HashRouter>
       <GrantAccessDialogHost />
       <CloseConfirmDialogHost />

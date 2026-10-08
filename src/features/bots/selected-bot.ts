@@ -2,7 +2,7 @@ import { useCallback } from "react";
 import { create } from "zustand";
 import type { BotAvatar } from "@/lib/ipc";
 import { readStoredJson, writeStored } from "@/lib/storage";
-import { avatarFromLegacyIcon } from "./bot-avatar";
+import { avatarFromLegacyIcon } from "./bot-avatar-model";
 
 /**
  * Per-thread pinned bot, persisted across restarts. Draft tabs (no session id

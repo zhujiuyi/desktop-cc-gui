@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { safeRandomUUID } from "@/lib/id";
 import {
   ipc,
+  type WorktreeRemoveResult,
   type WorktreeCreateArgs,
   type WorktreeCreateProgress,
   type WorktreeCreateStage,
@@ -95,13 +96,19 @@ interface WorktreeStore {
   /** 一次 worktree list 刷新同时更新锁定/丢失两集（同源数据，一次 set）。 */
   setGitStates: (locked: Record<string, string>, missing: Record<string, true>) => void;
   /** 后台直接删除：确认框即关，git worktree remove 在后台跑，成功后从
-   *  侧栏移除登记；失败走 chat store 的 actionError 横幅。 */
+   *  侧栏移除登记；失败走 chat store 的 actionError 横幅。
+   *  插件调用时传 silent + onResult：错误与非致命尾巴由调用方自己呈现
+   *  （不要同时弹宿主的横幅），并拿到 resolve 结果。 */
   remove: (args: {
     workspaceId: string;
     worktreePath: string;
     repoPath: string;
     branch: string | null;
     deleteBranch: boolean;
+    silent?: boolean;
+    onResult?: (
+      outcome: { ok: true; value: WorktreeRemoveResult } | { ok: false; error: unknown },
+    ) => void;
   }) => void;
   /** 创建完成后的后续动作（刷新工作区列表/开新会话）。对话框提交即返回，
    *  后续的 git 进度全靠事件驱动。返回本次创建的 creationId：进度事件、
@@ -180,7 +187,7 @@ export const useWorktreeStore = create<WorktreeStore>((set, get) => {
       }
     },
 
-    remove: ({ workspaceId, worktreePath, repoPath, branch, deleteBranch }) => {
+    remove: ({ workspaceId, worktreePath, repoPath, branch, deleteBranch, silent, onResult }) => {
       void (async () => {
         const [{ useChatStore }, { useTerminalStore }, i18n] = await Promise.all([
           import("@/features/chat/store"),
@@ -199,9 +206,11 @@ export const useWorktreeStore = create<WorktreeStore>((set, get) => {
           } else if (result.branchKeptReason === "unknown" && branch) {
             notes.push(i18n.default.t("worktree.branchKeptUnknown", { branch }));
           }
-          if (notes.length > 0) useChatStore.setState({ actionError: notes.join(" ") });
+          if (notes.length > 0 && !silent) useChatStore.setState({ actionError: notes.join(" ") });
+          onResult?.({ ok: true, value: result });
         } catch (error) {
-          useChatStore.setState({ actionError: String(error) });
+          if (!silent) useChatStore.setState({ actionError: String(error) });
+          onResult?.({ ok: false, error });
         }
       })();
     },

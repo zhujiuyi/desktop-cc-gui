@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import Eye from "lucide-react/dist/esm/icons/eye";
 import X from "lucide-react/dist/esm/icons/x";
@@ -21,7 +21,7 @@ import {
   ProseSection,
 } from "./bot-editor-sections";
 import { MemorySection } from "./memory-section";
-import { isPlannedTab } from "./bot-concept-diagram";
+import { isPlannedTab } from "./bot-concept-model";
 
 /** Debounce before an edit is written to disk (typing feels instant, the
  *  file is not rewritten per keystroke). */
@@ -78,43 +78,49 @@ type SaveState =
   | { kind: "saved"; at: number }
   | { kind: "error"; message: string };
 
-/**
- * Bot editor dialog, opened from the list. A modal (not a full-bleed page):
- * the list stays one Esc away, and the same shell every other dialog uses
- * brings the backdrop, focus trap and outside-press dismissal. The identity
- * column answers "who is this" at every moment, the tabs answer
- * "what does it do".
- *
- * Saves are automatic: edits land in `draft`, and a debounced write patches
- * the store. The draft, not the store, is what the fields render — otherwise a
- * store refresh would fight the caret.
- */
-export function BotEditor({
-  bot,
-  onBack,
-}: {
-  bot: BotConfig;
-  /** Close the dialog. `saved` tells the list whether to mention the write. */
-  onBack: (saved: boolean) => void;
-}) {
+/** Every editable field the backend accepts. Sent as a whole patch: the
+ *  backend validates the full shape anyway, and a partial patch would need a
+ *  per-field dirty map that adds nothing here. */
+function draftPatch(current: BotConfig) {
+  return {
+    name: current.name,
+    slug: current.slug,
+    title: current.title ?? "",
+    description: current.description ?? "",
+    avatar: current.avatar,
+    soul: current.soul,
+    instructions: current.instructions,
+    capabilities: current.capabilities,
+    runtime: current.runtime,
+    memory: current.memory,
+    pinned: current.pinned,
+    hidden: current.hidden,
+  };
+}
+
+/** Debounced persistence for the editor draft. Edits land in `draft`; a timer
+ *  writes them to the store, and leaving the editor flushes early. The draft,
+ *  not the store, is what the fields render — otherwise a store refresh would
+ *  fight the caret. */
+function useBotEditorDraft(bot: BotConfig) {
   const { t } = useTranslation();
   const [draft, setDraft] = useState<BotConfig>(bot);
-  const [tab, setTab] = useState<TabId>("soul");
-  const [previewOpen, setPreviewOpen] = useState(false);
   const [save, setSave] = useState<SaveState>({ kind: "idle" });
   const timerRef = useRef<number | null>(null);
   const pendingRef = useRef(false);
   const draftRef = useRef(draft);
-  draftRef.current = draft;
 
-  const applyLocal = (patch: Partial<BotConfig>) => {
+  // The unmount flusher reads the latest draft; sync the snapshot in an effect
+  // so render stays pure (React may replay it).
+  useEffect(() => {
+    draftRef.current = draft;
+  }, [draft]);
+
+  const applyLocal = useCallback((patch: Partial<BotConfig>) => {
     setDraft((current) => ({ ...current, ...patch }));
     pendingRef.current = true;
-  };
+  }, []);
 
-  // Debounced autosave. The patch carries every editable field: the backend
-  // validates the whole shape anyway, and a partial patch would need a
-  // per-field dirty map that adds nothing here.
   useEffect(() => {
     if (!pendingRef.current) return;
     setSave({ kind: "saving" });
@@ -123,20 +129,7 @@ export function BotEditor({
       pendingRef.current = false;
       void useBotStore
         .getState()
-        .update(draft.id, {
-          name: draft.name,
-          slug: draft.slug,
-          title: draft.title ?? "",
-          description: draft.description ?? "",
-          avatar: draft.avatar,
-          soul: draft.soul,
-          instructions: draft.instructions,
-          capabilities: draft.capabilities,
-          runtime: draft.runtime,
-          memory: draft.memory,
-          pinned: draft.pinned,
-          hidden: draft.hidden,
-        })
+        .update(draft.id, draftPatch(draft))
         .then((updated) => {
           if (!updated) {
             setSave({ kind: "error", message: t("settings.botSaveMissing") });
@@ -170,26 +163,170 @@ export function BotEditor({
     () => () => {
       if (!pendingRef.current) return;
       const current = draftRef.current;
-      void useBotStore
-        .getState()
-        .update(current.id, {
-          name: current.name,
-          slug: current.slug,
-          title: current.title ?? "",
-          description: current.description ?? "",
-          avatar: current.avatar,
-          soul: current.soul,
-          instructions: current.instructions,
-          capabilities: current.capabilities,
-          runtime: current.runtime,
-          memory: current.memory,
-          pinned: current.pinned,
-          hidden: current.hidden,
-        })
-        .catch(() => {});
+      void useBotStore.getState().update(current.id, draftPatch(current)).catch(() => {});
     },
     [],
   );
+
+  /** Claim the dirty flag: true means the caller still has an unsaved edit. */
+  const consumePending = useCallback(() => {
+    const wasPending = pendingRef.current;
+    pendingRef.current = false;
+    return wasPending;
+  }, []);
+
+  return { draft, save, applyLocal, consumePending };
+}
+
+/** Autosave status line (saving / saved at hh:mm / error). */
+function SaveIndicator({ save }: { save: SaveState }) {
+  const { t } = useTranslation();
+  const label =
+    save.kind === "saving"
+      ? t("settings.botSaving")
+      : save.kind === "error"
+        ? t("settings.botSaveFailed", { message: save.message })
+        : save.kind === "saved"
+          ? t("settings.botSaved", {
+              time: new Date(save.at).toLocaleTimeString(undefined, {
+                hour: "2-digit",
+                minute: "2-digit",
+              }),
+            })
+          : t("settings.botSavedIdle");
+  return (
+    <span
+      role="status"
+      className={cx(
+        "ml-auto shrink-0 text-caption-1-regular",
+        save.kind === "error" ? "text-text-error-primary" : "text-text-tertiary",
+      )}
+    >
+      {label}
+    </span>
+  );
+}
+
+/**
+ * Bot editor dialog, opened from the list. A modal (not a full-bleed page):
+ * the list stays one Esc away, and the same shell every other dialog uses
+ * brings the backdrop, focus trap and outside-press dismissal. The identity
+ * column answers "who is this" at every moment, the tabs answer
+ * "what does it do".
+ *
+ * Saves are automatic: edits land in `draft`, and a debounced write patches
+ * the store. The draft, not the store, is what the fields render — otherwise a
+ * store refresh would fight the caret.
+ */
+/** Identity column: avatar studio plus the four stored identity fields.
+ *
+ *  常驻左栏，切到任何分区都不会丢。字段行沿用 BoardUI agent editor 的 96px
+ *  标签列 + 52px 行高，和真组件同一种节奏；400px 的栏宽留给输入框约 250px。
+ *  这一栏自己是滚动容器，子块一律 `shrink-0`：不写的话弹性收缩会把 239px 的
+ *  身份卡片压到 63px（它带 `overflow-hidden`，于是被剪掉而不是顶开滚动条），
+ *  整栏 scrollHeight 等于 clientHeight，滚也滚不动。滚动条不画
+ *  （`scrollbar-none`）：11px 的轨道贴在手边的分隔线上，看起来像第二条竖线，
+ *  而设置页本身的内容列（settings-shell）和页签条也都是这个做法。 */
+function BotIdentityPanel({
+  bot,
+  onChange,
+}: {
+  bot: BotConfig;
+  onChange: (patch: Partial<BotConfig>) => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <div className="scrollbar-none flex w-[400px] shrink-0 flex-col gap-4 overflow-y-auto border-r border-separator-border bg-background-secondary-default p-4">
+      <div className="shrink-0">
+        <BotAvatarStudio
+          avatar={bot.avatar}
+          seed={bot.id}
+          onChange={(avatar) => onChange({ avatar })}
+        />
+      </div>
+
+      <div className="flex shrink-0 flex-col overflow-hidden rounded-2xl bg-background-primary-default">
+        <IdRow label={t("settings.agentName")} htmlFor="bot-name">
+          <Input
+            id="bot-name"
+            size="small"
+            value={bot.name}
+            onChange={(name) => onChange({ name })}
+            maxLength={64}
+            aria-label={t("settings.agentName")}
+          />
+        </IdRow>
+        <IdRow label={t("settings.botTitleLabel")} htmlFor="bot-title">
+          <Input
+            id="bot-title"
+            size="small"
+            value={bot.title ?? ""}
+            onChange={(title) => onChange({ title })}
+            maxLength={48}
+            placeholder={t("settings.botTitlePlaceholder")}
+            aria-label={t("settings.botTitleLabel")}
+          />
+        </IdRow>
+        <IdRow label={t("settings.botDescriptionLabel")} htmlFor="bot-description" tall>
+          <TextArea
+            id="bot-description"
+            value={bot.description ?? ""}
+            onChange={(description) => onChange({ description })}
+            rows={2}
+            maxLength={200}
+            placeholder={t("settings.botDescriptionPlaceholder")}
+            aria-label={t("settings.botDescriptionLabel")}
+            // The vendored block's own sizing: a fixed 62px field inside
+            // the 82px row, no drag handle (it would escape the rounded
+            // card it sits in).
+            fieldClassName="h-[62px]"
+            inputClassName="resize-none"
+          />
+        </IdRow>
+        <IdRow label={t("settings.botSlugLabel")} htmlFor="bot-slug">
+          <div className="flex items-center gap-1">
+            <span className="text-body-2-regular text-text-tertiary">@</span>
+            <Input
+              id="bot-slug"
+              size="small"
+              value={bot.slug}
+              onChange={(slug) => onChange({ slug })}
+              maxLength={48}
+              aria-label={t("settings.botSlugLabel")}
+            />
+          </div>
+        </IdRow>
+      </div>
+
+      <div className="flex shrink-0 flex-col gap-1 text-caption-1-regular text-text-tertiary">
+        <p>{t("settings.botTitleHint")}</p>
+        <p>{t("settings.botDescriptionHint")}</p>
+        <p>{t("settings.botSlugHint")}</p>
+      </div>
+
+      <p className="mt-auto shrink-0 text-caption-1-regular text-text-quaternary">
+        {t("settings.botMetaLine", {
+          date: new Date(bot.createdAt).toLocaleDateString(),
+        })}
+        <br />
+        {t("settings.botSchemaLine", { version: bot.schemaVersion })}
+      </p>
+    </div>
+  );
+}
+
+export function BotEditor({
+  bot,
+  onBack,
+}: {
+  bot: BotConfig;
+  /** Close the dialog. `saved` tells the list whether to mention the write. */
+  onBack: (saved: boolean) => void;
+}) {
+  const { t } = useTranslation();
+  const { draft, save, applyLocal, consumePending } = useBotEditorDraft(bot);
+  const [tab, setTab] = useState<TabId>("soul");
+  const [previewOpen, setPreviewOpen] = useState(false);
 
   const tabs: Array<{ id: TabId; label: string; planned?: boolean }> = useMemo(() => {
     const all: Array<{ id: TabId; label: string; planned?: boolean }> = [
@@ -206,25 +343,7 @@ export function BotEditor({
   }, [t]);
   const engines = useChatStore((s) => s.engines);
 
-  const saveLabel =
-    save.kind === "saving"
-      ? t("settings.botSaving")
-      : save.kind === "error"
-        ? t("settings.botSaveFailed", { message: save.message })
-        : save.kind === "saved"
-          ? t("settings.botSaved", {
-              time: new Date(save.at).toLocaleTimeString(undefined, {
-                hour: "2-digit",
-                minute: "2-digit",
-              }),
-            })
-          : t("settings.botSavedIdle");
-
-  const close = () => {
-    const wasPending = pendingRef.current;
-    pendingRef.current = false;
-    onBack(wasPending);
-  };
+  const close = () => onBack(consumePending());
 
   return (
     <ModalShell
@@ -243,15 +362,7 @@ export function BotEditor({
               : t("settings.botSourceCustom")}
           </span>
         </span>
-        <span
-          role="status"
-          className={cx(
-            "ml-auto shrink-0 text-caption-1-regular",
-            save.kind === "error" ? "text-text-error-primary" : "text-text-tertiary",
-          )}
-        >
-          {saveLabel}
-        </span>
+        <SaveIndicator save={save} />
         <Button
           size="small"
           variant="secondary"
@@ -272,99 +383,22 @@ export function BotEditor({
       </div>
 
       <div className="relative flex min-h-0 flex-1">
-        {/* 身份：常驻左栏，切到任何分区都不会丢。字段行沿用 BoardUI agent
-            editor 的 96px 标签列 + 52px 行高，和真组件同一种节奏；400px 的栏宽
-            留给输入框约 250px。这一栏自己是滚动容器，子块一律 `shrink-0`：
-            不写的话弹性收缩会把 239px 的身份卡片压到 63px（它带
-            `overflow-hidden`，于是被剪掉而不是顶开滚动条），整栏 scrollHeight
-            等于 clientHeight，滚也滚不动。滚动条不画（`scrollbar-none`）：
-            11px 的轨道贴在手边的分隔线上，看起来像第二条竖线，而设置页
-            本身的内容列（settings-shell）和页签条也都是这个做法。 */}
-        <div className="scrollbar-none flex w-[400px] shrink-0 flex-col gap-4 overflow-y-auto border-r border-separator-border bg-background-secondary-default p-4">
-          <div className="shrink-0">
-            <BotAvatarStudio
-              avatar={draft.avatar}
-              seed={draft.id}
-              onChange={(avatar) => applyLocal({ avatar })}
-            />
-          </div>
-
-          <div className="flex shrink-0 flex-col overflow-hidden rounded-2xl bg-background-primary-default">
-            <IdRow label={t("settings.agentName")} htmlFor="bot-name">
-              <Input
-                id="bot-name"
-                size="small"
-                value={draft.name}
-                onChange={(name) => applyLocal({ name })}
-                maxLength={64}
-                aria-label={t("settings.agentName")}
-              />
-            </IdRow>
-            <IdRow label={t("settings.botTitleLabel")} htmlFor="bot-title">
-              <Input
-                id="bot-title"
-                size="small"
-                value={draft.title ?? ""}
-                onChange={(title) => applyLocal({ title })}
-                maxLength={48}
-                placeholder={t("settings.botTitlePlaceholder")}
-                aria-label={t("settings.botTitleLabel")}
-              />
-            </IdRow>
-            <IdRow label={t("settings.botDescriptionLabel")} htmlFor="bot-description" tall>
-              <TextArea
-                id="bot-description"
-                value={draft.description ?? ""}
-                onChange={(description) => applyLocal({ description })}
-                rows={2}
-                maxLength={200}
-                placeholder={t("settings.botDescriptionPlaceholder")}
-                aria-label={t("settings.botDescriptionLabel")}
-                // The vendored block's own sizing: a fixed 62px field inside
-                // the 82px row, no drag handle (it would escape the rounded
-                // card it sits in).
-                fieldClassName="h-[62px]"
-                inputClassName="resize-none"
-              />
-            </IdRow>
-            <IdRow label={t("settings.botSlugLabel")} htmlFor="bot-slug">
-              <div className="flex items-center gap-1">
-                <span className="text-body-2-regular text-text-tertiary">@</span>
-                <Input
-                  id="bot-slug"
-                  size="small"
-                  value={draft.slug}
-                  onChange={(slug) => applyLocal({ slug })}
-                  maxLength={48}
-                  aria-label={t("settings.botSlugLabel")}
-                />
-              </div>
-            </IdRow>
-          </div>
-
-          <div className="flex shrink-0 flex-col gap-1 text-caption-1-regular text-text-tertiary">
-            <p>{t("settings.botTitleHint")}</p>
-            <p>{t("settings.botDescriptionHint")}</p>
-            <p>{t("settings.botSlugHint")}</p>
-          </div>
-
-          <p className="mt-auto shrink-0 text-caption-1-regular text-text-quaternary">
-            {t("settings.botMetaLine", {
-              date: new Date(draft.createdAt).toLocaleDateString(),
-            })}
-            <br />
-            {t("settings.botSchemaLine", { version: draft.schemaVersion })}
-          </p>
-        </div>
+        <BotIdentityPanel bot={draft} onChange={applyLocal} />
 
         {/* 分区内容 */}
         <div className="flex min-w-0 flex-1 flex-col">
-          <div className="scrollbar-none flex shrink-0 items-center gap-1 overflow-x-auto border-b border-separator-border px-4 py-2">
+          <div
+            role="tablist"
+            className="scrollbar-none flex shrink-0 items-center gap-1 overflow-x-auto border-b border-separator-border px-4 py-2"
+          >
             {tabs.map((entry) => (
               <button
                 key={entry.id}
+                id={`bot-tab-${entry.id}`}
+                role="tab"
                 type="button"
                 aria-selected={tab === entry.id}
+                aria-controls={`bot-tabpanel-${entry.id}`}
                 onClick={() => setTab(entry.id)}
                 className={cx(
                   "flex shrink-0 cursor-pointer items-center gap-1.5 rounded-full px-3 py-1.5 text-body-2-regular",
@@ -384,7 +418,12 @@ export function BotEditor({
             ))}
           </div>
 
-          <div className="scrollbar-none min-h-0 flex-1 overflow-y-auto px-4 py-5">
+          <div
+            id={`bot-tabpanel-${tab}`}
+            role="tabpanel"
+            aria-labelledby={`bot-tab-${tab}`}
+            className="scrollbar-none min-h-0 flex-1 overflow-y-auto px-4 py-5"
+          >
             <div className="mx-auto flex w-full max-w-[680px] flex-col gap-4">
               {(tab === "soul" || tab === "rules") && (
                 <ProseSection

@@ -36,8 +36,10 @@ export async function skillIndexFor(bot: BotConfig): Promise<SkillIndexEntry[]> 
   }));
   if (enabled.includes("*")) return entries;
   // A skill the user enabled but that has since been uninstalled simply
-  // drops out of the index; the bot keeps working without it.
-  return entries.filter((entry) => enabled.includes(entry.name));
+  // drops out of the index; the bot keeps working without it. Set lookup so
+  // one filter pass does not rescan the enabled list per skill.
+  const enabledSet = new Set(enabled);
+  return entries.filter((entry) => enabledSet.has(entry.name));
 }
 
 /**

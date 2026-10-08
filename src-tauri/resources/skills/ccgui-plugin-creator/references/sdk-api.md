@@ -1,7 +1,7 @@
 <!-- 由 src/features/plugins/skill/creator-skill-docs.ts 从源码生成，请勿手改。 -->
 <!-- 重新生成：pnpm plugin-skill:docs（测试 creator-skill-docs.test.ts 会断言本文件与源码一致）。 -->
 
-# CC GUI 插件 SDK 参考（SDK 0.3.18）
+# CC GUI 插件 SDK 参考（SDK 0.3.20）
 
 本文件由脚本从 `packages/plugin-sdk`（公共契约）与宿主运行时（权限门禁）派生，属于 `ccgui-plugin-creator` skill。
 字段、方法、权限以本文件为准：**文中没有的 API 一律视为不存在**，不要凭记忆猜测方法名或权限名。
@@ -22,7 +22,7 @@ export default function activate(ctx: PluginContext): void | (() => void) {
 | `name` | `string` | 必填 | — |
 | `version` | `string` | 必填 | Semver 三段（x.y.z）。 |
 | `minAppVersion`? | `string` | 可选 | 要求的宿主最低版本。 |
-| `sdkVersion`? | `string` | 可选 | 要求的 SDK 版本区间（"^0.3" / "~0.3.0" / ">=0.3.0" / 精确 / "*"）。 缺省 = "*"（不校验）。宿主 SDK 不满足时插件进入 incompatible 态。 |
+| `sdkVersion`? | `string` | 可选 | 要求的 SDK 版本区间（"^0.4" / "~0.4.0" / ">=0.4.0" / 精确 / "*"）。 缺省 = "*"（不校验）。宿主 SDK 不满足时插件进入 incompatible 态。 |
 | `author`? | `string` | 可选 | — |
 | `description`? | `string` | 可选 | — |
 | `tier` | `PluginTier` | 必填 | — |
@@ -46,6 +46,10 @@ export default function activate(ctx: PluginContext): void | (() => void) {
 
 | 入口 | 权限 | 说明 |
 |---|---|---|
+| `ctx.hooks.registerSessionHooks` | `session.lifecycle.read` | — |
+| `ctx.hooks.registerTurnHooks` | `runtime.events.read`（`prompt.contribute.internal` 按需） | — |
+| `ctx.hooks.registerRuntimeSwitchHooks` | `runtime.switch.observe` | — |
+| `ctx.workspace.getMetadata` | `workspace.metadata.read` | Stable host-registered workspace identity for the active path. |
 | `ctx.ui.registerConversationMode` | `ui:conversation-mode` | — |
 | `ctx.ui.registerSettingsSection` | `ui:settings-section` | — |
 | `ctx.ui.registerAddMenuRow` | `ui:add-menu` | — |
@@ -53,12 +57,14 @@ export default function activate(ctx: PluginContext): void | (() => void) {
 | `ctx.ui.registerPanelTab` | `ui:panel-tab` | Chat right-panel tab (plan §4.2 #4); renders with the active workspace path. The strip renders plugin tabs icon-only, so `icon` is the visible identity — without one the tab falls back to the plugin's artwork / letter tile, and the label stays a title/accessible name. |
 | `ctx.ui.registerStatusBarItem` | `ui:status-bar` | App status-bar chip (plan §4.2 #8). |
 | `ctx.ui.registerComposerStatusItem` | `ui:composer-status` | Composer status-row chip (permission `ui:composer-status`, 0.3.9): renders in the composer's status row (branch/context meter row), left group after the branch switcher. |
+| `ctx.ui.registerOverlay` | `ui:overlay` | Persistent viewport mount; requires ui:overlay. The plugin controls placement and opts interactive children into pointer-events: auto. |
 | `ctx.ui.registerCommand` | `ui:command` | Command palette entry (plan §4.2 #9). |
 | `ctx.ui.registerSessionMenuItem` | `ui:session-menu` | Sidebar session right-click menu row (permission `ui:session-menu`, 0.3.5 起)。`run` 收到打开菜单的会话 `{ engine, sessionId }`。 |
 | `ctx.ui.openSettings` | `ui:settings-section` | 跳转到本插件的设置页（权限 `ui:settings-section`，0.3.6 起）。 `key` 对应 registerSettingsSection 的子 key，省略时打开主 section； 供状态栏 chip、面板按钮等做深链入口。 |
 | `ctx.ui.registerMarkdownRenderer` | `ui:markdown` | Markdown pipeline additions, merged over host defaults (plan §4.2 #5). |
 | `ctx.ui.registerPage` | `ui:page` | Overlay page at `#/p/<id>` (plan §4.2 #10). |
 | `ctx.ui.registerTimelineRowRenderer` | `ui:timeline-row` | Renderer for a plugin-defined chat timeline row kind (plan §4.2 #5). The row payload is plugin-defined and typed loosely — blob bundles can't share the host's TimelineRow type identity. |
+| `ctx.ui.registerWorkspaceMenuItem` | `ui:workspace-menu` | Sidebar workspace row context-menu entry. |
 | `ctx.ui.registerSidebarNav` | `ui:sidebar-entry` | Home sidebar nav entry under the builtin 自动化 row (permission `ui:sidebar-entry`, 0.3.12). `onOpen` usually opens the plugin's center tab via openCenterTab. |
 | `ctx.ui.registerCenterTab` | `ui:center-tab` | Center-area tab definition (permission `ui:center-tab`, 0.3.12): renders in the center tab strip like session/file/browser tabs. Opening goes through openCenterTab; multiple keys = multiple tabs. |
 | `ctx.ui.openCenterTab` | `ui:center-tab` | Open (or focus) one of this plugin's registered center tabs (permission `ui:center-tab`, 0.3.12). Throws when the tab was never registered — open failures must be visible, not silent. |
@@ -73,12 +79,19 @@ export default function activate(ctx: PluginContext): void | (() => void) {
 | `ctx.workspaces.add` | `host:workspace`（`host:workspace:remote` 按需） | — |
 | `ctx.workspaces.list` | `host:workspace` | 侧栏工作区快照（只读；权限 `host:workspace`，0.3.16 起）。 worktree 子行额外带 `worktree: { branch, prNumber? }` 只读投影 （0.3.17 起），用来把 PR 绑到本地 worktree；字段定义见 `PluginWorkspaceRow`，`meta` 本体仍不输出。 |
 | `ctx.worktrees.create` | `host:worktree` | — |
+| `ctx.worktrees.remove` | `host:worktree` | 删除本地 worktree（权限 `host:worktree`，0.3.19 起）：走宿主侧栏 的删除流程——`git worktree remove`（可选删分支）+ 注销侧栏/终端 登记。reject 的 message 形如 "<errorKind>: <detail>"（errorKind 与 创建同一套分类，另有 not_found / remove_failed）。resolve 带非致命 尾巴：`orphanDirectory`（目录没能删掉）、`branchKeptReason` （"checked_out_elsewhere" \| "unknown"；null = 分支已删或未要求删）。 |
 | `ctx.sessions.selectSession` | `host:session` | — |
 | `ctx.sessions.refresh` | `host:session` | 请求宿主立即刷新会话目录（侧栏/标签页），0.3.7 起。 插件绕过宿主直写会话数据（如 sqlite custom_title、转录 title 行）后 调用——否则变更要等用户手动同步或下次常规刷新才可见。 |
 | `ctx.sessions.setEffort` | `host:session` | 修改已有会话的 effort 档位，0.3.10 起。直写宿主会话状态并持久化 （等价于用户在会话内切换档位，refreshSessions 不会回滚）。未知会话 或空 effort 以 rejection 失败——不会创建幽灵会话条目。 |
 | `ctx.sessions.startRun` | `host:session` | 把一个 AI 轮次跑成**宿主聊天会话**（0.3.18 起，权限 `host:session`）： 会话立刻出现在侧栏（带运行中状态，不需要手动同步），打开就是实时 流式输出；停止既能在聊天里点，也能用 `interruptRun`。会话挂在 `workspacePath` 工作区下，模型/强度/渠道只覆盖这一轮，不动用户的 全局默认。 与 `ctx.agent.start` 的分工：那个是插件自有的后台轮次（事件只回 插件，不进聊天）；这个就是「像用户自己发了一条」。需要用户看得见、 随时能接管/停止的轮次用本方法。 spawn 成功后 resolve `{ runId, sessionId }`（引擎稍后才 announce sessionId 时为 null）；轮次终止经 `plugin-run://<pluginId>` 事件回执： `{ runId, sessionId, engine, workspacePath, kind: "done" \| "error", error }`。 被用户/插件中断的轮次同样以 `done` 收尾。 |
 | `ctx.sessions.interruptRun` | `host:session` | 停止 `startRun` 起的轮次（等价于聊天里的停止按钮）。 |
 | `ctx.sessions.registerSource` | `host:session` | — |
+| `ctx.window.getState` | `host:window` | — |
+| `ctx.window.setNormalBounds` | `host:window` | — |
+| `ctx.window.sampleWechat` | `host:window` | — |
+| `ctx.models.listEngines` | `host:models` | — |
+| `ctx.models.listEngineModels` | `host:models` | — |
+| `ctx.models.catalog` | `host:models` | Aggregated safe catalog. Provider endpoints are contacted only when refreshProviders is true (must be tied to an explicit user action). |
 | `ctx.agent.catalog` | `agent` | — |
 | `ctx.agent.start` | `agent` | 启动一个 agent 轮次；返回的 runId 用于事件过滤与 interrupt。 |
 | `ctx.agent.interrupt` | `agent` | 中断本插件启动的 run（run id 属主前缀由宿主强制）。 |
@@ -86,6 +99,36 @@ export default function activate(ctx: PluginContext): void | (() => void) {
 ## PluginContext 完整签名
 
 以下签名与 `@ccgui/plugin-sdk` 源码逐字对应（类型已收成一行）。
+
+### ctx.hooks
+
+```ts
+hooks: {
+  /** 权限：session.lifecycle.read */
+  registerSessionHooks(hooks: SessionHooks): Disposer;
+  /** 权限：runtime.events.read、prompt.contribute.internal */
+  registerTurnHooks(hooks: TurnHooks): Disposer;
+  /** 权限：runtime.switch.observe */
+  registerRuntimeSwitchHooks(hooks: RuntimeSwitchHooks): Disposer;
+}
+```
+
+### ctx.workspace
+
+```ts
+workspace: {
+  /** 权限：workspace.metadata.read */
+  getMetadata(): Promise<WorkspaceMetadata>;
+}
+```
+
+### ctx.shell
+
+```ts
+shell: {
+  revealPath(path: string): Promise<void>;
+}
+```
 
 ### ctx.ui
 
@@ -105,6 +148,8 @@ ui: {
   registerStatusBarItem(def: { key?: string; component: ComponentType; order?: number; zone?: "start" | "end" }): Disposer;
   /** 权限：ui:composer-status */
   registerComposerStatusItem(def: { key?: string; component: ComponentType; order?: number }): Disposer;
+  /** 权限：ui:overlay */
+  registerOverlay(def: { key?: string; component: ComponentType; order?: number }): Disposer;
   /** 权限：ui:command */
   registerCommand(def: { key: string; title(): string; keywords?(): string[]; run(): void }): Disposer;
   /** 权限：ui:session-menu */
@@ -117,6 +162,8 @@ ui: {
   registerPage(def: { key?: string; title(): string; component: ComponentType }): Disposer;
   /** 权限：ui:timeline-row */
   registerTimelineRowRenderer(def: { kind: string; key?: string; component: ComponentType<{ row: { kind: string } }> }): Disposer;
+  /** 权限：ui:workspace-menu */
+  registerWorkspaceMenuItem(def: { key?: string; label(ctx: { workspaceId: string; archived: boolean }): WorkspaceMenuLabelValue; icon?: ComponentType<{ className?: string }>; visible?(ctx: { workspaceId: string; archived: boolean }): boolean; onSelect(ctx: { workspaceId: string; archived: boolean }): void; order?: number }): Disposer;
   /** 权限：ui:sidebar-entry */
   registerSidebarNav(def: { key?: string; label(): string; icon?: ComponentType<{ className?: string }>; order?: number; onOpen(): void }): Disposer;
   /** 权限：ui:center-tab */
@@ -201,6 +248,8 @@ Worktree 创建（权限 `host:worktree`，0.3.17 起）：经宿主「新建 Wo
 worktrees: {
   /** 权限：host:worktree */
   create(def: { repoPath: string; parentWorkspaceId: string; branch: string; baseRef?: string | null; prNumber?: number | null; prTitle?: string | null; prUrl?: string | null; existingBranch?: boolean }): Promise<{ worktreePath: string }>;
+  /** 权限：host:worktree */
+  remove(def: { repoPath: string; worktreePath: string; branch?: string | null; deleteBranch?: boolean }): Promise<{ orphanDirectory: boolean; branchKeptReason: string | null }>;
 }
 ```
 
@@ -222,6 +271,36 @@ sessions: {
   interruptRun(def: { engine: string; workspacePath: string; sessionId?: string | null }): Promise<void>;
   /** 权限：host:session */
   registerSource(def: { id: string; list(): Promise<ExternalSessionRow[]> }): Disposer;
+}
+```
+
+### ctx.window
+
+主窗口访问（权限 `host:window`，0.3.19 起）。坐标与尺寸均为物理像素； setNormalBounds 仅接受普通态窗口，并要求至少 64x64 像素落在当前任一屏幕。 sampleWechat 在 Windows 按可执行名 Weixin.exe/WeChat.exe 采样；其他平台 以 Unsupported 拒绝，找不到以 NotFound 拒绝。
+
+```ts
+window: {
+  /** 权限：host:window */
+  getState(): Promise<PluginWindowSnapshot>;
+  /** 权限：host:window */
+  setNormalBounds(bounds: PluginWindowBounds): Promise<PluginWindowSnapshot>;
+  /** 权限：host:window */
+  sampleWechat(): Promise<PluginWechatWindow>;
+}
+```
+
+### ctx.models
+
+宿主模型目录（权限 `host:models`，0.3.19 起）。结果来自宿主权威 list_engines/list_engine_models，不包含 API key、token 或完整 provider 配置。 workspace 可选；远程工作区由拥有 CLI 的远程宿主/WSL 侧探测。
+
+```ts
+models: {
+  /** 权限：host:models */
+  listEngines(): Promise<PluginEngineInfo[]>;
+  /** 权限：host:models */
+  listEngineModels(engine: string, workspace?: string): Promise<PluginEngineCatalog>;
+  /** 权限：host:models */
+  catalog(options?: { workspace?: string; refreshProviders?: boolean }): Promise<PluginModelCatalogResult>;
 }
 ```
 
@@ -267,6 +346,8 @@ host: {
 ctx.pluginId: string;
 ctx.version: string;
 ctx.react: typeof React; // Shared host React instance: external bundles can't resolve bare imports, so they build host-tree components with `ctx.react.createElement`; 插件自己的子树用自带 React cre…
+ctx.documentStorage: DocumentStorage; // Isolated CAS text storage rooted under plugin-data/<plugin-id>.
+ctx.assets: PluginAssets;
 ```
 
 ## 权限目录
@@ -281,10 +362,12 @@ ctx.react: typeof React; // Shared host React instance: external bundles can't r
 | `ui:composer-status` | `ctx.ui.registerComposerSlot`、`ctx.ui.registerComposerStatusItem` |
 | `ui:panel-tab` | `ctx.ui.registerPanelTab` |
 | `ui:status-bar` | `ctx.ui.registerStatusBarItem` |
+| `ui:overlay` | `ctx.ui.registerOverlay` |
 | `ui:command` | `ctx.ui.registerCommand` |
 | `ui:markdown` | `ctx.ui.registerMarkdownRenderer` |
 | `ui:page` | `ctx.ui.registerPage` |
 | `ui:timeline-row` | `ctx.ui.registerTimelineRowRenderer` |
+| `ui:workspace-menu` | `ctx.ui.registerWorkspaceMenuItem` |
 | `ui:session-menu` | `ctx.ui.registerSessionMenuItem` |
 | `ui:sidebar-entry` | `ctx.ui.registerSidebarNav` |
 | `ui:center-tab` | `ctx.ui.registerCenterTab`、`ctx.ui.openCenterTab` |
@@ -298,7 +381,17 @@ ctx.react: typeof React; // Shared host React instance: external bundles can't r
 | `host:session` | `ctx.sessions.selectSession`、`ctx.sessions.refresh`、`ctx.sessions.setEffort`、`ctx.sessions.startRun`、`ctx.sessions.interruptRun`、`ctx.sessions.registerSource` |
 | `host:workspace` | `ctx.workspaces.add`、`ctx.workspaces.list` |
 | `host:workspace:remote` | `ctx.workspaces.add` |
-| `host:worktree` | `ctx.worktrees.create` |
+| `host:worktree` | `ctx.worktrees.create`、`ctx.worktrees.remove` |
+| `host:window` | `ctx.window.getState`、`ctx.window.setNormalBounds`、`ctx.window.sampleWechat` |
+| `host:models` | `ctx.models.listEngines`、`ctx.models.listEngineModels`、`ctx.models.catalog` |
+| `session.lifecycle.read` | `ctx.hooks.registerSessionHooks` |
+| `runtime.events.read` | `ctx.hooks.registerTurnHooks` |
+| `runtime.switch.observe` | `ctx.hooks.registerRuntimeSwitchHooks` |
+| `prompt.contribute.internal` | `ctx.hooks.registerTurnHooks` |
+| `workspace.metadata.read` | `ctx.workspace.getMetadata` |
+| `plugin.storage` | `ctx.documentStorage.getLocation`、`ctx.documentStorage.selectLocation`、`ctx.documentStorage.readText`、`ctx.documentStorage.writeTextAtomic`、`ctx.documentStorage.remove`、`ctx.documentStorage.list`、`ctx.assets.documentUrl` |
+| `assets:bundle` | `ctx.assets.bundleUrl` |
+| `assets:directory` | `ctx.assets.grantDirectory`、`ctx.assets.listDirectories`、`ctx.assets.revokeDirectory`、`ctx.assets.directoryUrl` |
 
 ### network: / exec: 授权形状
 

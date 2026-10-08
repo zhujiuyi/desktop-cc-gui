@@ -116,8 +116,7 @@ export function buildCodexConfigToml(
   wireApi: "responses" | "chat" = "responses",
   providerId = "custom",
 ): string {
-  return `disable_response_storage = true
-model = ${tomlString(model)}
+  return `model = ${tomlString(model)}
 model_reasoning_effort = "high"
 model_provider = ${tomlString(providerId)}
 

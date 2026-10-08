@@ -9,11 +9,11 @@ vi.mock("@/lib/ipc", () => ({
   ipc: {
     sendMessage: vi.fn(async () => ({ runId: "run-1", sessionId: null })),
     loadSessionPage: vi.fn(async () => ({ messages: [], nextBefore: null, subagentHistory: [] })),
+    listPlanReviews: vi.fn(async () => []),
     rememberSessionModel: vi.fn(async () => {}),
     rememberSessionEffort: vi.fn(async () => {}),
     listSessions: vi.fn(async () => []),
     listArchivedSessions: vi.fn(async () => []),
-    listPlanReviews: vi.fn(async () => []),
     rescanSessions: vi.fn(async () => {}),
     usageRecord: vi.fn(async () => {}),
   },

@@ -6,7 +6,7 @@
  * 插件仓用法（包未发布 npm 前的过渡方案）：复制本文件为插件仓的
  * `src/ccgui-plugin.d.ts`，首行版本戳必须与所用宿主 SDK 一致。
  *
- * @ccgui/plugin-sdk v0.3.18
+ * @ccgui/plugin-sdk v0.3.20
  */
 
 /** 宿主实现的 SDK 契约版本。 */
@@ -57,11 +57,82 @@ export interface PluginWorkspaceRow {
   worktree?: { branch: string; prNumber?: number };
 }
 
+export interface PluginWindowBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+export interface PluginWindowSnapshot {
+  bounds: PluginWindowBounds;
+  state: "normal" | "minimized" | "maximized" | "fullscreen";
+  scaleFactor: number;
+}
+export interface PluginWechatWindow {
+  bounds: PluginWindowBounds;
+  executable: "Weixin.exe" | "WeChat.exe";
+}
+export interface PluginEngineInfo {
+  id: string;
+  available: boolean;
+  enabled: boolean;
+  supportsImages: boolean;
+  supportsComputerUse: boolean;
+  supportsEffort: boolean;
+  supportsToolConstraints: boolean;
+  permissions: string[];
+}
+export interface PluginEngineModel {
+  id: string;
+  name?: string | null;
+  description?: string | null;
+  provider: string;
+  contextWindow?: number | null;
+}
+export interface PluginEngineCatalog {
+  models: PluginEngineModel[];
+  authoritative: boolean;
+  remote?: boolean;
+}
+export interface PluginEngineCatalogEntry {
+  engine: PluginEngineInfo;
+  catalog: PluginEngineCatalog;
+}
+export interface PluginModelCatalogResult {
+  engines: PluginModelCatalogEngine[];
+  errors: PluginModelCatalogError[];
+  refreshedAt: number;
+}
+export interface PluginModelCatalogEngine {
+  engine: PluginEngineInfo;
+  sources: PluginModelSource[];
+}
+export interface PluginModelSource {
+  id: string;
+  name: string;
+  kind: "cli" | "official" | "provider" | "custom" | "configured" | "builtin";
+  authoritative: boolean;
+  remote: boolean;
+  models: PluginEngineModel[];
+  refreshedAt: number;
+  detail?: string;
+}
+export interface PluginModelCatalogError {
+  engine: string;
+  sourceId?: string;
+  message: string;
+}
+
 /** 信任层级（ADR-1）：declarative = 零 JS 声明式。 */
 export type PluginTier = "declarative" | "js";
 
 /** 插件入口唯一约定：main.js 默认导出本函数。 */
 export type PluginActivate = (ctx: PluginContext) => void | (() => void);
+/** Validates safe lowercase point-separated plugin ids: 2..=64 bytes total,
+ *  each segment `[a-z0-9][a-z0-9-]*`. Byte-for-byte identical to the Rust
+ *  install-time check. */
+export declare function isValidPluginId(id: string): boolean;
+
 
 /** 外部会话源行(ctx.sessions.registerSource,0.3.4 起):插件上报的
  *  远端/容器内会话摘要。workspacePath 必须是已登记工作区的 path,否则
@@ -121,6 +192,13 @@ export interface PluginManifest {
 }
 
 export type ComposerSlotId = "addMenu" | "cliMenu" | "permissionMenu";
+export type WorkspaceMenuStatusTone = "success" | "muted";
+export interface WorkspaceMenuLabel {
+  text: string;
+  status?: { text: string; tone: WorkspaceMenuStatusTone };
+}
+export type WorkspaceMenuLabelValue = string | WorkspaceMenuLabel;
+
 
 /** 侧栏会话右键菜单被打开时所在的会话行。 */
 export interface SessionMenuTarget {
@@ -129,6 +207,231 @@ export interface SessionMenuTarget {
 }
 
 export type ComponentLike<P = Record<string, never>> = (props: P) => unknown;
+export interface WorkspaceMetadata {
+  id: string;
+  path: string;
+  gitBranch?: string;
+  gitHead?: string;
+  dirty?: boolean;
+}
+
+export interface PromptContribution {
+  id: string;
+  content: string;
+  placement: "system-tail" | "request-tail";
+  visibility: "internal";
+  persistence: "turn" | "session";
+  /** Called synchronously by the host exactly once after the engine accepts a
+   * launch carrying this contribution. It is not called when launch fails or
+   * when the byte budget rejects the contribution. Callback failures are
+   * isolated and do not fail the accepted launch. Admitted contributions are
+   * confirmed before afterTurn, even if the terminal event arrives first. */
+  onAccepted?: () => void;
+}
+
+export interface InternalMessageCapture {
+  channel: string;
+  nonce?: string;
+  maxBytes: number;
+  /** Synchronous predicate the host calls on each candidate frame's parsed
+   *  payload, inline while parsing. Return true to let the host hide the frame
+   *  from the transcript and deliver it to the plugin; returning false (or
+   *  throwing) keeps the frame visible. NOT authoritative — the payload is
+   *  still untrusted, so the plugin must validate again in
+   *  `onInternalMessage`. Must be synchronous: it gates visibility before the
+   *  async delivery can run. */
+  validate?: (payload: unknown) => boolean;
+}
+
+export interface BeforeTurnResult {
+  promptContributions?: PromptContribution[];
+  internalMessageCapture?: InternalMessageCapture;
+  /** Pure synchronous lifetime guard, checked during collection, replay,
+   * launch acceptance, and capture parsing/delivery. False or throwing retires
+   * this result's prompts and capture; a retired lifetime must not revive. */
+  isCurrent?: () => boolean;
+}
+
+interface SessionEventBase {
+  engine: string;
+  sessionId: string | null;
+  workspace: WorkspaceMetadata;
+  occurredAt: string;
+}
+
+export interface SessionCreatedEvent extends SessionEventBase {}
+export interface SessionRestoredEvent extends SessionEventBase { sessionId: string }
+export interface SessionClosedEvent extends SessionEventBase {}
+
+interface TurnEventBase {
+  runId: string;
+  turnId: string;
+  engine: string;
+  sessionId: string | null;
+  workspace: WorkspaceMetadata;
+  occurredAt: string;
+}
+
+export interface BeforeTurnEvent extends TurnEventBase {}
+export interface AfterTurnEvent extends TurnEventBase {
+  status: "completed" | "cancelled" | "failed";
+  error?: string;
+}
+export interface InternalMessageEvent extends TurnEventBase {
+  channel: string;
+  nonce?: string;
+  payload: unknown;
+}
+
+export interface RuntimeSwitchEvent {
+  /** Stable identity shared by beforeSwitch and afterSwitch for one launch. */
+  switchId: string;
+  sourceEngine: string;
+  targetEngine: string;
+  sourceSessionId: string | null;
+  targetSessionId: string | null;
+  workspace: WorkspaceMetadata;
+  occurredAt: string;
+}
+
+interface NormalizedRuntimeEventBase {
+  eventId: string;
+  runId: string;
+  turnId: string;
+  engine: string;
+  sessionId: string | null;
+  workspaceId: string;
+  workspacePath: string;
+  occurredAt: string;
+}
+
+export interface FileChangedEvent extends NormalizedRuntimeEventBase {
+  kind: "file-changed";
+  path: string;
+  /** `touched`（适配器可确定的最弱事实）：引擎报告了针对该路径的修改类
+   *  工具调用；不断言是创建、修改还是删除。 */
+  change: "created" | "modified" | "deleted" | "touched";
+}
+/** 引擎已发起该命令：本事件不含结果，退出码未知；结果由同一工具行的
+ *  command-finished 声明。 */
+export interface CommandStartedEvent extends NormalizedRuntimeEventBase {
+  kind: "command-started";
+  command: string;
+  cwd: string;
+  startedAt: string;
+}
+export interface CommandFinishedEvent extends NormalizedRuntimeEventBase {
+  kind: "command-finished";
+  command: string;
+  cwd: string;
+  /** 仅引擎在同一工具消息里给出结构化数字退出码时才有值；null 表示结果
+   *  里没有退出码，status 随之是 unknown。 */
+  exitCode: number | null;
+  startedAt?: string;
+  finishedAt: string;
+  status: "completed" | "failed" | "cancelled" | "unknown";
+}
+export interface ToolFinishedEvent extends NormalizedRuntimeEventBase {
+  kind: "tool-finished";
+  toolName: string;
+  status: "completed" | "failed" | "cancelled" | "unknown";
+}
+/** A denied engine capability surfaced for host approval, not a promise
+ * that the engine is paused. No user-facing message text is exposed. */
+export interface PermissionRequestedEvent extends NormalizedRuntimeEventBase {
+  kind: "permission-requested";
+  tool: string | null;
+  path: string | null;
+}
+export interface AssistantCompletedEvent extends NormalizedRuntimeEventBase {
+  kind: "assistant-completed";
+}
+export interface TurnCancelledEvent extends NormalizedRuntimeEventBase {
+  kind: "turn-cancelled";
+}
+export interface TurnFailedEvent extends NormalizedRuntimeEventBase {
+  kind: "turn-failed";
+  error?: string;
+}
+export interface RuntimeExitedEvent extends NormalizedRuntimeEventBase {
+  kind: "runtime-exited";
+  exitCode: number | null;
+}
+
+export type NormalizedRuntimeEvent =
+  | FileChangedEvent
+  | CommandStartedEvent
+  | CommandFinishedEvent
+  | ToolFinishedEvent
+  | PermissionRequestedEvent
+  | AssistantCompletedEvent
+  | TurnCancelledEvent
+  | TurnFailedEvent
+  | RuntimeExitedEvent;
+
+export interface SessionHooks {
+  onCreated?(event: SessionCreatedEvent): void | Promise<void>;
+  onRestored?(event: SessionRestoredEvent): void | Promise<void>;
+  onClosed?(event: SessionClosedEvent): void | Promise<void>;
+}
+export interface TurnHooks {
+  beforeTurn?(event: BeforeTurnEvent): BeforeTurnResult | void | Promise<BeforeTurnResult | void>;
+  /** Read-only launch observation; requires runtime.events.read, not prompt
+   * contribution permission. Correlate start and finish using turnId. */
+  onTurnStarted?(event: BeforeTurnEvent): void | Promise<void>;
+  onRuntimeEvent?(event: NormalizedRuntimeEvent): void;
+  afterTurn?(event: AfterTurnEvent): void | Promise<void>;
+  onInternalMessage?(event: InternalMessageEvent): void | Promise<void>;
+}
+export interface RuntimeSwitchHooks {
+  beforeSwitch?(event: RuntimeSwitchEvent): void | Promise<void>;
+  afterSwitch?(event: RuntimeSwitchEvent): void | Promise<void>;
+}
+
+export type DocumentStorageLocationKind = "data" | "program" | "custom";
+export interface ResolvedDocumentStorageLocation {
+  kind: DocumentStorageLocationKind;
+  path: string;
+}
+export interface DocumentReadResult { content: string; version: string }
+export interface DocumentWriteResult { version: string }
+export interface DocumentStorage {
+  getLocation(): Promise<ResolvedDocumentStorageLocation>;
+  selectLocation(kind: DocumentStorageLocationKind): Promise<ResolvedDocumentStorageLocation>;
+  readText(relativePath: string): Promise<DocumentReadResult | null>;
+  /** expectedVersion=null requires the document not to exist. */
+  writeTextAtomic(
+    relativePath: string,
+    content: string,
+    expectedVersion: string | null,
+  ): Promise<DocumentWriteResult>;
+  /** Delete a document. Pass the opaque version from the last read for a
+   *  conditional (CAS) delete; omit/null deletes unconditionally. A stale
+   *  version rejects with a conflict. */
+  remove(relativePath: string, expectedVersion?: string | null): Promise<void>;
+  list(prefix?: string): Promise<string[]>;
+}
+
+export interface AssetDirectoryGrant {
+  grantId: string;
+  /** Canonical host filesystem path. */
+  path: string;
+}
+export interface PluginAssets {
+  /** assets:bundle permission. */
+  bundleUrl(relativePath: string): string;
+  /** plugin.storage permission; follows the selected document root. */
+  documentUrl(relativePath: string): string;
+  /** HTTP(S) proxy, exact network:<host> grant; no embedded credentials. */
+  remoteUrl(url: string): string;
+  /** User action only; assets:directory permission. Cancellation rejects. */
+  grantDirectory(): Promise<AssetDirectoryGrant>;
+  listDirectories(): Promise<AssetDirectoryGrant[]>;
+  revokeDirectory(grantId: string): Promise<void>;
+  /** Forward-slash relative path inside a directory granted to this plugin. */
+  directoryUrl(grantId: string, relativePath: string): string;
+}
+
 
 /** 插件唯一能力门面（plan §5.2）。每个 register* 需要对应权限声明，
  *  返回 Disposer；未显式回收也由宿主 disposer 栈兜底。 */
@@ -138,7 +441,30 @@ export interface PluginContext {
   /** 宿主共享 React：宿主树容器组件经它创建（createElement/useRef/...）；
    *  插件自有子树用自己的 createRoot 挂进容器（双段挂载模式）。 */
   react: typeof import("react");
+  hooks: {
+    registerSessionHooks(hooks: SessionHooks): Disposer;
+    registerTurnHooks(hooks: TurnHooks): Disposer;
+    registerRuntimeSwitchHooks(hooks: RuntimeSwitchHooks): Disposer;
+  };
+  workspace: {
+    /** 稳定的宿主登记工作区身份（权限 workspace.metadata.read）。 */
+    getMetadata(): Promise<WorkspaceMetadata>;
+  };
+  /** 插件隔离的 CAS 文本文档存储（权限 plugin.storage）。 */
+  documentStorage: DocumentStorage;
+  assets: PluginAssets;
+  shell: {
+    /** Reveal only within this plugin's document root or granted directories. */
+    revealPath(path: string): Promise<void>;
+  };
   ui: {
+    /** Persistent viewport mount (ui:overlay); interactive children must
+     * explicitly opt into pointer-events: auto. Removed on plugin unload. */
+    registerOverlay(def: {
+      key?: string;
+      component: ComponentLike;
+      order?: number;
+    }): Disposer;
     registerConversationMode(def: {
       key?: string;
       label: () => string;
@@ -206,7 +532,7 @@ export interface PluginContext {
     registerSessionMenuItem(def: {
       key?: string;
       label: () => string;
-      icon?: ComponentType<{ className?: string }>;
+      icon?: ComponentLike<{ className?: string }>;
       danger?: boolean;
       run: (target: SessionMenuTarget) => void;
     }): Disposer;
@@ -232,6 +558,15 @@ export interface PluginContext {
       kind: string;
       key?: string;
       component: ComponentLike<{ row: { kind: string } }>;
+    }): Disposer;
+    /** 侧边栏工作区行右键菜单条目（权限 ui:workspace-menu）。 */
+    registerWorkspaceMenuItem(def: {
+      key?: string;
+      label: (ctx: { workspaceId: string; archived: boolean }) => WorkspaceMenuLabelValue;
+      icon?: ComponentLike<{ className?: string }>;
+      visible?: (ctx: { workspaceId: string; archived: boolean }) => boolean;
+      onSelect: (ctx: { workspaceId: string; archived: boolean }) => void;
+      order?: number;
     }): Disposer;
     /** 首页侧栏导航入口，位于内建「自动化」之下（权限 ui:sidebar-entry，
      *  0.3.12 起）。onOpen 通常经 openCenterTab 打开本插件的中心页签。 */
@@ -354,6 +689,18 @@ export interface PluginContext {
       /** true = branch 是已存在的本地分支(检出而非新建)。 */
       existingBranch?: boolean;
     }): Promise<{ worktreePath: string }>;
+    /** 删除本地 worktree(权限 host:worktree,0.3.19 起):走宿主侧栏
+     *  的删除流程——git worktree remove(可选删分支)+ 注销侧栏/终端
+     *  登记。reject 的 message 形如 "<errorKind>: <detail>"(errorKind 与
+     *  创建同一套分类,另有 not_found / remove_failed)。resolve 带非致命
+     *  尾巴:orphanDirectory(目录没能删掉)、branchKeptReason
+     *  ("checked_out_elsewhere" | "unknown";null = 分支已删或未要求删)。 */
+    remove(def: {
+      repoPath: string;
+      worktreePath: string;
+      branch?: string | null;
+      deleteBranch?: boolean;
+    }): Promise<{ orphanDirectory: boolean; branchKeptReason: string | null }>;
   };
   /** 会话打开 + 外部会话源(权限 host:session;selectSession 0.3.3 起,
    *  registerSource 0.3.4 起)。registerSource:登记异步会话源,宿主在会话
@@ -395,7 +742,10 @@ export interface PluginContext {
       /** 本轮渠道 id(catalog 的 providers[].id)。 */
       providerId?: string | null;
     }): Promise<{ runId: string; sessionId: string | null }>;
-    /** 停止 startRun 起的轮次(等价于聊天里的停止按钮)。 */
+    /** 停止 startRun 起的轮次(等价于聊天里的停止按钮)。只允许停止本插件
+     *  startRun 起的、仍在运行的轮次：没有匹配的在跑轮次会以 rejection 失败，
+     *  不会误停用户或其他插件的会话；`sessionId: null` 匹配本插件在该引擎+工作
+     *  区里的任意在跑轮次（原生 id 可能在 startRun 返回后才 announce）。 */
     interruptRun(def: {
       engine: string;
       workspacePath: string;
@@ -406,6 +756,26 @@ export interface PluginContext {
       id: string;
       list: () => Promise<ExternalSessionRow[]>;
     }): Disposer;
+  };
+  /** 主窗口访问（权限 host:window，SDK 0.3.19；宿主 ≥ 1.0.10）。物理像素坐标；
+   *  设置 bounds 只允许普通态且必须保留在连接的屏幕内。微信采样在 Windows
+   *  按 Weixin.exe/WeChat.exe 进程名识别，其他平台返回 Unsupported。 */
+  window: {
+    getState(): Promise<PluginWindowSnapshot>;
+    setNormalBounds(bounds: PluginWindowBounds): Promise<PluginWindowSnapshot>;
+    sampleWechat(): Promise<PluginWechatWindow>;
+  };
+  /** 权威宿主模型目录（权限 host:models，SDK 0.3.19；宿主 ≥ 1.0.10）。
+   *  返回 engine/model 的公开字段与 authoritative/remote 标志，不返回密钥、
+   *  token 或完整 provider 配置。 */
+  models: {
+    listEngines(): Promise<PluginEngineInfo[]>;
+    listEngineModels(engine: string, workspace?: string): Promise<PluginEngineCatalog>;
+    /** 仅 refreshProviders=true 才联网；调用方必须绑定显式用户动作。 */
+    catalog(options?: {
+      workspace?: string;
+      refreshProviders?: boolean;
+    }): Promise<PluginModelCatalogResult>;
   };
   /** Agent 轮次（权限 `agent`，0.3.13 起）：经宿主引擎管线拉起 agent
    *  进程——渠道注入、进程注册与聊天发送同构。事件经 `agent://<pluginId>`

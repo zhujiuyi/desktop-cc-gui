@@ -71,6 +71,48 @@ export function TooltipContent({
   );
 }
 
+export interface TooltipPanelProps
+  extends Pick<ComponentProps<typeof AriaTooltip>, "placement" | "offset"> {
+  /** Card heading, already localized by the caller. */
+  title: string;
+  children: ReactNode;
+  className?: string;
+}
+
+/**
+ * TooltipPanel — a small card rather than a one-line hint: a title plus
+ * `dt`/`dd` rows. Same hover/focus behavior as TooltipContent, styled like
+ * the status bar's token-usage panel (the token speed meter plugin's card).
+ */
+export function TooltipPanel({
+  placement = "top",
+  offset = 6,
+  title,
+  children,
+  className,
+}: TooltipPanelProps) {
+  return (
+    <AriaTooltip
+      placement={placement}
+      offset={offset}
+      className={cx(
+        "min-w-[220px] max-w-[min(320px,calc(100vw-32px))] rounded-lg border border-border-button-default",
+        "bg-background-primary-default px-3 py-2 shadow-dropdown",
+        "text-caption-1-regular text-text-secondary",
+        "transition duration-150 ease-out",
+        "data-[entering]:opacity-0 data-[entering]:scale-95 data-[exiting]:opacity-0",
+        "data-[placement=bottom]:origin-top data-[placement=top]:origin-bottom",
+        className,
+      )}
+    >
+      <div className="mb-1.5 text-caption-1-semibold text-text-primary">
+        {title}
+      </div>
+      <dl className="m-0 flex flex-col gap-1">{children}</dl>
+    </AriaTooltip>
+  );
+}
+
 /**
  * InfoTip — clickable ⓘ hint next to a label.
  *

@@ -3,6 +3,7 @@
 // document covering every structure the old unstyled preview mangled:
 // GFM tables, heading levels, lists, blockquote, code fence, math, mermaid.
 // No app, no backend, no saved state.
+import { useState } from "react";
 import { createRoot } from "react-dom/client";
 import "../../src/index.css";
 import "../../src/lib/i18n";
@@ -42,7 +43,13 @@ const DOC = `# ChatMoss 服务下线 & 极简退款门户重建计划（审查�
 
 #### 四级标题：关键事实
 
-**加粗**、*斜体*、~~删除线~~、\`inline_code\` 与 [外部链接](https://github.com/vercel/streamdown)。
+**加粗**、*斜体*、~~删除线~~、\`inline_code\`、[外部链接](https://github.com/vercel/streamdown) 与 [相对链接](./plan.md)。
+
+## 友链
+
+感谢 LINUX DO 用户的支持与反馈。
+
+[AtomGit](https://atomgit.com/zhukunpenglinyutong/desktop-cc-gui)：在国内托管本项目，帮助中国大陆用户更快访问项目与下载 Release。
 
 ---
 
@@ -72,9 +79,23 @@ graph LR
 `;
 
 function Fixture() {
+  const [searchOpen, setSearchOpen] = useState(false);
   return (
     <div className="flex h-dvh flex-col bg-background-primary-default">
-      <MarkdownPreview path="/fixture/下线计划.md" draft={DOC} />
+      <button
+        type="button"
+        className="m-2 h-8 shrink-0 self-start rounded-lg border border-border-button-default px-3 text-caption-1-medium"
+        onClick={() => setSearchOpen((open) => !open)}
+      >
+        toggle search
+      </button>
+      <MarkdownPreview
+        path="/fixture/下线计划.md"
+        draft={DOC}
+        searchOpen={searchOpen}
+        onSearchOpenChange={setSearchOpen}
+        bindSearchShortcut
+      />
     </div>
   );
 }

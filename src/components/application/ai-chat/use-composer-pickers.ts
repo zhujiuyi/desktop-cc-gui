@@ -35,11 +35,11 @@ import {
 import { findSlashTrigger } from "@/components/application/ai-chat/slash-commands";
 import { type FileMentionMenuHandle } from "@/components/application/ai-chat/file-mention-menu";
 import { type SlashCommandMenuHandle } from "@/components/application/ai-chat/slash-command-menu";
+import { type BotMenuHandle } from "@/components/application/ai-chat/bot-menu";
 import {
   toSelectedBot,
   type BotMenuEntry,
-  type BotMenuHandle,
-} from "@/components/application/ai-chat/bot-menu";
+} from "@/components/application/ai-chat/bot-menu-model";
 import {
   CREATE_NEW_PROMPT_PATH,
   type PromptMenuHandle,

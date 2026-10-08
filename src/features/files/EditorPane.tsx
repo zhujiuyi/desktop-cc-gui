@@ -75,10 +75,13 @@ function FileEditor({ path, content }: { path: string; content: FileContent }) {
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [mdMode, setMdMode] = useState<"edit" | "preview">(() => (MARKDOWN_RE.test(path) ? "preview" : "edit"));
-  const [langExt, setLangExt] = useState<Extension[]>([]);
+  // Find bar for the markdown preview (⌘F / header button); closing the
+  // preview drops it so switching back to read mode starts clean.
+  const [previewSearchOpen, setPreviewSearchOpen] = useState(false);
 
   const name = fileName(path);
   const isMarkdown = MARKDOWN_RE.test(name);
+  const [langExt, setLangExt] = useState<Extension[]>([]);
   // Truncated files are partial (editing + saving would clobber the tail);
   // remote-readOnly files are complete but unwritable — both stay read-only.
   const readOnly = content.truncated || content.readOnly === true;
@@ -89,6 +92,11 @@ function FileEditor({ path, content }: { path: string; content: FileContent }) {
     setFileDirty(path, dirty);
     return () => setFileDirty(path, false);
   }, [dirty, path, setFileDirty]);
+
+  const handleMdModeChange = useCallback((mode: "edit" | "preview") => {
+    setPreviewSearchOpen(false);
+    setMdMode(mode);
+  }, []);
 
   // Resolve a CodeMirror grammar from the file extension (lazy-loaded).
   useEffect(() => {
@@ -159,9 +167,11 @@ function FileEditor({ path, content }: { path: string; content: FileContent }) {
         readOnly={readOnly}
         isMarkdown={isMarkdown}
         mdMode={mdMode}
-        onMdModeChange={setMdMode}
+        onMdModeChange={handleMdModeChange}
         saving={saving}
         onSave={save}
+        searchOpen={previewSearchOpen}
+        onToggleSearch={() => setPreviewSearchOpen((open) => !open)}
       />
       {saveError && (
         <p className="shrink-0 break-all border-b border-border-button-default px-3 py-1.5 text-caption-1-regular text-text-error-primary">
@@ -169,7 +179,14 @@ function FileEditor({ path, content }: { path: string; content: FileContent }) {
         </p>
       )}
       {isMarkdown && mdMode === "preview" ? (
-        <MarkdownPreview path={path} draft={draft} />
+        <MarkdownPreview
+          path={path}
+          draft={draft}
+          active={isActiveTab}
+          searchOpen={previewSearchOpen}
+          onSearchOpenChange={setPreviewSearchOpen}
+          bindSearchShortcut={isActiveTab}
+        />
       ) : (
         <CodeMirror
           className="min-h-0 flex-1 overflow-hidden [&_.cm-editor]:h-full"

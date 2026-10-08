@@ -12,7 +12,7 @@ import {
   defaultGeneratedAvatar,
   hexToAppearance,
   normalizeAvatar,
-} from "./bot-avatar";
+} from "./bot-avatar-model";
 
 /**
  * The avatar is the one field a user recognises a bot by, so the mapping

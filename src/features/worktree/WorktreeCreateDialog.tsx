@@ -54,11 +54,13 @@ function usePrPreview({
   const lastResolveKey = useRef("");
   // 建议分支带三位随机后缀（本地同名分支残留会让创建反复失败）。后缀按 PR
   // 号换一次：同一 PR 内保持稳定，否则 resolve key 每次渲染都变、解析打转。
-  const suffixRef = useRef<{ pr: number | null; value: string }>({ pr: null, value: "" });
-  if (suffixRef.current.pr !== prNumber) {
-    suffixRef.current = { pr: prNumber, value: randomBranchSuffix() };
+  // 随机值不可派生，所以在渲染期重置（React 文档的 sanctioned 模式）：本次
+  // 渲染会被立即丢弃并用新后缀重跑，不会带着旧值提交。
+  const [suffix, setSuffix] = useState(() => ({ pr: prNumber, value: randomBranchSuffix() }));
+  if (suffix.pr !== prNumber) {
+    setSuffix({ pr: prNumber, value: randomBranchSuffix() });
   }
-  const branchSuffix = suffixRef.current.value;
+  const branchSuffix = suffix.value;
   useEffect(() => {
     if (tab !== "pr") return;
     if (!prNumber) {

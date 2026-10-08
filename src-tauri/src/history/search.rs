@@ -220,8 +220,15 @@ fn stamp_failure(db: &crate::db::Db, row: &PendingSession) -> Result<(), String>
 /// (e.g. deleted transcript) neither retries nor counts as pending until
 /// its stat moves.
 fn index_one(db: &crate::db::Db, row: &PendingSession) -> Result<bool, String> {
+    // Index the same text the reader shows: parse with this session's accepted
+    // internal frames, so hidden frames stay out of the index (an empty set
+    // would re-reveal every frame the capture validator hid). The signature
+    // rides along so `write_index` can prove, while holding the write lock,
+    // that no identity was recorded after this read.
+    let (accepted_frames, accepted_signature) =
+        db.accepted_internal_frames(&row.engine, &row.session_id)?;
     let parsed = if row.message_count > 0 {
-        match parse_session_file(&row.engine, Path::new(&row.file_path)) {
+        match parse_session_file(&row.engine, Path::new(&row.file_path), &accepted_frames) {
             Ok(parsed) => parsed,
             Err(error) => {
                 eprintln!(
@@ -236,6 +243,20 @@ fn index_one(db: &crate::db::Db, row: &PendingSession) -> Result<bool, String> {
         super::ParsedSession { messages: vec![] }
     };
 
+    write_index(db, row, &parsed, &accepted_signature)
+}
+
+/// Publish one parsed session. The identity-set re-check runs under the same
+/// db lock as the record path: a frame recorded while this file was parsed
+/// must not be published as visible text, and the stamp must not mark that
+/// stale content as current. A changed set returns `false` without writing,
+/// leaving the session pending; `spawn_index` re-drains after a raced request.
+fn write_index(
+    db: &crate::db::Db,
+    row: &PendingSession,
+    parsed: &super::ParsedSession,
+    accepted_signature: &str,
+) -> Result<bool, String> {
     // Deletion paths hold SCAN_LOCK, so under it the sessions row cannot
     // vanish mid-write; the stat re-check keeps a file rewritten mid-parse
     // from being stamped as indexed at the new stat.
@@ -243,6 +264,11 @@ fn index_one(db: &crate::db::Db, row: &PendingSession) -> Result<bool, String> {
     let mut conn = db.0.lock();
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     if !stat_unchanged(&tx, row)? {
+        return Ok(false);
+    }
+    let (_, current_signature) =
+        crate::db::accepted_internal_frames_from(&tx, &row.engine, &row.session_id)?;
+    if current_signature != accepted_signature {
         return Ok(false);
     }
     tx.execute(
@@ -303,14 +329,20 @@ pub fn index_pending(db: &crate::db::Db) -> Result<usize, String> {
 }
 
 /// Background index pass, collapse-safe like spawn_scan: a pass already in
-/// flight makes the new call a no-op (its pending loop sees the new work).
+/// flight makes the new call a no-op — but it must not lose the request. A
+/// pass takes its pending snapshot up front, and work created after that
+/// snapshot (a recorded frame deleting an fts stamp) would otherwise wait for
+/// the next unrelated scan; a raced request therefore asks the running pass to
+/// drain once more before it exits.
 pub fn spawn_index(db: Arc<crate::db::Db>) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static INDEX_RUNNING: AtomicBool = AtomicBool::new(false);
+    static INDEX_RERUN: AtomicBool = AtomicBool::new(false);
     if INDEX_RUNNING
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
+        INDEX_RERUN.store(true, Ordering::SeqCst);
         return;
     }
     tauri::async_runtime::spawn_blocking(move || {
@@ -321,8 +353,30 @@ pub fn spawn_index(db: Arc<crate::db::Db>) {
             }
         }
         let _guard = ResetOnDrop;
-        if let Err(error) = index_pending(&db) {
-            eprintln!("[search] index pass failed: {error}");
+        loop {
+            // Reset before draining: a request landing during this drain sets
+            // the flag and is caught by the check below.
+            INDEX_RERUN.store(false, Ordering::SeqCst);
+            if let Err(error) = index_pending(&db) {
+                eprintln!("[search] index pass failed: {error}");
+            }
+            if INDEX_RERUN.swap(false, Ordering::SeqCst) {
+                continue;
+            }
+            // Release the slot, then re-check so a request that observed
+            // RUNNING=true and could not start a pass is never dropped: either
+            // this loop reclaims the slot, or the requester's CAS wins and its
+            // own pass drains the work.
+            INDEX_RUNNING.store(false, Ordering::SeqCst);
+            if !INDEX_RERUN.swap(false, Ordering::SeqCst) {
+                break;
+            }
+            if INDEX_RUNNING
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                break;
+            }
         }
     });
 }
@@ -825,6 +879,15 @@ mod tests {
         .to_string()
     }
 
+    fn claude_assistant_line(text: &str) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2026-09-20T10:00:01.000Z",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}
+        })
+        .to_string()
+    }
+
     fn write_session_file(scratch: &Scratch, name: &str, lines: &[String]) -> std::path::PathBuf {
         let path = scratch.0.join(name);
         std::fs::write(&path, lines.join("\n") + "\n").unwrap();
@@ -879,6 +942,68 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM session_messages", [], |r| r.get(0))
                 .unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn a_frame_recorded_mid_parse_never_gets_indexed_as_visible() {
+        let scratch = Scratch::new();
+        let db = crate::db::Db::open_at(&scratch.0.join("app.db")).unwrap();
+        let frame =
+            "<CCGUI_INTERNAL_race-1>{\"note\":\"racehidden\"}</CCGUI_INTERNAL_race-1>".to_string();
+        let path = write_session_file(
+            &scratch,
+            "race.jsonl",
+            &[
+                claude_user_line("可见的提问"),
+                claude_assistant_line(&format!("可见的回复 {frame}")),
+            ],
+        );
+        register_file_session(&db, "race", &path);
+
+        // index_one's first step: the identity set this parse is derived from.
+        let (accepted_frames, accepted_signature) =
+            db.accepted_internal_frames("claude", "race").unwrap();
+        assert!(accepted_frames.is_empty());
+        let parsed = parse_session_file("claude", &path, &accepted_frames).unwrap();
+        // The frame is visible in this parse — exactly the content that must
+        // not be published if an identity is recorded before the write.
+        assert!(parsed
+            .messages
+            .iter()
+            .any(|message| message.text.contains("racehidden")));
+        let (file_size, file_mtime_ms) = super::super::stat_signature(&path).unwrap();
+        let row = PendingSession {
+            engine: "claude".into(),
+            session_id: "race".into(),
+            file_path: path.to_string_lossy().into_owned(),
+            file_size,
+            file_mtime_ms,
+            message_count: 2,
+        };
+
+        // The capture validator records the frame while that parse is running:
+        // insert identity + drop the fts stamp (the record path's own sequence).
+        let hash = crate::history::recordable_internal_frame_hash(&frame).unwrap();
+        assert!(db
+            .record_accepted_internal_frame_hash("claude", "race", &hash, "/ws")
+            .unwrap());
+
+        // The stale parse is refused: nothing is published, nothing is stamped.
+        assert!(!write_index(&db, &row, &parsed, &accepted_signature).unwrap());
+        assert!(search(&db, "racehidden", None, None)
+            .unwrap()
+            .hits
+            .is_empty());
+        assert_eq!(pending_count(&db).unwrap(), 1, "the session stays pending");
+
+        // The fresh pass reads the enlarged identity set and hides the frame.
+        assert_eq!(index_pending(&db).unwrap(), 1);
+        assert_eq!(pending_count(&db).unwrap(), 0);
+        assert!(search(&db, "racehidden", None, None)
+            .unwrap()
+            .hits
+            .is_empty());
+        assert_eq!(search(&db, "可见的回复", None, None).unwrap().hits.len(), 1);
     }
 
     #[test]

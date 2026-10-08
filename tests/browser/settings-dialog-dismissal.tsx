@@ -7,7 +7,7 @@
 //   `?open=1` opens the editor on the only row. Then click or press the grey
 //   area outside it (top strip, rail, or the margins beside it): the editor
 //   must close, exactly as the ✕ does.
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { MemoryRouter } from "react-router-dom";
 import "../../src/index.css";
@@ -66,7 +66,9 @@ window.__TAURI_INTERNALS__.invoke = async (cmd: string, args?: Record<string, un
 };
 
 function Fixture() {
-  const params = new URLSearchParams(window.location.search);
+  // Stable across renders: the query string never changes at runtime, and a
+  // fresh URLSearchParams each render would re-run the effect forever.
+  const params = useMemo(() => new URLSearchParams(window.location.search), []);
   const [ready, setReady] = useState(false);
 
   useEffect(() => setReady(true), []);

@@ -582,13 +582,15 @@ describe("PlanReviewCard timeline card & preview", () => {
     await act(async () => {
       buttonByText("查看完整计划")!.click();
     });
-    const dialog = document.querySelector('[role="dialog"]');
+    // Native <dialog> carries the implicit dialog role; the test looks it up
+    // by element because jsdom does not map the implicit ARIA role.
+    const dialog = document.querySelector("dialog");
     expect(dialog).toBeTruthy();
     expect(dialog!.textContent).toContain("第一步做 A");
     await act(async () => {
       window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
     });
-    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(document.querySelector("dialog")).toBeNull();
     expect(vi.mocked(ipc.respondPlanReview)).not.toHaveBeenCalled();
     // Re-open and close via the button: still no IPC.
     await act(async () => {
@@ -597,7 +599,7 @@ describe("PlanReviewCard timeline card & preview", () => {
     await act(async () => {
       (document.querySelector('[aria-label="关闭预览"]') as HTMLButtonElement).click();
     });
-    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(document.querySelector("dialog")).toBeNull();
     expect(vi.mocked(ipc.respondPlanReview)).not.toHaveBeenCalled();
   });
 });

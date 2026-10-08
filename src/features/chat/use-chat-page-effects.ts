@@ -36,12 +36,14 @@ export function useChatPageLifecycle(
   }, [activeWorkspacePath, gitRefresh]);
 }
 
-/** Terminal toggle + new-session + interrupt keys live in the shortcut
- * runtime (defaults ⌘J / ⌘N / ⌃C, configurable in Settings → Shortcuts). */
+/** Terminal toggle + new-session + interrupt + close-tab keys live in the
+ * shortcut runtime (defaults ⌘J / ⌘N / ⌃C / ⌘W, configurable in
+ * Settings → Shortcuts). */
 export function useChatShortcutHandlers(
   activeWorkspacePath: string | undefined,
   toggleTerminal: (workspacePath: string) => void,
   handleNewSession: () => void,
+  closeActiveTab: () => void,
 ) {
   useEffect(
     () =>
@@ -60,6 +62,13 @@ export function useChatShortcutHandlers(
         void useChatStore.getState().interrupt();
       }),
     [],
+  );
+  // ⌘W closes the tab in view (macOS loses its native Close Window item — see
+  // `app_menu::install` in src-tauri/src/app_menu.rs — so the key reaches the
+  // webview and this handler, exactly like the tab strip's ×).
+  useEffect(
+    () => registerShortcutHandler("closeTab", closeActiveTab),
+    [closeActiveTab],
   );
 }
 

@@ -569,6 +569,7 @@ impl TurnCore {
                 args,
                 result,
                 patch,
+                tool_call_id,
             } => {
                 // A tool row opening (or its arg patch), or a completed
                 // assistant snapshot (codex/kimi report whole messages), ends
@@ -595,6 +596,12 @@ impl TurnCore {
                 }
                 if let Some(result) = result {
                     payload["result"] = result;
+                }
+                // The engine's own call id, when it reported one: the
+                // frontend pairs a result with its call on this rather than
+                // on the tool name, which collides across parallel calls.
+                if let Some(tool_call_id) = tool_call_id {
+                    payload["toolCallId"] = Value::String(tool_call_id);
                 }
                 if patch {
                     payload["patch"] = Value::Bool(true);
@@ -897,6 +904,26 @@ impl TurnCore {
                     Value::String(effort),
                 );
             }
+            EngineEvent::Launch {
+                model,
+                effort,
+                comparison_model,
+            } => {
+                let mut payload = selection_payload(model, effort);
+                if let Some(model) = comparison_model {
+                    payload["comparisonModel"] = model.map(Value::String).unwrap_or(Value::Null);
+                }
+                state.push(&self.sink, &self.run_id, &self.engine_id, "launch", payload);
+            }
+            EngineEvent::Served { model, effort } => {
+                state.push(
+                    &self.sink,
+                    &self.run_id,
+                    &self.engine_id,
+                    "served",
+                    selection_payload(model, effort),
+                );
+            }
             EngineEvent::McpServers { servers, tools } => {
                 // Keep the runtime snapshot path from the v1.0.8 MCP support.
                 crate::mcp::record_from_run(
@@ -1128,6 +1155,7 @@ pub(crate) struct RunContext {
     /// Session id fixed before spawn (grok `-s`); seeds TurnState.
     pub(crate) preassigned_session_id: Option<String>,
     pub(crate) initial_model: Option<String>,
+    pub(crate) comparison_model: Option<Option<String>>,
     pub(crate) initial_effort: Option<String>,
     pub(crate) child: Arc<TokioMutex<Child>>,
     pub(crate) killed: Arc<std::sync::atomic::AtomicBool>,
@@ -1287,15 +1315,35 @@ pub(crate) async fn read_line_capped(
         }
     }
 }
+/// `{model?, effort?}` for the launch/served selection events. Absent sides
+/// are omitted, not nulled: a sparse report must never read as an
+/// authoritative empty one.
+fn selection_payload(model: Option<String>, effort: Option<String>) -> Value {
+    let mut out = serde_json::Map::new();
+    if let Some(model) = model.filter(|m| !m.trim().is_empty()) {
+        out.insert("model".to_string(), Value::String(model));
+    }
+    if let Some(effort) = effort.filter(|e| !e.trim().is_empty()) {
+        out.insert("effort".to_string(), Value::String(effort));
+    }
+    Value::Object(out)
+}
 /// Read NDJSON stdout until EOF, dispatch events, then settle the turn:
 /// registry cleanup, temp-file cleanup, and the terminal done/error event.
 pub(crate) async fn run_reader(stdout: ChildStdout, ctx: RunContext) {
     let mut state = TurnState::new(ctx.preassigned_session_id.clone());
-    if let Some(model) = ctx.initial_model.clone() {
-        ctx.dispatch_event(&mut state, EngineEvent::Model(model));
-    }
-    if let Some(effort) = ctx.initial_effort.clone() {
-        ctx.dispatch_event(&mut state, EngineEvent::Effort(effort));
+    // The launch selection is one `launch` event, not `model`/`effort`
+    // reports: the response check compares it against what the stream later
+    // reports as served, and neither side may be read as the other.
+    if ctx.initial_model.is_some() || ctx.initial_effort.is_some() {
+        ctx.dispatch_event(
+            &mut state,
+            EngineEvent::Launch {
+                comparison_model: ctx.comparison_model.clone(),
+                model: ctx.initial_model.clone(),
+                effort: ctx.initial_effort.clone(),
+            },
+        );
     }
     // codex reports usage into its own session log instead of the stdout
     // stream (the stream only carries it with `turn.completed`), so a long
@@ -1660,6 +1708,71 @@ mod staging_tests {
         assert!(kept.ends_with("引擎错误"));
     }
 
+    /// Absent sides stay absent: a sparse report must never read as an
+    /// authoritative empty one.
+    #[test]
+    fn selection_payload_omits_unreported_sides() {
+        assert_eq!(
+            selection_payload(Some("claude-opus-5-5".to_string()), None),
+            serde_json::json!({ "model": "claude-opus-5-5" })
+        );
+        assert_eq!(
+            selection_payload(None, Some("xhigh".to_string())),
+            serde_json::json!({ "effort": "xhigh" })
+        );
+        assert_eq!(
+            selection_payload(Some(" ".to_string()), Some(String::new())),
+            serde_json::json!({})
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_event_preserves_resolved_and_unresolved_alias_evidence() {
+        struct Capture(Mutex<Vec<Value>>);
+        impl event_sink::Emit for Capture {
+            fn emit_json(&self, _: &str, payload: &str) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_str(payload).unwrap());
+            }
+        }
+        let capture = Arc::new(Capture(Mutex::new(Vec::new())));
+        let sink = event_sink::EventSink::new(capture.clone());
+        let core = TurnCore {
+            sink,
+            registry: Arc::new(ProcessRegistry::default()),
+            engine_id: "claude".into(),
+            run_id: "test".into(),
+            db: None,
+        };
+        let mut state = TurnState::new(None);
+        for model in [Some("claude-opus-5-5".to_string()), None] {
+            core.dispatch_event(
+                &mut state,
+                EngineEvent::Launch {
+                    model: Some("opus".into()),
+                    effort: Some("high".into()),
+                    comparison_model: Some(model),
+                },
+            );
+        }
+        core.sink.flush();
+        let emitted = capture.0.lock().unwrap();
+        let events: Vec<_> = emitted
+            .iter()
+            .flat_map(|batch| batch.as_array().unwrap())
+            .collect();
+        assert_eq!(
+            events[0]["data"],
+            serde_json::json!({"model":"opus", "effort":"high", "comparisonModel":"claude-opus-5-5"})
+        );
+        assert_eq!(
+            events[1]["data"],
+            serde_json::json!({"model":"opus", "effort":"high", "comparisonModel":null})
+        );
+    }
+
     struct Noop;
     impl event_sink::Emit for Noop {
         fn emit_json(&self, _: &str, _: &str) {}
@@ -1692,6 +1805,7 @@ mod staging_tests {
                 pid: 0,
                 preassigned_session_id: None,
                 initial_model: None,
+                comparison_model: None,
                 initial_effort: None,
                 child: Arc::new(TokioMutex::new(child)),
                 killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1755,6 +1869,7 @@ mod staging_tests {
             pid: 0,
             preassigned_session_id: None,
             initial_model: None,
+            comparison_model: None,
             initial_effort: None,
             child: Arc::new(TokioMutex::new(child)),
             killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1833,6 +1948,7 @@ mod staging_tests {
             pid: 0,
             preassigned_session_id: None,
             initial_model: None,
+            comparison_model: None,
             initial_effort: None,
             child: Arc::new(TokioMutex::new(child)),
             killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1904,6 +2020,7 @@ mod staging_tests {
             pid: 4242,
             preassigned_session_id: None,
             initial_model: None,
+            comparison_model: None,
             initial_effort: None,
             child: Arc::new(TokioMutex::new(child)),
             killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2049,6 +2166,7 @@ mod terminal_event_tests {
             args: None,
             result: None,
             patch: false,
+            tool_call_id: None,
         };
 
         // Explicit window: a mid-response tool row (claude streams tool args
@@ -2198,6 +2316,7 @@ mod terminal_event_tests {
                 pid,
                 preassigned_session_id: None,
                 initial_model: None,
+                comparison_model: None,
                 initial_effort: None,
                 child: child.clone(),
                 killed,

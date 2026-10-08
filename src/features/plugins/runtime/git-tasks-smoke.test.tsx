@@ -29,10 +29,12 @@ if (!PLUGIN_AVAILABLE) {
 
 type WorktreeCreateArgsLike = { branch?: string; prNumber?: number; repoPath?: string; parentWorkspaceId?: string; worktreePath?: string };
 const gitWorktreeCreate = vi.fn<(id: string, args: WorktreeCreateArgsLike) => Promise<void>>(async () => undefined);
+const gitWorktreeRemove = vi.fn(async () => ({ orphanDirectory: false, branchDeleted: true }));
 vi.mock("@/lib/ipc", () => ({
   ipc: {
     gitWorktreeCreate: (id: string, args: WorktreeCreateArgsLike) => gitWorktreeCreate(id, args),
     gitWorktreeCreateCancel: vi.fn(async () => undefined),
+    gitWorktreeRemove: (...args: unknown[]) => gitWorktreeRemove(...(args as [])),
   },
   worktreeMetaOf: (workspace: { meta?: Record<string, unknown> } | null | undefined) => {
     const meta = workspace?.meta?.worktree as { branch?: unknown; prNumber?: unknown } | undefined;
@@ -66,6 +68,7 @@ const chatState = {
   selectSession: vi.fn(),
   startNewChat: vi.fn(),
   removeWorkspace: vi.fn(async () => {}),
+  setState: vi.fn(),
 };
 vi.mock("@/features/chat/store", () => ({
   useChatStore: {
@@ -80,6 +83,10 @@ vi.mock("@/features/chat/store", () => ({
 }));
 vi.mock("@/features/chat/center-surfaces", () => ({ dismissCenterSurfaces: vi.fn() }));
 vi.mock("./composer-draft", () => ({ setActiveComposerDraft: vi.fn() }));
+vi.mock("@/features/terminal/store", () => ({
+  useTerminalStore: { getState: () => ({ removeWorkspace: vi.fn() }) },
+}));
+vi.mock("@/lib/i18n", () => ({ default: { t: (key: string) => key } }));
 
 const PRS = [
   { number: 7, title: "fix: bound worktree", state: "OPEN", url: "https://github.com/acme/app/pull/7", labels: [], updatedAt: "2026-10-06T00:00:00.000Z", author: { login: "alice", avatarUrl: "" }, isDraft: false, headRefName: "fix/bound", baseRefName: "main", headRefOid: "abc", headRepositoryOwner: { login: "alice" }, reviewRequests: [] },
@@ -177,6 +184,15 @@ function backend(opts: { engines?: unknown[]; mode?: "prs" | "issues"; report?: 
     set: async () => {},
     delete: async () => {},
     agentCatalog: async () => (opts.engines ?? CATALOG) as never,
+    // 插件上下文后端里这条用例用不到的宿主能力：给最小桩，保持类型完整。
+    workspaceMetadata: async () => ({ id: "ws", path: "/repo" }) as never,
+    pickDirectory: async () => null,
+    documentStorageGetLocation: async () => ({ kind: "data" as const, displayPath: "/data", writable: true }),
+    documentStorageSelectLocation: async (_id, kind) => ({ kind, displayPath: "/data", writable: true }),
+    documentStorageReadText: async () => null,
+    documentStorageWriteTextAtomic: async () => ({ status: "written" as const, version: "v1" }),
+    documentStorageRemove: async () => ({ status: "removed" as const }),
+    documentStorageList: async () => [],
     bridgeInvoke: async (command, args) => {
       if (command !== "plugin_exec_run") return null;
       const argv = (args.args as string[]) || [];
@@ -659,6 +675,60 @@ describe.skipIf(!PLUGIN_AVAILABLE)("git-tasks smoke", () => {
     expect(container.querySelector(".gt-rv-raw")).toBeTruthy();
     expect(buttonByText("重新审查（结构化）")).toBeTruthy();
     expect(buttonByText("反馈作者并请求修改")).toBeFalsy();
+
+    act(() => disposers.forEach((dispose) => dispose()));
+  });
+
+  it("列表项 ×：可以只关闭结果，不动 worktree", async () => {
+    const disposers = await mount({ report: true });
+    await waitFor(() => container.querySelectorAll(".gt-wt-chip").length === 1, "binding loaded");
+    const checks = container.querySelectorAll<HTMLInputElement>(".gt-table .gt-row .gt-row-check");
+    await act(async () => { checks[0].click(); });
+    await flush(2);
+    await act(async () => { container.querySelector<HTMLButtonElement>(".gt-bulk-primary")!.click(); });
+    await flush(4);
+    await act(async () => { container.querySelector<HTMLButtonElement>(".gt-modal.is-ai .gt-modal-foot .gt-btn.is-primary")!.click(); });
+    await waitFor(() => sendMock.mock.calls.length === 1, "review run started");
+    finishRun(startedRuns[0]);
+    await act(async () => { buttonByText("查看结果")!.click(); });
+    await waitFor(() => container.querySelectorAll(".gt-rv-item").length === 1, "result listed");
+
+    await act(async () => { container.querySelector<HTMLButtonElement>(".gt-rv-item-close")!.click(); });
+    await flush(1);
+    const dialog = container.querySelector<HTMLElement>(".gt-modal.is-review")!;
+    expect(dialog.textContent).toContain("关闭审查结果 #7");
+    await act(async () => { buttonByText("只关闭结果", dialog)!.click(); });
+    await waitFor(() => container.querySelectorAll(".gt-rv-item").length === 0, "record closed");
+    expect(gitWorktreeRemove).not.toHaveBeenCalled();
+    expect(container.textContent).toContain("已关闭结果");
+
+    act(() => disposers.forEach((dispose) => dispose()));
+  });
+
+  it("列表项 ×：选择删除 worktree 时走宿主删除流程（可带删分支）", async () => {
+    const disposers = await mount({ report: true });
+    await waitFor(() => container.querySelectorAll(".gt-wt-chip").length === 1, "binding loaded");
+    const checks = container.querySelectorAll<HTMLInputElement>(".gt-table .gt-row .gt-row-check");
+    await act(async () => { checks[0].click(); });
+    await flush(2);
+    await act(async () => { container.querySelector<HTMLButtonElement>(".gt-bulk-primary")!.click(); });
+    await flush(4);
+    await act(async () => { container.querySelector<HTMLButtonElement>(".gt-modal.is-ai .gt-modal-foot .gt-btn.is-primary")!.click(); });
+    await waitFor(() => sendMock.mock.calls.length === 1, "review run started");
+    finishRun(startedRuns[0]);
+    await act(async () => { buttonByText("查看结果")!.click(); });
+    await waitFor(() => container.querySelectorAll(".gt-rv-item").length === 1, "result listed");
+
+    await act(async () => { container.querySelector<HTMLButtonElement>(".gt-rv-item-close")!.click(); });
+    await flush(1);
+    const dialog = container.querySelector<HTMLElement>(".gt-modal.is-review")!;
+    const branchCheck = dialog.querySelector<HTMLInputElement>(".gt-rv-check input")!;
+    await act(async () => { branchCheck.click(); });
+    await act(async () => { buttonByText("删除 worktree 并关闭", dialog)!.click(); });
+    await waitFor(() => gitWorktreeRemove.mock.calls.length === 1, "worktree removed");
+    expect(gitWorktreeRemove).toHaveBeenCalledWith("/tmp/app", "/tmp/app-worktrees/pr-7-fix-bound", "pr-7-fix-bound", true);
+    await waitFor(() => container.querySelectorAll(".gt-rv-item").length === 0, "record closed");
+    expect(container.textContent).toContain("已关闭结果并删除 worktree");
 
     act(() => disposers.forEach((dispose) => dispose()));
   });

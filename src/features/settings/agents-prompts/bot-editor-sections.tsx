@@ -13,11 +13,9 @@ import {
   skillsIndexText,
 } from "@/features/bots/bot-prompt";
 import type { BotAvatar, BotCapabilities, BotConfig } from "@/lib/ipc";
-import {
-  BotConceptDiagram,
-  PLANNED_TAB_COPY,
-  type PlannedTabId,
-} from "./bot-concept-diagram";
+import { BotConceptDiagram } from "./bot-concept-diagram";
+import { PLANNED_TAB_COPY, type PlannedTabId } from "./bot-concept-model";
+import { UsageBar } from "./usage-bar";
 
 /** Structured skeleton offered for an empty SOUL / AGENTS field. */
 const SOUL_TEMPLATE = `你是「{name}」。
@@ -40,40 +38,6 @@ const AGENTS_TEMPLATE = `# 职责
 
 function charCount(text: string): number {
   return [...text].length;
-}
-
-/** Shared usage bar for the SOUL + AGENTS budget. */
-function ProseUsage({ used }: { used: number }) {
-  const { t } = useTranslation();
-  const ratio = used / PROSE_LIMIT;
-  return (
-    <div className="flex min-w-0 flex-col gap-1.5">
-      <div className="flex items-center justify-between gap-3 text-caption-1-regular">
-        <span className="text-text-tertiary">{t("settings.botProseUsageLabel")}</span>
-        <span
-          className={cx(
-            "font-mono",
-            ratio > 1
-              ? "text-text-error-primary"
-              : ratio > 0.8
-                ? "text-text-warning-primary"
-                : "text-text-secondary",
-          )}
-        >
-          {used.toLocaleString()} / {PROSE_LIMIT.toLocaleString()}
-        </span>
-      </div>
-      <div className="h-1.5 overflow-hidden rounded-full bg-background-tertiary-default">
-        <div
-          className={cx(
-            "h-full rounded-full",
-            ratio > 1 ? "bg-text-error-primary" : ratio > 0.8 ? "bg-text-warning-primary" : "bg-accent-500",
-          )}
-          style={{ width: `${Math.min(100, Math.round(ratio * 100))}%` }}
-        />
-      </div>
-    </div>
-  );
 }
 
 /**
@@ -157,7 +121,11 @@ export function ProseSection({
           {t("settings.botInsertTemplate")}
         </Button>
         <div className="ml-auto w-full max-w-[240px]">
-          <ProseUsage used={used} />
+          <UsageBar
+            label={t("settings.botProseUsageLabel")}
+            used={used}
+            limit={PROSE_LIMIT}
+          />
         </div>
       </div>
     </div>
@@ -180,7 +148,8 @@ export function CapabilitiesSection({
   const [skills, setSkills] = useState<{ name: string; description: string }[] | null>(null);
   const [search, setSearch] = useState("");
   const caps = bot.capabilities;
-  const allEnabled = caps.skills.includes("*");
+  const enabledSkills = useMemo(() => new Set(caps.skills), [caps.skills]);
+  const allEnabled = enabledSkills.has("*");
 
   useEffect(() => {
     let cancelled = false;
@@ -203,10 +172,10 @@ export function CapabilitiesSection({
     () =>
       skillsIndexText(
         (skills ?? []).filter(
-          (skill) => allEnabled || caps.skills.includes(skill.name),
+          (skill) => allEnabled || enabledSkills.has(skill.name),
         ),
       ),
-    [skills, caps.skills, allEnabled],
+    [skills, enabledSkills, allEnabled],
   );
 
   const visible = useMemo(() => {
@@ -304,7 +273,7 @@ export function CapabilitiesSection({
             </div>
             <div className="max-h-[320px] overflow-y-auto">
               {visible.map((skill) => {
-                const enabled = allEnabled || caps.skills.includes(skill.name);
+                const enabled = allEnabled || enabledSkills.has(skill.name);
                 return (
                   <div
                     key={skill.name}

@@ -4,12 +4,7 @@ import { useMotionValue, useMotionValueEvent, useReducedMotion, useSpring } from
 import { AgentAvatar } from "@/components/application/agent-avatar/agent-avatar";
 import { FOLD_SHAPES, type AvatarConfig } from "@/components/application/agent-avatar/model";
 import { cx } from "@/utils/cx";
-
-export const wrapShape = (index: number) => ((index % FOLD_SHAPES.length) + FOLD_SHAPES.length) % FOLD_SHAPES.length;
-export function shapeArcPoint(distance: number) {
-  const angle = distance * .34;
-  return { x: Math.sin(angle) * 210, y: Math.cos(angle) * 210 - 176 };
-}
+import { shapeArcPoint, wrapShape } from "./shape-arc-model";
 
 function Shape({ config, shape }: { config: AvatarConfig; shape: AvatarConfig["foldShape"] }) {
   const appearance = useMemo(() => ({ ...config, foldShape: shape, face: false, idle: false, motion: 0, lookAt: "center" as const }), [config, shape]);
@@ -22,7 +17,7 @@ export function ShapeArc({ config, onChange, labels }: { config: AvatarConfig; o
   const ref = useRef<HTMLDivElement>(null);
   const target = useMotionValue(Math.max(0, FOLD_SHAPES.indexOf(config.foldShape)));
   const spring = useSpring(target, { stiffness: 180, damping: 28 });
-  const [position, setPosition] = useState(target.get());
+  const [position, setPosition] = useState(() => target.get());
   const reduceMotion = useReducedMotion();
   const drag = useRef<{ x: number; start: number; moved: boolean } | null>(null);
   const suppressClick = useRef(false);

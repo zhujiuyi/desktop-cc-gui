@@ -154,6 +154,24 @@ export async function interruptPluginChatRun(
   if (!engine || !workspacePath) {
     throw new Error(`invalid_args: ${pluginId} sessions.interruptRun: engine and workspacePath are required`);
   }
+  // Ownership gate: the store's interrupt is session-scoped, so forwarding
+  // blindly would let any plugin with host:session stop the user's or a
+  // sibling plugin's turn. Only a live run this plugin started may be
+  // stopped. `sessionId: null` matches any live run of this plugin in the
+  // scope because the native id is often announced after startRun resolves.
+  const sessionId = def.sessionId ?? null;
+  const owned = [...runs.values()].some(
+    (record) =>
+      record.pluginId === pluginId &&
+      record.engine === engine &&
+      record.workspacePath === workspacePath &&
+      (sessionId === null || record.sessionId === sessionId),
+  );
+  if (!owned) {
+    throw new Error(
+      `${pluginId}: sessions.interruptRun may only stop a run started by this plugin`,
+    );
+  }
   const chat = await import("@/features/chat/store");
   // 等价于聊天里的停止：sessionId 未知（尚未 announce）时按待发键停，
   // 与聊天栏在 spawn 前就能点停止是同一条路径。

@@ -20,6 +20,7 @@ export type ShortcutSettingKey = keyof Pick<
   | "commandPaletteShortcut"
   | "sidebarSearchShortcut"
   | "chatSearchShortcut"
+  | "closeTabShortcut"
   | "toggleTerminalShortcut"
   | "toggleSidebarShortcut"
   | "toggleSidePanelShortcut"
@@ -89,6 +90,13 @@ export const shortcutActions: ShortcutAction[] = [
     category: "app",
     labelKey: "shortcuts.actions.chatSearch",
     defaultMac: "cmd+f",
+  },
+  {
+    id: "closeTab",
+    setting: "closeTabShortcut",
+    category: "app",
+    labelKey: "shortcuts.actions.closeTab",
+    defaultMac: "cmd+w",
   },
   {
     id: "openSettings",

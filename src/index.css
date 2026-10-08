@@ -139,6 +139,29 @@ body {
 ::highlight(ccgui-chat-search-current) {
   background-color: color-mix(in srgb, #f97316 55%, transparent);
 }
+/* 文件 Markdown 预览（Streamdown）：查找用独立的 highlight 名，与对话搜索
+   可同时开启；链接沿用聊天 Markdown 的绿色点状下划线——Streamdown 只在
+   自己的 link 组件上带 `text-primary underline`，自定义 `a` 组件替换后
+   这些类会丢，所以 MarkdownPreview 显式加 .md-preview-link。 */
+::highlight(ccgui-md-search) {
+  background-color: color-mix(in srgb, #eab308 35%, transparent);
+}
+::highlight(ccgui-md-search-current) {
+  background-color: color-mix(in srgb, #f97316 55%, transparent);
+}
+.md-preview-link {
+  color: var(--md-link-color);
+  text-decoration-line: underline;
+  text-decoration-style: dotted;
+  text-decoration-thickness: 1px;
+  text-decoration-color: currentColor;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+.md-preview-link:hover {
+  text-decoration-thickness: 2px;
+  opacity: 0.95;
+}
 /* Horizontal scroll strips (tab bar) without a visible scrollbar. */
 .scrollbar-none {
   scrollbar-width: none;

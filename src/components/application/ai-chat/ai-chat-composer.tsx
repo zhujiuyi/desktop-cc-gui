@@ -38,6 +38,7 @@ import { SelectedBotChip } from "@/components/application/ai-chat/composer-bot-c
 import { useComposerPickers } from "@/components/application/ai-chat/use-composer-pickers";
 import { useComposerInputHandle } from "@/components/application/ai-chat/use-composer-input-handle";
 import { useResizableComposer } from "@/components/application/ai-chat/use-resizable-composer";
+import { getProxyQuickToggleAction, type ProxyQuickToggleState } from "@/components/application/ai-chat/proxy-toggle";
 import {
   FILE_TAG_CLASS,
   extractText,
@@ -50,6 +51,7 @@ import { ipc } from "@/lib/ipc";
 import { listenSettingsChanged } from "@/lib/events";
 import { useTauriEvent } from "@/hooks/use-tauri-event";
 import { ASSUMED_CONTEXT_WINDOW } from "@/features/chat/usage";
+import type { AutoCompactSettings } from "@/features/chat/auto-compact-context";
 import {
   usePromptCompletion,
   usePromptHistoryNav,
@@ -350,36 +352,6 @@ const EMPTY_LIMITS: UsageLimit[] = [];
 const EMPTY_PLAN = "";
 
 /**
- * Mirrors `validate_proxy_settings` in src-tauri/src/proxy.rs: enabling the
- * proxy requires a configured URL with an http(s)/socks5 scheme and a host.
- * Disabling never fails validation, so an enabled toggle stays operable even
- * if the stored URL is later broken.
- */
-function isUsableProxyUrl(value: string | null): boolean {
-  const trimmed = value?.trim() ?? "";
-  if (!trimmed) return false;
-  let parsed: URL;
-  try {
-    parsed = new URL(trimmed);
-  } catch {
-    return false;
-  }
-  const scheme = parsed.protocol.replace(":", "");
-  return (
-    ["http", "https", "socks5", "socks5h"].includes(scheme) &&
-    parsed.hostname.length > 0
-  );
-}
-
-type ProxyQuickToggleState = { enabled: boolean; url: string | null };
-
-/** Decide whether an unconfigured footer glyph should open proxy settings. */
-export function getProxyQuickToggleAction(state: ProxyQuickToggleState): "settings" | "toggle" {
-  if (!state.enabled && !isUsableProxyUrl(state.url)) return "settings";
-  return "toggle";
-}
-
-/**
  * One-click network-proxy switch for the composer footer: the glyph carries
  * the state (dim = off, green = on) and the click persists `systemProxyEnabled`
  * through the same read-modify-write funnel the settings page uses, so the two
@@ -497,30 +469,31 @@ export function StatusBar({
   compacting,
   refreshing,
   canCompact,
+  autoCompact,
+  autoCompactDisabled,
+  onAutoCompactEnabledChange,
+  onAutoCompactThresholdChange,
 }: {
   branch?: string;
-  /** Local and remote-tracking branches for the switcher; empty until the
-   *  first load. */
   branches?: BranchMenuItem[];
-  /** Repository display name when the chip tracks a nested repo (file-tree
-   *  selection inside a subfolder repository); prefixes the branch label. */
   branchRepoName?: string;
-  /** Present → the branch label becomes a switcher dropdown. */
   onBranchSelect?: (name: string) => void;
-  /** Workspace folder display names. */
   folders?: string[];
   selectedFolder?: string;
   onFolderSelect?: (name: string) => void;
   usagePct?: number;
-  /** Context window size in tokens for the breakdown card. */
   contextMax?: number;
-  /** Token buckets for the breakdown card; empty until usage is reported. */
   contextSegments?: ContextSegment[];
   onCompactContext?: () => void;
   onRefreshUsage?: () => void;
   compacting?: boolean;
   refreshing?: boolean;
   canCompact?: boolean;
+  autoCompact?: AutoCompactSettings;
+  /** No active session: keep the controls visible but inert. */
+  autoCompactDisabled?: boolean;
+  onAutoCompactEnabledChange?: (enabled: boolean) => void;
+  onAutoCompactThresholdChange?: (threshold: number) => void;
 }) {
   const { t } = useTranslation();
   // `isNonModal` popovers don't dismiss on outside press (react-aria couples
@@ -552,6 +525,10 @@ export function StatusBar({
       refreshUsage: t("chat.refreshUsage"),
       refreshUsageTooltip: t("chat.refreshUsageTooltip"),
       refreshing: t("chat.refreshing"),
+      autoCompactThreshold: t("chat.autoCompactThreshold"),
+      autoCompactEnable: t("chat.autoCompactEnable"),
+      autoCompactDisable: t("chat.autoCompactDisable"),
+      autoCompactNoSession: t("chat.autoCompactNoSession"),
     }),
     [t],
   );
@@ -629,6 +606,16 @@ export function StatusBar({
                 compacting={compacting}
                 refreshing={refreshing}
                 canCompact={canCompact}
+                autoCompact={
+                  autoCompact
+                    ? {
+                        ...autoCompact,
+                        disabled: autoCompactDisabled === true,
+                        onEnabledChange: onAutoCompactEnabledChange ?? (() => {}),
+                        onThresholdChange: onAutoCompactThresholdChange ?? (() => {}),
+                      }
+                    : undefined
+                }
               />
             </AriaDialog>
           </AriaPopover>

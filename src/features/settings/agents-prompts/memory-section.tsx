@@ -23,43 +23,10 @@ import {
   type MemoryReviewOutcome,
   type PendingMemoryWrite,
 } from "@/lib/ipc";
+import { UsageBar } from "./usage-bar";
 
 const ICON_BUTTON =
   "flex size-7 shrink-0 cursor-pointer items-center justify-center rounded-lg text-foreground-icon-secondary transition-colors hover:bg-background-secondary-hover hover:text-foreground-icon-primary";
-
-/** 用量条：与「人格 + 工作规则」同一种读法，超过 80% 变黄、超限变红。 */
-function Usage({ used, limit }: { used: number; limit: number }) {
-  const { t } = useTranslation();
-  const ratio = limit > 0 ? used / limit : 0;
-  return (
-    <div className="flex min-w-0 flex-col gap-1.5">
-      <div className="flex items-center justify-between gap-3 text-caption-1-regular">
-        <span className="text-text-tertiary">{t("settings.memoryUsageLabel")}</span>
-        <span
-          className={cx(
-            "font-mono",
-            ratio > 1
-              ? "text-text-error-primary"
-              : ratio > 0.8
-                ? "text-text-warning-primary"
-                : "text-text-secondary",
-          )}
-        >
-          {used.toLocaleString()} / {limit.toLocaleString()}
-        </span>
-      </div>
-      <div className="h-1.5 overflow-hidden rounded-full bg-background-tertiary-default">
-        <div
-          className={cx(
-            "h-full rounded-full",
-            ratio > 1 ? "bg-text-error-primary" : ratio > 0.8 ? "bg-text-warning-primary" : "bg-accent-500",
-          )}
-          style={{ width: `${Math.min(100, Math.round(ratio * 100))}%` }}
-        />
-      </div>
-    </div>
-  );
-}
 
 function EntryRow({
   entry,
@@ -228,7 +195,11 @@ function LedgerCard({
             </button>
           </div>
         </div>
-        <Usage used={ledger.used} limit={ledger.limit} />
+        <UsageBar
+          label={t("settings.memoryUsageLabel")}
+          used={ledger.used}
+          limit={ledger.limit}
+        />
       </div>
 
       {ledger.entries.length === 0 ? (
@@ -474,8 +445,12 @@ export function MemorySection({
     setActionError(null);
     void (async () => {
       let firstError: string | null = null;
+      // Sequential on purpose: approvals write the bot's shared memory ledger,
+      // so concurrency could interleave writes; a failed item must not block
+      // the rest, hence catch-and-continue instead of Promise.all.
       for (const id of ids) {
         try {
+          // oxlint-disable-next-line react-doctor/async-await-in-loop -- deliberate ordered ledger writes
           await action(id);
         } catch (error) {
           firstError ??= memoryErrorMessage(error);

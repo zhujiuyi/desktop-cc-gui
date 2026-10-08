@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import Check from "lucide-react/dist/esm/icons/check";
 import ClipboardList from "lucide-react/dist/esm/icons/clipboard-list";
@@ -6,9 +6,15 @@ import Copy from "lucide-react/dist/esm/icons/copy";
 import X from "lucide-react/dist/esm/icons/x";
 import type { Message, PlanReview, PlanReviewStatus } from "@/lib/ipc";
 import { useCopied } from "@/hooks/use-copied";
+import {
+  hideModalDialog,
+  isModalDialogOpen,
+  showModalDialog,
+} from "@/lib/engine-compat";
 import { useChatStore } from "../store";
 import { useScopedSessionKey } from "../split/session-scope";
 import Markdown from "./Markdown";
+import { planSummary } from "./plan-review-helpers";
 
 /**
  * Plan preview card (timeline form): the typed plan_review event produced a
@@ -29,21 +35,6 @@ const STATUS_KEYS: Record<PlanReviewStatus, string> = {
   superseded: "chat.planStatusSuperseded",
 };
 
-/** Localized execution-permission label; unknown values pass through raw. */
-export function execPermissionLabel(
-  t: (key: string) => string,
-  permission: string,
-): string {
-  const keys: Record<string, string> = {
-    auto: "chat.permissionAuto",
-    manual: "chat.permissionManual",
-    plan: "chat.permissionPlan",
-    bypass: "chat.permissionBypass",
-  };
-  const key = keys[permission];
-  return key ? t(key) : permission;
-}
-
 /** Status badge with an accessible text label for every lifecycle state. */
 export function PlanStatusBadge({ status }: { status: PlanReviewStatus }) {
   const { t } = useTranslation();
@@ -60,12 +51,6 @@ export function PlanStatusBadge({ status }: { status: PlanReviewStatus }) {
       {t(STATUS_KEYS[status])}
     </span>
   );
-}
-
-/** Whitespace-collapsed excerpt for the card body. */
-export function planSummary(content: string, max = 240): string {
-  const flat = content.replace(/\s+/g, " ").trim();
-  return flat.length > max ? `${flat.slice(0, max)}…` : flat;
 }
 
 /** Copy the plan's raw markdown (verbatim — what the user approved). */
@@ -125,47 +110,77 @@ export function PlanPreviewOverlay({
   onClose: () => void;
 }) {
   const { t } = useTranslation();
+  const dialogRef = useRef<HTMLDialogElement>(null);
+
+  // Native <dialog>: showModal() brings the focus trap and top-layer stacking
+  // for free. The engine-compat helpers cover engines where <dialog> is not
+  // implemented yet; the window listener keeps Esc working there (native
+  // engines also fire `cancel`, which is idempotent with this handler).
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    if (!isModalDialogOpen(dialog)) showModalDialog(dialog);
+    return () => {
+      if (isModalDialogOpen(dialog)) hideModalDialog(dialog);
+    };
+  }, []);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.stopPropagation();
         onClose();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
+
   return (
-    <div
-      className="fixed inset-0 z-50 flex justify-end bg-black/40"
-      role="dialog"
-      aria-modal="true"
+    <dialog
+      ref={dialogRef}
       aria-label={t("chat.planReviewFullTitle")}
-      onClick={onClose}
+      className="fixed inset-0 z-50 m-0 h-dvh max-h-none w-screen max-w-none overflow-hidden bg-transparent p-0 backdrop:bg-black/40"
+      onCancel={(event) => {
+        event.preventDefault();
+        onClose();
+      }}
+      onKeyDown={(event) => {
+        if (event.key === "Escape") event.stopPropagation();
+      }}
     >
-      <div
-        className="flex h-full w-full flex-col bg-background-primary-default sm:max-w-[720px] sm:border-l sm:border-border-primary"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1 border-b border-border-primary px-4 py-3">
-          <PlanCardHeader record={record} />
-          <div className="ml-auto flex items-center gap-2">
-            <CopyPlanButton content={record.content} />
-            <button
-              type="button"
-              onClick={onClose}
-              aria-label={t("chat.closePreview")}
-              className="cursor-pointer rounded-md p-1 text-text-tertiary transition-colors hover:bg-background-tertiary-hover hover:text-text-primary"
-            >
-              <X className="size-4" aria-hidden />
-            </button>
+      {/* Backdrop as a real button: the click handler needs an interactive
+          host, and a labelled button also gives assistive tech a name for
+          the dismiss target. Skipped by Tab (Esc and the ✕ already close). */}
+      <button
+        type="button"
+        tabIndex={-1}
+        aria-label={t("common.close")}
+        onClick={onClose}
+        className="absolute inset-0 block size-full cursor-default bg-black/40"
+      />
+      <div className="pointer-events-none relative flex h-full w-full justify-end">
+        <div className="pointer-events-auto flex h-full w-full flex-col bg-background-primary-default sm:max-w-[720px] sm:border-l sm:border-border-primary">
+          <div className="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1 border-b border-border-primary px-4 py-3">
+            <PlanCardHeader record={record} />
+            <div className="ml-auto flex items-center gap-2">
+              <CopyPlanButton content={record.content} />
+              <button
+                type="button"
+                onClick={onClose}
+                aria-label={t("chat.closePreview")}
+                className="cursor-pointer rounded-md p-1 text-text-tertiary transition-colors hover:bg-background-tertiary-hover hover:text-text-primary"
+              >
+                <X className="size-4" aria-hidden />
+              </button>
+            </div>
+          </div>
+          <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
+            <Markdown text={record.content} workspacePath={workspacePath} />
           </div>
         </div>
-        <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
-          <Markdown text={record.content} workspacePath={workspacePath} />
-        </div>
       </div>
-    </div>
+    </dialog>
   );
 }
 

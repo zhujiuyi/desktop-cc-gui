@@ -1,4 +1,6 @@
 pub mod agent_catalog;
+pub mod app_info;
+pub mod app_menu;
 pub mod bots;
 pub mod baidu_tongji;
 pub mod browser;
@@ -27,6 +29,7 @@ pub mod paths;
 pub mod pet_overlay;
 pub mod pets;
 pub mod plugin_caps;
+pub mod plugin_host;
 pub mod plugins;
 pub mod prompts;
 pub mod provider_files;
@@ -109,7 +112,7 @@ pub fn run() {
         settings::apply_codex_home(&settings);
     }
 
-    tauri::Builder::default()
+    plugins::asset_protocol::register(tauri::Builder::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -315,6 +318,12 @@ pub fn run() {
             window_builder
                 .build()
                 .expect("failed to create main window");
+            // Replace the automatic macOS menu with the same one minus its
+            // Close Window (⌘W) item; the frontend shortcut runtime owns that
+            // key and closes the tab in view (see app_menu.rs).
+            if let Err(error) = app_menu::install(app.handle()) {
+                eprintln!("[menu] install failed: {error}");
+            }
             // Cmd+Q / AppleScript `quit` bypass both the window X's
             // CloseRequested and Tauri's ExitRequested on macOS; without
             // this hook one stray quit kills every live engine run with no
@@ -348,6 +357,7 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            app_info::host_app_version,
             // 窗口
             settings::restart_app,
             // config
@@ -404,6 +414,25 @@ pub fn run() {
             plugins::plugin_storage_get,
             plugins::plugin_storage_set,
             plugins::plugin_storage_delete,
+            plugins::storage::plugin_document_storage_get_location,
+            plugins::storage::plugin_document_storage_select_location,
+            plugins::storage::plugin_document_storage_read_text,
+            plugins::storage::plugin_document_storage_write_text_atomic,
+            plugins::storage::plugin_document_storage_remove,
+            plugins::storage::plugin_document_storage_list,
+            plugins::assets::plugin_asset_grant_directory,
+            plugins::assets::plugin_asset_list_directories,
+            plugins::assets::plugin_asset_revoke_directory,
+            plugins::assets::plugin_reveal_path,
+            db::workspace_metadata,
+            history::reader::record_accepted_internal_frame,
+            // narrow host capabilities exposed through PluginContext
+            plugin_host::plugin_window_state,
+            plugin_host::plugin_window_set_normal_bounds,
+            plugin_host::plugin_window_sample_wechat,
+            plugin_host::plugin_list_engines,
+            plugin_host::plugin_list_engine_models,
+            plugin_host::plugin_model_catalog,
             // plugin marketplace (Phase 3, plan §6)
             plugins::market::plugin_fetch_index,
             plugins::market::plugin_fetch_market_readme,

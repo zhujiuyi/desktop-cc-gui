@@ -41,8 +41,72 @@ const MIN_CUSTOM_TOKEN_LENGTH = 16;
  * Mobile/web access page: starts the LAN bridge (src-tauri/src/web.rs) and
  * shows the token-bearing URL as text + QR. Start/stop are desktop-only —
  * the bridge does not route them, so on web this page is a read-only status.
+ *
+ * The page is a thin composition: `useWebAccess` owns state and IPC,
+ * `WebAccessTabs` the LAN/WAN switch, `LanAccessPane` the bridge card.
  */
 export function WebAccessSection() {
+  const { t } = useTranslation();
+  const model = useWebAccess();
+  return (
+    <div className="flex w-full flex-col gap-2">
+      <WebAccessTabs pane={model.pane} onSelect={model.selectPane} />
+      {model.error && (
+        <p role="alert" className="text-body-regular text-text-error-primary">
+          {t("common.error")}: {model.error}
+        </p>
+      )}
+      {model.pane === "wan" ? (
+        <WebWanPane onInfoRefresh={model.refreshInfo} />
+      ) : (
+        <LanAccessPane model={model} />
+      )}
+      {model.riskPrompt && (
+        <WebWanRiskDialog
+          onCancel={model.dismissRiskPrompt}
+          onAccept={model.acceptWanRisk}
+        />
+      )}
+    </div>
+  );
+}
+
+/** LAN / WAN segmented control. The WAN tab sits behind the one-time risk
+ *  gate; the click is intercepted in `selectPane` while unaccepted. */
+function WebAccessTabs({
+  pane,
+  onSelect,
+}: {
+  pane: "lan" | "wan";
+  onSelect: (pane: "lan" | "wan") => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <div className="flex w-fit items-center gap-1 rounded-full bg-background-tertiary-default p-1">
+      {(["lan", "wan"] as const).map((id) => (
+        <button
+          key={id}
+          type="button"
+          data-setting-anchor={id === "lan" ? "webLanTab" : "webWanTab"}
+          aria-pressed={pane === id}
+          onClick={() => onSelect(id)}
+          className={cx(
+            "cursor-pointer rounded-full px-3 py-1 text-body-2-medium transition-colors",
+            pane === id
+              ? "bg-background-primary-default text-text-primary shadow-sm"
+              : "text-text-secondary hover:text-text-primary",
+          )}
+        >
+          {t(id === "lan" ? "settings.webLan" : "settings.webWan")}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** WebAccess state and IPC. Kept as one hook because the values are used
+ *  across the tabs and both panes; the components below stay render-only. */
+function useWebAccess() {
   const { t } = useTranslation();
   const [info, setInfo] = useState<WebAccessInfo | null>(null);
   const [busy, setBusy] = useState(false);
@@ -163,6 +227,17 @@ export function WebAccessSection() {
       })
       .catch((e) => setError(String(e)));
   }, [portDraft]);
+
+  const resetPort = useCallback(() => {
+    setPortDraft("");
+    setConfiguredPort(null);
+    void ipc
+      .getAppSettings()
+      .then((s) => {
+        void ipc.updateAppSettings({ ...s, webAccessPort: null });
+      })
+      .catch((e) => setError(String(e)));
+  }, []);
 
   const commitToken = useCallback(() => {
     if (isWeb) return;
@@ -289,218 +364,231 @@ export function WebAccessSection() {
     writeStored(WEB_ACCESS_SELECTED_IP_KEY, nextIp);
   }, []);
 
+  /** 内网访问 is upstream's LAN behaviour and needs no warning; the internet
+   *  tab does, exactly once per machine. */
+  const selectPane = useCallback((next: "lan" | "wan") => {
+    if (next === "wan" && !wanRiskAcceptedRef.current) {
+      setRiskPrompt("wan");
+      return;
+    }
+    setPane(next);
+  }, []);
+  const dismissRiskPrompt = useCallback(() => setRiskPrompt(null), []);
+
+  return {
+    info,
+    busy,
+    error,
+    copied,
+    pane,
+    selectPane,
+    autoStart,
+    handleAutoStartChange,
+    portDraft,
+    setPortDraft,
+    commitPort,
+    resetPort,
+    tokenDraft,
+    setTokenDraft,
+    commitToken,
+    rotateToken,
+    rotatingToken,
+    needsRestart,
+    restart,
+    start,
+    stop,
+    availableIps,
+    activeIp,
+    handleIpChange,
+    displayUrl,
+    copyUrl,
+    refreshInfo,
+    riskPrompt,
+    acceptWanRisk,
+    dismissRiskPrompt,
+  };
+}
+
+/** Bridge controls: start/stop, autostart, port, token, restart notice. */
+function LanBridgeRows({ model }: { model: ReturnType<typeof useWebAccess> }) {
+  const { t } = useTranslation();
   return (
-    <div className="flex w-full flex-col gap-2">
-      <div className="flex w-fit items-center gap-1 rounded-full bg-background-tertiary-default p-1">
-        {(["lan", "wan"] as const).map((id) => (
-          <button
-            key={id}
-            type="button"
-            data-setting-anchor={id === "lan" ? "webLanTab" : "webWanTab"}
-            aria-pressed={pane === id}
-            onClick={() => {
-              // 内网访问 is upstream's LAN behaviour and needs no warning; the
-              // internet tab does, exactly once per machine.
-              if (id === "wan" && !wanRiskAcceptedRef.current) {
-                setRiskPrompt("wan");
-                return;
-              }
-              setPane(id);
-            }}
-            className={cx(
-              "cursor-pointer rounded-full px-3 py-1 text-body-2-medium transition-colors",
-              pane === id
-                ? "bg-background-primary-default text-text-primary shadow-sm"
-                : "text-text-secondary hover:text-text-primary",
-            )}
+    <>
+      <SettingsRow
+        label={model.info ? t("settings.webAccessRunning") : t("settings.webAccessStopped")}
+        description={t("settings.webAccessDesc")}
+      >
+        {!isWeb && (
+          <Button
+            size="small"
+            variant={model.info ? "secondary" : "primary"}
+            disabled={model.busy}
+            onClick={() => void (model.info ? model.stop() : model.start())}
           >
-            {t(id === "lan" ? "settings.webLan" : "settings.webWan")}
-          </button>
-        ))}
-      </div>
-      {error && (
-        <p role="alert" className="text-body-regular text-text-error-primary">
-          {t("common.error")}: {error}
-        </p>
+            {model.info ? t("settings.webAccessStop") : t("settings.webAccessStart")}
+          </Button>
+        )}
+      </SettingsRow>
+      {!isWeb && (
+        <SettingsRow
+          label={t("settings.webAccessAutoStart")}
+          description={t("settings.webAccessAutoStartDesc")}
+        >
+          <Switch
+            size="sm"
+            aria-label={t("settings.webAccessAutoStart")}
+            isSelected={model.autoStart}
+            onChange={model.handleAutoStartChange}
+          />
+        </SettingsRow>
       )}
-      {pane === "lan" && (
-        <>
-          <SettingsCard>
-            <SettingsRow
-              label={info ? t("settings.webAccessRunning") : t("settings.webAccessStopped")}
-              description={t("settings.webAccessDesc")}
+      {!isWeb && (
+        <SettingsRow
+          label={t("settings.webAccessPort")}
+          description={t("settings.webAccessPortDesc")}
+        >
+          <div className="flex items-center gap-2">
+            <Input
+              aria-label={t("settings.webAccessPort")}
+              size="small"
+              className="w-28"
+              inputClassName="text-center"
+              inputMode="numeric"
+              placeholder={t("settings.webAccessPortAuto")}
+              value={model.portDraft}
+              onChange={(v) => model.setPortDraft(v.replace(/\D/g, ""))}
+              onBlur={model.commitPort}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") model.commitPort();
+              }}
+            />
+            {Boolean(model.portDraft) && (
+              <Button size="small" variant="ghost" onClick={model.resetPort}>
+                {t("settings.webAccessPortReset")}
+              </Button>
+            )}
+          </div>
+        </SettingsRow>
+      )}
+      {!isWeb && (
+        <SettingsRow
+          label={t("settings.webAccessToken")}
+          description={t("settings.webAccessTokenDesc")}
+        >
+          <div className="flex items-center gap-2">
+            <Input
+              aria-label={t("settings.webAccessToken")}
+              size="small"
+              className="w-56"
+              inputClassName="font-mono text-xs"
+              value={model.tokenDraft || (model.info?.token ?? "")}
+              onChange={model.setTokenDraft}
+              onBlur={model.commitToken}
+              onKeyDown={(e) => {
+                if (e.nativeEvent.isComposing) return;
+                if (e.key === "Enter") model.commitToken();
+              }}
+            />
+            <Button
+              size="small"
+              variant="secondary"
+              disabled={model.rotatingToken}
+              onClick={() => void model.rotateToken()}
+              title={t("settings.webAccessRotateToken")}
             >
-              {!isWeb && (
-                <Button
-                  size="small"
-                  variant={info ? "secondary" : "primary"}
-                  disabled={busy}
-                  onClick={() => void (info ? stop() : start())}
-                >
-                  {info ? t("settings.webAccessStop") : t("settings.webAccessStart")}
-                </Button>
-              )}
-            </SettingsRow>
-            {!isWeb && (
-              <SettingsRow
-                label={t("settings.webAccessAutoStart")}
-                description={t("settings.webAccessAutoStartDesc")}
+              <RefreshCw
+                className={cx("size-3.5", model.rotatingToken && "animate-spin")}
+              />
+              {t("settings.webAccessRotateTokenBtn")}
+            </Button>
+          </div>
+        </SettingsRow>
+      )}
+      {model.needsRestart && (
+        <div className="mx-3 my-1 flex items-center justify-between gap-3 rounded-lg bg-background-tertiary-warning p-2.5">
+          <span className="text-body-2-medium text-text-warning-primary">
+            {t("settings.webAccessRestartNotice")}
+          </span>
+          <Button
+            size="small"
+            variant="secondary"
+            onClick={() => void model.restart()}
+            disabled={model.busy}
+          >
+            {t("settings.webAccessRestartBtn")}
+          </Button>
+        </div>
+      )}
+    </>
+  );
+}
+
+/** LAN pane: bridge card (host-IP picker included) plus the URL and QR. */
+function LanAccessPane({ model }: { model: ReturnType<typeof useWebAccess> }) {
+  const { t } = useTranslation();
+  return (
+    <>
+      <SettingsCard>
+        <LanBridgeRows model={model} />
+        {model.info && (
+          <SettingsRow
+            label={t("settings.webAccessHostIp")}
+            description={t("settings.webAccessHostIpDesc")}
+          >
+            <Select
+              aria-label={t("settings.webAccessHostIp")}
+              selectedKey={model.activeIp}
+              onSelectionChange={model.handleIpChange}
+              triggerClassName={SELECT_TRIGGER}
+            >
+              {model.availableIps.map((entry) => (
+                <SelectItem key={entry.ip} id={entry.ip} textValue={entry.label}>
+                  {entry.label}
+                </SelectItem>
+              ))}
+            </Select>
+          </SettingsRow>
+        )}
+        {model.info && (
+          <div className="flex w-full flex-col gap-2 py-3 pr-3">
+            <p className="text-body-regular text-text-primary">{t("settings.webAccessUrl")}</p>
+            <div className="flex h-8 w-full items-center gap-1 rounded-2lg bg-background-tertiary-default pr-1 pl-2">
+              <span
+                className="min-w-0 flex-1 truncate text-body-regular text-text-primary"
+                title={model.displayUrl}
               >
-                <Switch
-                  size="sm"
-                  aria-label={t("settings.webAccessAutoStart")}
-                  isSelected={autoStart}
-                  onChange={handleAutoStartChange}
-                />
-              </SettingsRow>
-            )}
-            {!isWeb && (
-              <SettingsRow
-                label={t("settings.webAccessPort")}
-                description={t("settings.webAccessPortDesc")}
+                {model.displayUrl}
+              </span>
+              <button
+                type="button"
+                aria-label={t("settings.webAccessCopy")}
+                title={model.copied ? t("common.copied") : t("settings.webAccessCopy")}
+                onClick={model.copyUrl}
+                className="flex size-7 shrink-0 cursor-pointer items-center justify-center rounded-lg text-foreground-icon-secondary transition-colors hover:bg-background-secondary-hover hover:text-foreground-icon-primary"
               >
-                <div className="flex items-center gap-2">
-                  <Input
-                    aria-label={t("settings.webAccessPort")}
-                    size="small"
-                    className="w-28"
-                    inputClassName="text-center"
-                    inputMode="numeric"
-                    placeholder={t("settings.webAccessPortAuto")}
-                    value={portDraft}
-                    onChange={(v) => setPortDraft(v.replace(/\D/g, ""))}
-                    onBlur={commitPort}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") commitPort();
-                    }}
-                  />
-                  {Boolean(portDraft) && (
-                    <Button
-                      size="small"
-                      variant="ghost"
-                      onClick={() => {
-                        setPortDraft("");
-                        setConfiguredPort(null);
-                        void ipc
-                          .getAppSettings()
-                          .then((s) => {
-                            void ipc.updateAppSettings({ ...s, webAccessPort: null });
-                          })
-                          .catch((e) => setError(String(e)));
-                      }}
-                    >
-                      {t("settings.webAccessPortReset")}
-                    </Button>
-                  )}
-                </div>
-              </SettingsRow>
-            )}
-            {!isWeb && (
-              <SettingsRow
-                label={t("settings.webAccessToken")}
-                description={t("settings.webAccessTokenDesc")}
-              >
-                <div className="flex items-center gap-2">
-                  <Input
-                    aria-label={t("settings.webAccessToken")}
-                    size="small"
-                    className="w-56"
-                    inputClassName="font-mono text-xs"
-                    value={tokenDraft || (info?.token ?? "")}
-                    onChange={setTokenDraft}
-                    onBlur={commitToken}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") commitToken();
-                    }}
-                  />
-                  <Button
-                    size="small"
-                    variant="secondary"
-                    disabled={rotatingToken}
-                    onClick={() => void rotateToken()}
-                    title={t("settings.webAccessRotateToken")}
-                  >
-                    <RefreshCw className={cx("size-3.5", rotatingToken && "animate-spin")} />
-                    {t("settings.webAccessRotateTokenBtn")}
-                  </Button>
-                </div>
-              </SettingsRow>
-            )}
-            {needsRestart && (
-              <div className="mx-3 my-1 flex items-center justify-between gap-3 rounded-lg bg-background-tertiary-warning p-2.5">
-                <span className="text-body-2-medium text-text-warning-primary">
-                  {t("settings.webAccessRestartNotice")}
-                </span>
-                <Button size="small" variant="secondary" onClick={() => void restart()} disabled={busy}>
-                  {t("settings.webAccessRestartBtn")}
-                </Button>
-              </div>
-            )}
-            {info && (
-              <SettingsRow
-                label={t("settings.webAccessHostIp")}
-                description={t("settings.webAccessHostIpDesc")}
-              >
-                <Select
-                  aria-label={t("settings.webAccessHostIp")}
-                  selectedKey={activeIp}
-                  onSelectionChange={handleIpChange}
-                  triggerClassName={SELECT_TRIGGER}
-                >
-                  {availableIps.map((entry) => (
-                    <SelectItem key={entry.ip} id={entry.ip} textValue={entry.label}>
-                      {entry.label}
-                    </SelectItem>
-                  ))}
-                </Select>
-              </SettingsRow>
-            )}
-            {info && (
-              <div className="flex w-full flex-col gap-2 py-3 pr-3">
-                <p className="text-body-regular text-text-primary">{t("settings.webAccessUrl")}</p>
-                <div className="flex h-8 w-full items-center gap-1 rounded-2lg bg-background-tertiary-default pr-1 pl-2">
-                  <span
-                    className="min-w-0 flex-1 truncate text-body-regular text-text-primary"
-                    title={displayUrl}
-                  >
-                    {displayUrl}
-                  </span>
-                  <button
-                    type="button"
-                    aria-label={t("settings.webAccessCopy")}
-                    title={copied ? t("common.copied") : t("settings.webAccessCopy")}
-                    onClick={copyUrl}
-                    className="flex size-7 shrink-0 cursor-pointer items-center justify-center rounded-lg text-foreground-icon-secondary transition-colors hover:bg-background-secondary-hover hover:text-foreground-icon-primary"
-                  >
-                    {copied ? (
-                      <Check className="size-4 text-notification-success-foreground" aria-hidden />
-                    ) : (
-                      <Copy className="size-4" aria-hidden />
-                    )}
-                  </button>
-                </div>
-                <p className="text-body-2-regular text-text-secondary">
-                  {t("settings.webAccessScanHint")}
-                </p>
-              </div>
-            )}
-          </SettingsCard>
-          {info && (
-            <div className="flex w-full flex-col items-center gap-3 py-2">
-              <div className="rounded-2xl border border-separator-border bg-white p-3 shadow-sm">
-                <QRCodeSVG value={displayUrl} size={180} />
-              </div>
-              <p className="max-w-[420px] text-center text-body-2-regular text-text-error-primary">
-                {t("settings.webAccessWarning")}
-              </p>
+                {model.copied ? (
+                  <Check className="size-4 text-notification-success-foreground" aria-hidden />
+                ) : (
+                  <Copy className="size-4" aria-hidden />
+                )}
+              </button>
             </div>
-          )}
-        </>
+            <p className="text-body-2-regular text-text-secondary">
+              {t("settings.webAccessScanHint")}
+            </p>
+          </div>
+        )}
+      </SettingsCard>
+      {model.info && (
+        <div className="flex w-full flex-col items-center gap-3 py-2">
+          <div className="rounded-2xl border border-separator-border bg-white p-3 shadow-sm">
+            <QRCodeSVG value={model.displayUrl} size={180} />
+          </div>
+          <p className="max-w-[420px] text-center text-body-2-regular text-text-error-primary">
+            {t("settings.webAccessWarning")}
+          </p>
+        </div>
       )}
-      {pane === "wan" && <WebWanPane onInfoRefresh={refreshInfo} />}
-      {riskPrompt && (
-        <WebWanRiskDialog onCancel={() => setRiskPrompt(null)} onAccept={acceptWanRisk} />
-      )}
-    </div>
+    </>
   );
 }

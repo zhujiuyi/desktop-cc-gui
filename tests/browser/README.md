@@ -152,6 +152,19 @@ warning tone at the end of the meta row, carry the provider's own reason as
 its tooltip, and be absent entirely when nothing is being retried. No model,
 no IPC, no saved conversation.
 
+Open `/tests/browser/response-check.html` to check the tail indicator's
+response check. Synthetic `launch`/`served` engine events run through the real
+store: 一致 must show the default-colored circled check, 模型不一致 (both
+sides differ) and 档位降级 (same model, downgraded level) the amber circled
+caution, 版本差异 a dated snapshot of the requested family (a match, not a
+substitution), and 未上报 no badge at all — an unreported side is unknown,
+never a pass. 已结算 drives a `done` event through the store and renders the
+real settled row (`MessageRow`): the recorded check must survive the turn's
+end and stay reachable (hover the row, then the badge). Hovering the badge
+must open the card (请求模型 / 响应模型 / 请求档位 / 响应档位, with 不一致 on
+a differing response value, 未上报 on a missing one). No model, no IPC, no
+saved conversation.
+
 Open `/tests/browser/touch-scroll-follow.html` in a **touch-emulated** viewport
 (390x844) to check the timeline's tail-follow intent on a phone, where the
 web-remote UI runs. Swipe up into history and the fixture's refs must read
@@ -256,12 +269,20 @@ the final file. The metrics output reports requests, mounted rows and actions.
 
 Open `/tests/browser/markdown-preview.html` to check the files-feature Markdown
 preview (Streamdown) against a document covering GFM tables, heading levels,
-lists, task list, blockquote, fenced code, KaTeX math and a Mermaid diagram:
+lists, task list, blockquote, fenced code, KaTeX math, a Mermaid diagram and
+inline links:
 tables render with a bordered wrapper and styled header row, code blocks carry
 language header + copy/download controls with `files.markdown.*` labels, the
 block formula renders via KaTeX, and the Mermaid diagram stays an empty
 container until scrolled into view (IntersectionObserver lazy render), then
-draws the flow SVG. No app, no backend, no saved state.
+draws the flow SVG. Links (both the external and relative `plan.md` targets)
+must read as links: green with a dotted underline (`.md-preview-link`), not
+body text. The `toggle search` button opens the real find bar top-right (the
+preview has no header in this fixture, so use the button instead of ⌘F):
+typing `退款` shows a live `n/total` count, every match gets the yellow
+highlight and the current one the stronger orange, Enter / Shift+Enter walk
+the matches scrolling each into view, Esc closes and clears the highlights.
+No app, no backend, no saved state.
 
 Open `/tests/browser/plugin-detail-rail.html` to check the plugin detail page
 at a desktop width (1145x731 in the verification run, with the app's 40px tab
@@ -274,3 +295,14 @@ painted ~190px across the rail, and the pinned 1042px rail could only be read
 by scrolling the README to its end. The readout reports PASS plus the measured
 boxes, `clientHeight`/`scrollHeight` and the page's scrollTop. No app shell,
 no backend, no saved state.
+
+Open `/tests/browser/auto-compact-curtain.html` for the compaction curtain:
+the host's own scheduling rows — the `/compact` command and the resume nudge
+the auto-compaction sends to pick a task back up — must never appear as
+bubbles, no matter how the engine's transcript is replayed, and while a
+compaction runs the timeline tail must be exactly one grey right-aligned
+`< 正在压缩上下文 >` line (host-sent and engine-reported compactions alike)
+instead of the wave indicator. The four buttons switch idle / host / engine /
+resume states; the readout reports the rendered bubbles against the five
+stored rows, the hint's computed colour and alignment, and PASS/FAIL. No model,
+no IPC, no saved conversation.

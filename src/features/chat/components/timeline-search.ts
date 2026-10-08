@@ -1,3 +1,4 @@
+import { findTextMatches, highlightSupported } from "@/lib/dom-text-search";
 import type { TimelineRow } from "./timeline-rows";
 
 /**
@@ -10,6 +11,7 @@ import type { TimelineRow } from "./timeline-rows";
  *  步骤合成一段，命中后由搜索导航展开该行。 */
 export function rowSearchText(row: TimelineRow): string {
   if (row.kind === "msg") return row.message.text;
+  if (row.kind === "curtain") return "";
   return row.items.map((item) => item.text).join("\n");
 }
 
@@ -44,11 +46,7 @@ const HIGHLIGHT_CURRENT = "ccgui-chat-search-current";
 
 /** WKWebView 需 Safari 17.2+；不支持时退化为仅计数+跳转+行圈选。 */
 export function searchHighlightSupported(): boolean {
-  return (
-    typeof CSS !== "undefined" &&
-    "highlights" in CSS &&
-    typeof Highlight !== "undefined"
-  );
+  return highlightSupported();
 }
 
 export function clearSearchHighlights(): void {
@@ -67,32 +65,17 @@ export function paintSearchHighlights(
   currentRowIndex: number | null,
 ): void {
   clearSearchHighlights();
-  const needle = query.trim().toLowerCase();
-  if (!needle || !searchHighlightSupported()) return;
+  if (!query.trim() || !searchHighlightSupported()) return;
   const all: Range[] = [];
   const current: Range[] = [];
-  const walker = root.ownerDocument.createTreeWalker(
-    root,
-    NodeFilter.SHOW_TEXT,
-  );
-  let node = walker.nextNode();
-  while (node) {
-    const text = node.nodeValue ?? "";
-    const lower = text.toLowerCase();
+  for (const match of findTextMatches(root, query)) {
     const rowIndex = Number(
-      node.parentElement?.closest("[data-index]")?.getAttribute("data-index"),
+      match.node.parentElement?.closest("[data-index]")?.getAttribute("data-index"),
     );
-    let from = 0;
-    for (;;) {
-      const at = lower.indexOf(needle, from);
-      if (at === -1) break;
-      const range = new Range();
-      range.setStart(node, at);
-      range.setEnd(node, at + needle.length);
-      (rowIndex === currentRowIndex ? current : all).push(range);
-      from = at + needle.length;
-    }
-    node = walker.nextNode();
+    const range = new Range();
+    range.setStart(match.node, match.start);
+    range.setEnd(match.node, match.end);
+    (rowIndex === currentRowIndex ? current : all).push(range);
   }
   if (all.length > 0) CSS.highlights.set(HIGHLIGHT_ALL, new Highlight(...all));
   if (current.length > 0) {

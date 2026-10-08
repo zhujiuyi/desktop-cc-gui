@@ -14,9 +14,9 @@ import {
   useBotStore,
   visibleBots,
 } from "@/features/bots/bot-store";
-import { BotAvatarView, defaultGeneratedAvatar } from "@/features/bots/bot-avatar";
-import { type SelectedBot } from "@/features/bots/selected-bot";
+import { BotAvatarView } from "@/features/bots/bot-avatar";
 import { type BotConfig, type BuiltInAgentView } from "@/lib/ipc";
+import { type BotMenuEntry } from "./bot-menu-model";
 
 /**
  * `#` picker, rendered above the composer while a `#` trigger is active.
@@ -35,45 +35,6 @@ export type BotMenuHandle = ComposerPickerMenuHandle;
 
 /** Sentinel id of the fixed footer row that opens the settings page. */
 export const CREATE_NEW_BOT_ID = "__create_new__";
-
-/** A menu row: a bot, or a built-in catalog entry (no stored prompt — it
- *  resolves at send time — but a description and a division badge). */
-export type BotMenuEntry =
-  | { kind: "bot"; key: string; bot: BotConfig }
-  | {
-      kind: "builtin";
-      key: string;
-      name: string;
-      description: string;
-      icon: string | null;
-      divisionLabel?: string;
-    }
-  | { kind: "create"; key: string; name: string };
-
-/** Menu entry → the persisted per-thread pick. The pick keeps only what the
- *  chip and the send path need; the prompt block itself is assembled on the
- *  first send and frozen there (see features/bots/selected-bot.ts). */
-export function toSelectedBot(entry: BotMenuEntry): SelectedBot {
-  if (entry.kind === "bot") {
-    return {
-      id: entry.bot.id,
-      name: entry.bot.name,
-      title: entry.bot.title ?? undefined,
-      slug: entry.bot.slug,
-      avatar: entry.bot.avatar,
-      source: "custom",
-    };
-  }
-  return {
-    id: entry.kind === "builtin" ? entry.key.replace(/^builtin:/, "") : entry.key,
-    name: entry.kind === "builtin" ? entry.name : "",
-    title: undefined,
-    avatar: entry.kind === "builtin" && entry.icon
-      ? { type: "emoji", value: entry.icon }
-      : defaultGeneratedAvatar(entry.key),
-    source: "builtIn",
-  };
-}
 
 /** Section header between groups; keyboard navigation skips it (headers
  *  are not options — row indices stay contiguous). Same chrome as the `/`

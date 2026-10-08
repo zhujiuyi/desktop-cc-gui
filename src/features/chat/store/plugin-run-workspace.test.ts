@@ -35,6 +35,8 @@ function setup() {
     openTabs: [{ engine: ENGINE, sessionId: null, workspacePath: REPO }],
     active: { engine: ENGINE, sessionId: null, workspacePath: REPO },
     drafts: {},
+    sessionContributions: {},
+    createdSessionKeys: {},
     archivedSessionKeys: {},
   }) as unknown as ChatStore);
   const set = vi.fn<EngineEventDeps["set"]>((update) => store.setState(update));

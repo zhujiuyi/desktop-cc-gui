@@ -28,6 +28,8 @@ pub mod images;
 pub(crate) mod job;
 pub mod kimi;
 mod kimi_acp;
+pub mod minimax;
+mod minimax_acp;
 pub mod models;
 pub mod opencode;
 pub mod opencode_server;
@@ -46,8 +48,9 @@ pub(crate) use resolve::command_for_binary;
 
 // Event types and tool-call/todo payload helpers (events.rs).
 pub(crate) use events::{
-    assistant_message, parse_todo_args, parse_todo_result, parse_tool_args_value, push_session_id,
-    safe_prompt_arg, tool_call_message, tool_call_patch, tool_path_arg, tool_result_patch,
+    assistant_message, parse_todo_args, parse_todo_result, parse_tool_args_value, push_session_id, safe_prompt_arg,
+    tool_call_message, tool_call_message_with_id, tool_call_patch_with_id,
+    tool_path_arg, tool_result_patch, tool_result_patch_with_id,
 };
 pub use events::{EngineEvent, TodoItem, TodosPayload};
 pub use plan_review::{PlanApproval, PlanReview, PlanReviewKind};
@@ -62,7 +65,7 @@ pub(crate) use reader::{
 };
 
 use crate::event_sink;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -79,11 +82,55 @@ pub(crate) fn hide_console(command: &mut Command) {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     command.creation_flags(CREATE_NO_WINDOW);
 }
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PromptPlacement {
+    SystemTail,
+    RequestTail,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptContribution {
+    pub id: String,
+    pub content: String,
+    pub placement: PromptPlacement,
+    pub visibility: String,
+    pub persistence: String,
+}
+
+fn effective_prompt(prompt: &str, contributions: Vec<PromptContribution>) -> String {
+    let mut effective = prompt.to_string();
+    for (placement, label) in [
+        (PromptPlacement::SystemTail, "system-tail"),
+        (PromptPlacement::RequestTail, "request-tail"),
+    ] {
+        for contribution in contributions.iter().filter(|contribution| {
+            matches!(
+                (&contribution.placement, &placement),
+                (PromptPlacement::SystemTail, PromptPlacement::SystemTail)
+                    | (PromptPlacement::RequestTail, PromptPlacement::RequestTail)
+            )
+        }) {
+            if contribution.visibility != "internal" || contribution.content.trim().is_empty() {
+                continue;
+            }
+            effective.push_str("\n\n[CCGUI internal ");
+            effective.push_str(label);
+            effective.push_str("]\n");
+            effective.push_str(&contribution.content);
+        }
+    }
+    effective
+}
+
 #[derive(Clone)]
 pub struct SendRequest {
     pub session_id: Option<String>,
     pub workspace: PathBuf,
     pub prompt: String,
+    pub prompt_contributions: Vec<PromptContribution>,
     /// True only for ccgui's intercepted `/compact`; a user-defined catalog
     /// command with the same text remains an ordinary CLI prompt.
     pub native_compact: bool,
@@ -240,6 +287,7 @@ pub fn engine_by_id(id: &str) -> Option<Box<dyn Engine>> {
     match id {
         "claude" => Some(Box::new(claude::ClaudeEngine::new())),
         "kimi" => Some(Box::new(kimi::KimiEngine)),
+        "minimax" => Some(Box::new(minimax::MiniMaxEngine)),
         "grok" => Some(Box::new(grok::GrokEngine)),
         "codex" => Some(Box::new(codex::CodexEngine)),
         "pi" => Some(Box::new(pi_family::pi())),
@@ -315,7 +363,7 @@ pub struct SendResult {
     pub run_id: String,
     pub session_id: Option<String>,
 }
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineInfo {
     pub id: String,
@@ -361,6 +409,9 @@ pub(crate) fn cli_binary_name(engine_id: &str) -> &str {
     match engine_id {
         "qoder" => qoder::QoderDistribution::Global.cli_name(),
         "qoder-cn" => qoder::QoderDistribution::Cn.cli_name(),
+        // MiniMax Code ships its CLI under the product-independent `mcode`
+        // command, not the engine id.
+        "minimax" => "mcode",
         _ => engine_id,
     }
 }
@@ -456,6 +507,7 @@ fn ensure_plan_approval(
 
 /// Resolved launch parameters for one send: request, binary, built command.
 struct Launch {
+    comparison_model: Option<Option<String>>,
     req: SendRequest,
     bin: String,
     built: BuiltCommand,
@@ -466,6 +518,7 @@ fn prepare_launch(
     workspace_path: &str,
     session_id: Option<String>,
     prompt: String,
+    prompt_contributions: Vec<PromptContribution>,
     native_compact: Option<bool>,
     image_paths: Option<Vec<String>>,
     model: Option<String>,
@@ -533,7 +586,8 @@ fn prepare_launch(
     let req = SendRequest {
         session_id: session_id.filter(|s| !s.trim().is_empty()),
         workspace: PathBuf::from(workspace_path),
-        prompt,
+        prompt: effective_prompt(&prompt, prompt_contributions),
+        prompt_contributions: Vec::new(),
         native_compact: native_compact.unwrap_or(false) && engine == "omp",
         images: image_paths.unwrap_or_default(),
         model,
@@ -614,7 +668,17 @@ fn prepare_launch(
         }
         return Err(error);
     }
+    let comparison_model = (engine == "claude").then(|| {
+        models::claude_comparison_model(
+            req.model.as_deref().unwrap_or("default"),
+            &bin,
+            provider.as_ref().map(|_| &channel_env),
+            &req.workspace,
+            wsl,
+        )
+    });
     Ok(Launch {
+        comparison_model,
         req,
         bin,
         built,
@@ -629,6 +693,7 @@ pub async fn send_message(
     workspace_path: String,
     session_id: Option<String>,
     prompt: String,
+    prompt_contributions: Vec<PromptContribution>,
     native_compact: Option<bool>,
     image_paths: Option<Vec<String>>,
     model: Option<String>,
@@ -645,6 +710,7 @@ pub async fn send_message(
         workspace_path,
         session_id,
         prompt,
+        prompt_contributions,
         native_compact,
         image_paths,
         model,
@@ -689,6 +755,7 @@ pub(crate) async fn plugin_agent_send(
         workspace_path,
         session_id,
         prompt,
+        Vec::new(),
         None,
         None,
         model,
@@ -750,6 +817,7 @@ pub(crate) async fn mission_agent_send(
         workspace_path,
         session_id,
         prompt,
+        Vec::new(),
         None,
         None,
         model,
@@ -771,6 +839,7 @@ pub async fn send_message_inner(
     workspace_path: String,
     session_id: Option<String>,
     prompt: String,
+    prompt_contributions: Vec<PromptContribution>,
     native_compact: Option<bool>,
     image_paths: Option<Vec<String>>,
     model: Option<String>,
@@ -788,6 +857,7 @@ pub async fn send_message_inner(
         workspace_path,
         session_id,
         prompt,
+        prompt_contributions,
         native_compact,
         image_paths,
         model,
@@ -810,6 +880,7 @@ async fn send_message_inner_with_sink(
     workspace_path: String,
     session_id: Option<String>,
     prompt: String,
+    prompt_contributions: Vec<PromptContribution>,
     native_compact: Option<bool>,
     image_paths: Option<Vec<String>>,
     model: Option<String>,
@@ -872,6 +943,7 @@ async fn send_message_inner_with_sink(
         workspace_path,
         session_id,
         prompt,
+        prompt_contributions,
         native_compact,
         image_paths,
         model,
@@ -903,6 +975,7 @@ async fn send_reserved(
     workspace_path: String,
     session_id: Option<String>,
     prompt: String,
+    prompt_contributions: Vec<PromptContribution>,
     native_compact: Option<bool>,
     image_paths: Option<Vec<String>>,
     model: Option<String>,
@@ -923,6 +996,7 @@ async fn send_reserved(
         &workspace_path,
         session_id,
         prompt,
+        prompt_contributions,
         native_compact,
         image_paths,
         model,
@@ -1139,6 +1213,7 @@ async fn send_reserved(
         pid,
         preassigned_session_id: launch.built.preassigned_session_id.clone(),
         initial_model,
+        comparison_model: launch.comparison_model,
         initial_effort,
         child,
         killed,
@@ -1218,6 +1293,13 @@ async fn send_host_stream(
             core, launch.req, launch.bin, killed, pid,
         )),
         "grok" | "kimi" => tokio::spawn(grok_acp::run_acp_turn(
+            core,
+            launch.req,
+            launch.built,
+            killed,
+            pid,
+        )),
+        "minimax" => tokio::spawn(minimax_acp::run_acp_turn(
             core,
             launch.req,
             launch.built,
@@ -1336,6 +1418,20 @@ pub async fn answer_question(
     // the answer is the JSON-RPC response line on the CLI's stdin.
     if let Some(acp) = input.get("grokAcp") {
         let frame = grok_acp::answer_frame(acp, answers.as_ref())?;
+        state
+            .processes
+            .write_line(&session_id, frame.to_string())
+            .await?;
+        if let Ok(mut questions) = entry.questions.lock() {
+            questions.remove(&request_id);
+        }
+        return Ok(());
+    }
+    // MiniMax's ACP driver parks `session/request_permission`: the answer is
+    // the JSON-RPC response line on the CLI's stdin, selecting one of the
+    // ask's advertised options.
+    if let Some(acp) = input.get("minimaxAcp") {
+        let frame = minimax_acp::answer_frame(acp, answers.as_ref())?;
         state
             .processes
             .write_line(&session_id, frame.to_string())
@@ -1726,6 +1822,39 @@ mod stop_task_tests {
 }
 
 #[cfg(test)]
+mod prompt_contribution_tests {
+    use super::*;
+
+    #[test]
+    fn internal_contributions_append_after_the_visible_prompt_in_stable_order() {
+        let prompt = effective_prompt(
+            "visible",
+            vec![
+                PromptContribution {
+                    id: "system".into(),
+                    content: "system context".into(),
+                    placement: PromptPlacement::SystemTail,
+                    visibility: "internal".into(),
+                    persistence: "turn".into(),
+                },
+                PromptContribution {
+                    id: "request".into(),
+                    content: "request context".into(),
+                    placement: PromptPlacement::RequestTail,
+                    visibility: "internal".into(),
+                    persistence: "turn".into(),
+                },
+            ],
+        );
+
+        assert_eq!(
+            prompt,
+            "visible\n\n[CCGUI internal system-tail]\nsystem context\n\n[CCGUI internal request-tail]\nrequest context"
+        );
+    }
+}
+
+#[cfg(test)]
 mod permission_tests {
     use super::*;
 
@@ -1799,6 +1928,7 @@ mod permission_tests {
             session_id: None,
             workspace: PathBuf::from("/tmp"),
             prompt: "hi".to_string(),
+            prompt_contributions: Vec::new(),
             native_compact: false,
             images: Vec::new(),
             model: None,
@@ -2517,6 +2647,7 @@ mod retry_lifecycle_tests {
             pid: child.id().unwrap(),
             preassigned_session_id: Some("session".to_string()),
             initial_model: None,
+            comparison_model: None,
             initial_effort: None,
             child: Arc::new(TokioMutex::new(child)),
             killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2566,6 +2697,7 @@ mod retry_lifecycle_tests {
             pid: child.id().unwrap(),
             preassigned_session_id: None,
             initial_model: None,
+            comparison_model: None,
             initial_effort: None,
             child: Arc::new(TokioMutex::new(child)),
             killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2687,6 +2819,7 @@ mod retry_lifecycle_tests {
             pid,
             preassigned_session_id: Some("session-held".to_string()),
             initial_model: None,
+            comparison_model: None,
             initial_effort: None,
             child,
             killed,

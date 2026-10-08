@@ -6,6 +6,7 @@
 
 use super::{Message, ParsedSession, ScanSummary};
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::path::Path;
 
 /// `steps.step_type` values observed on agy 1.2.x.
@@ -25,7 +26,10 @@ struct UserTurn {
     ts_ms: Option<i64>,
 }
 
-pub(super) fn parse_agy_session(path: &Path) -> ParsedSession {
+pub(super) fn parse_agy_session(
+    path: &Path,
+    accepted_internal_frames: &HashSet<String>,
+) -> ParsedSession {
     let id = conversation_id(path);
     let mut users = load_user_turns(id.as_deref());
     let mut user_iter = users.drain(..);
@@ -38,7 +42,11 @@ pub(super) fn parse_agy_session(path: &Path) -> ParsedSession {
                 STEP_USER => {
                     if let Some(turn) = user_iter.next() {
                         seq += 1;
-                        messages.push(plain_message(seq, "user", turn.text, turn.ts_ms));
+                        // agy's history.jsonl records the effective prompt verbatim,
+                        // internal system/request tail included — strip it
+                        // exactly like the other engines' user rows.
+                        let visible = super::extract::strip_internal_prompt_tail(&turn.text);
+                        messages.push(plain_message(seq, "user", visible.to_string(), turn.ts_ms));
                     }
                 }
                 STEP_ASSISTANT => {
@@ -46,7 +54,20 @@ pub(super) fn parse_agy_session(path: &Path) -> ParsedSession {
                     // reconstructing them yields protobuf/JSON fragments
                     // ("ommandLine", "WaitMsBeforeAsync"). History only keeps
                     // the visible assistant reply.
-                    if let Some(text) = pick_assistant(&proto_strings(&payload)) {
+                    let mut texts = proto_strings(&payload);
+                    if !accepted_internal_frames.is_empty() {
+                        for candidate in &mut texts {
+                            if candidate.depth == 1 && candidate.field == 1 {
+                                // Strip before the prose filter: the frame's JSON
+                                // would otherwise discard the surrounding reply.
+                                candidate.text = super::extract::strip_recorded_internal_frames(
+                                    std::mem::take(&mut candidate.text),
+                                    accepted_internal_frames,
+                                );
+                            }
+                        }
+                    }
+                    if let Some(text) = pick_assistant(&texts) {
                         seq += 1;
                         messages.push(plain_message(seq, "assistant", text, None));
                     }
@@ -59,14 +80,18 @@ pub(super) fn parse_agy_session(path: &Path) -> ParsedSession {
     // Conversation db unreadable / older than the prompt log: still show users.
     for turn in user_iter {
         seq += 1;
-        messages.push(plain_message(seq, "user", turn.text, turn.ts_ms));
+        let visible = super::extract::strip_internal_prompt_tail(&turn.text);
+        messages.push(plain_message(seq, "user", visible.to_string(), turn.ts_ms));
     }
 
     ParsedSession { messages }
 }
 
-pub(super) fn scan_agy_summary(path: &Path) -> ScanSummary {
-    let parsed = parse_agy_session(path);
+pub(super) fn scan_agy_summary(
+    path: &Path,
+    accepted_internal_frames: &HashSet<String>,
+) -> ScanSummary {
+    let parsed = parse_agy_session(path, accepted_internal_frames);
     let mut first_ts = None;
     let mut last_ts = None;
     let mut title = String::new();
@@ -566,6 +591,43 @@ mod tests {
     }
 
     #[test]
+    fn user_turns_strip_the_internal_prompt_tail() {
+        // agy's history.jsonl records the effective prompt verbatim, internal
+        // system/request tail included; user rows must strip it like every
+        // other engine's.
+        let scratch =
+            std::env::temp_dir().join(format!("ccgui-agy-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let previous = std::env::var_os("ANTIGRAVITY_HOME");
+        std::env::set_var("ANTIGRAVITY_HOME", &scratch);
+        let id = "conv-strip-tail";
+        std::fs::write(
+            scratch.join("history.jsonl"),
+            concat!(
+                "{\"conversationId\":\"conv-strip-tail\",\"timestamp\":1,",
+                "\"display\":\"hello\\n\\n[CCGUI internal system-tail]\\nprivate protocol\"}\n"
+            ),
+        )
+        .unwrap();
+        // No readable steps db: the fallback loop still surfaces user turns.
+        let session = scratch.join(format!("{id}.db"));
+        std::fs::write(&session, b"").unwrap();
+        let parsed = parse_agy_session(&session, &HashSet::new());
+        match previous {
+            Some(value) => std::env::set_var("ANTIGRAVITY_HOME", value),
+            None => std::env::remove_var("ANTIGRAVITY_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+        let users: Vec<&str> = parsed
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .map(|m| m.text.as_str())
+            .collect();
+        assert_eq!(users, ["hello"]);
+    }
+
+    #[test]
     fn parses_live_agy_conversation_if_present() {
         let path = crate::engine::agy::agy_home()
             .join("conversations")
@@ -573,7 +635,7 @@ mod tests {
         if !path.is_file() {
             return;
         }
-        let parsed = parse_agy_session(&path);
+        let parsed = parse_agy_session(&path, &HashSet::new());
         assert!(
             parsed
                 .messages
@@ -641,6 +703,49 @@ mod tests {
                 .map(|m| m.text.chars().take(50).collect::<String>())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn recorded_frames_preserve_agy_replies_and_summary() {
+        let path = std::env::temp_dir().join(format!("ccgui-agy-{}.db", uuid::Uuid::new_v4()));
+        let recorded = r#"<CCGUI_INTERNAL_accepted>{"plugin":"bridge","patch":{"goal":"done"}}</CCGUI_INTERNAL_accepted>"#;
+        let unrecorded = r#"<CCGUI_INTERNAL_example>{"v":1}</CCGUI_INTERNAL_example>"#;
+        let visible = format!("已完成桥接验证，未记录的示例仍保留。\n{unrecorded}");
+        let text = format!("{visible}\n{recorded}");
+        let inner = encode_string_field(1, &text);
+        let mut payload = Vec::new();
+        write_varint(&mut payload, (20 << 3) | 2);
+        write_varint(&mut payload, inner.len() as u64);
+        payload.extend(inner);
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE steps(idx INTEGER, step_type INTEGER, step_payload BLOB);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO steps VALUES(0, ?1, ?2)",
+                rusqlite::params![STEP_ASSISTANT, payload],
+            )
+            .unwrap();
+        }
+        let accepted = HashSet::from([
+            crate::history::recordable_internal_frame_hash(recorded).unwrap(),
+        ]);
+
+        let parsed = crate::history::parse_session_file("agy", &path, &accepted).unwrap();
+        let summary = crate::history::scan_summary_file("agy", &path, &accepted).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let replies: Vec<_> = parsed
+            .messages
+            .iter()
+            .filter(|message| message.role == "assistant")
+            .map(|message| message.text.as_str())
+            .collect();
+        assert_eq!(replies, [visible.as_str()]);
+        assert_eq!(summary.preview, visible);
+        assert_eq!(summary.message_count, 1);
     }
 
     #[test]

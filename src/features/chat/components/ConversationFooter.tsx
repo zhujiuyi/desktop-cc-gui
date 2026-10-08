@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import {
   Composer,
@@ -22,6 +22,14 @@ import { ComposerSlotExtras } from "@/features/plugins/boundary/composer-slot-ex
 import { COMPOSER_DRAFT_TOPIC, pluginBus } from "@/features/plugins/runtime/events";
 import { USAGE_PART_LABEL_KEYS, usageBreakdown } from "./usage-breakdown";
 import { useComposerFileDrop } from "./use-composer-file-drop";
+import {
+  hasPendingUserInput,
+  setAutoCompactEnabled,
+  setAutoCompactThreshold,
+  shouldAutoCompact,
+  shouldResumeAfterAutoCompact,
+  useAutoCompactSettings,
+} from "../auto-compact-context";
 
 /** Path → trailing name (folder or file) for status-bar and chip labels.
  *  Both separators: workspace/attachment paths are native — backslashes on
@@ -237,16 +245,118 @@ function FooterStatusBar({
   const sessionKeyValue = active
     ? sessionKey(active.engine, active.sessionId, active.workspacePath)
     : "";
+  const autoCompact = useAutoCompactSettings(sessionKeyValue);
+  const autoCompactLatch = useRef<{
+    sessionKey: string;
+    attemptedAtPct: number | null;
+  }>({ sessionKey: "", attemptedAtPct: null });
 
-  const handleCompact = useCallback(async () => {
-    if (!active || streaming || compacting) return;
-    setCompacting(true);
-    try {
-      await compactContext(sessionKeyValue);
-    } finally {
-      setCompacting(false);
+  /** Hand the task back after a threshold compaction: the point of
+   *  auto-compact is not having to type 「继续」 by hand. Manual clicks stay
+   *  the user's own move, and a failed compaction / pressed stop / queued
+   *  message / parked dialog all mean someone else owns what happens next
+   *  (see shouldResumeAfterAutoCompact). */
+  const resumeAfterAutoCompact = useCallback(
+    (key: string) => {
+      const state = useChatStore.getState();
+      const session = state.bySession[key];
+      // No active fallback: a closed tab means there is nothing to resume
+      // into, and the fallback would send the nudge to a different session.
+      const tab = state.openTabs.find(
+        (t) => sessionKey(t.engine, t.sessionId, t.workspacePath) === key,
+      );
+      const shouldResume = shouldResumeAfterAutoCompact({
+        trigger: "threshold",
+        // A send clears the error up front, so anything set here came from
+        // this very compaction attempt.
+        errorAfter: session?.error ?? null,
+        interrupted: session?.interrupted === true,
+        streaming: session?.streaming === true,
+        queued: session?.queue.length ?? 0,
+        parked: hasPendingUserInput(session?.messages ?? []),
+        sessionId: tab?.sessionId ?? null,
+      });
+      if (!shouldResume || !tab) return;
+      void state
+        .send(
+          t("chat.autoCompactResume"),
+          [],
+          {},
+          {
+            engine: tab.engine,
+            sessionId: tab.sessionId,
+            workspacePath: tab.workspacePath,
+          },
+        )
+        .catch(() => {});
+    },
+    [t],
+  );
+
+  const compactSession = useCallback(
+    async (trigger: "manual" | "threshold") => {
+      if (!sessionKeyValue || streaming || compacting) return;
+      setCompacting(true);
+      try {
+        await compactContext(sessionKeyValue, { trigger });
+        if (trigger === "threshold") {
+          resumeAfterAutoCompact(sessionKeyValue);
+        }
+      } finally {
+        setCompacting(false);
+      }
+    },
+    [compactContext, compacting, resumeAfterAutoCompact, sessionKeyValue, streaming],
+  );
+
+  const handleCompact = useCallback(() => {
+    if (usage?.pct !== undefined && usage.pct >= autoCompact.threshold) {
+      autoCompactLatch.current = {
+        sessionKey: sessionKeyValue,
+        attemptedAtPct: usage.pct,
+      };
     }
-  }, [active, streaming, compacting, compactContext, sessionKeyValue]);
+    void compactSession("manual").catch(() => {});
+  }, [autoCompact.threshold, compactSession, sessionKeyValue, usage?.pct]);
+
+  useEffect(() => {
+    if (autoCompactLatch.current.sessionKey !== sessionKeyValue) {
+      autoCompactLatch.current = { sessionKey: sessionKeyValue, attemptedAtPct: null };
+    }
+
+    const usagePct = usage?.pct;
+    if (usagePct !== undefined && usagePct < autoCompact.threshold) {
+      // Back under the threshold: the next upward crossing is a new event.
+      autoCompactLatch.current.attemptedAtPct = null;
+    }
+    if (
+      !sessionKeyValue ||
+      !shouldAutoCompact({
+        enabled: autoCompact.enabled,
+        threshold: autoCompact.threshold,
+        usagePct,
+        streaming,
+        compacting,
+        attemptedAtPct: autoCompactLatch.current.attemptedAtPct,
+      })
+    ) {
+      return;
+    }
+
+    // Arm at the level just tried: a retry needs the context to grow past it,
+    // so a failed compaction (or one that left usage above the threshold)
+    // neither spins nor disarms the session for good.
+    autoCompactLatch.current.attemptedAtPct = usagePct ?? null;
+    void compactSession("threshold").catch(() => {});
+  }, [
+    autoCompact.enabled,
+    autoCompact.threshold,
+    compactSession,
+    compacting,
+    sessionKeyValue,
+    streaming,
+    usage?.pct,
+  ]);
 
   const handleRefresh = useCallback(async () => {
     if (!active || refreshing) return;
@@ -294,6 +404,10 @@ function FooterStatusBar({
         compacting={compacting}
         refreshing={refreshing}
         canCompact={Boolean(active) && !streaming && !compacting}
+        autoCompact={autoCompact}
+        autoCompactDisabled={!sessionKeyValue}
+        onAutoCompactEnabledChange={(enabled) => setAutoCompactEnabled(sessionKeyValue, enabled)}
+        onAutoCompactThresholdChange={(threshold) => setAutoCompactThreshold(sessionKeyValue, threshold)}
       />
     </div>
   );

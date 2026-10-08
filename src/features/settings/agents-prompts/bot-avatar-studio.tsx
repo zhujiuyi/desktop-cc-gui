@@ -23,7 +23,7 @@ import {
   hexToAppearance,
   normalizeAvatar,
   randomAvatar,
-} from "@/features/bots/bot-avatar";
+} from "@/features/bots/bot-avatar-model";
 import type { BotAvatar } from "@/lib/ipc";
 import { cx } from "@/utils/cx";
 

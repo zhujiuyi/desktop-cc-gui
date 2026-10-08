@@ -3,18 +3,38 @@ import {
   KNOWN_PERMISSIONS,
   execGrantAllows,
   isKnownPermission,
+  isValidPluginId,
   networkGrantAllows,
 } from "@ccgui/plugin-sdk";
 import spec from "../../../../packages/plugin-sdk/spec/permissions.json";
 
 describe("isKnownPermission", () => {
-  it("accepts every base permission (24 项)", () => {
+  it("accepts every permission registered in the spec", () => {
     for (const p of Object.keys(KNOWN_PERMISSIONS)) {
       expect(isKnownPermission(p)).toBe(true);
     }
-    expect(Object.keys(KNOWN_PERMISSIONS)).toHaveLength(24);
-    expect(isKnownPermission("ui:conversation-mode")).toBe(true);
-    expect(isKnownPermission("host:worktree")).toBe(true);
+    // Count derives from the spec, not a hand-maintained literal: adding a
+    // permission to spec/permissions.json must never stale-fail this test.
+    expect(Object.keys(KNOWN_PERMISSIONS)).toHaveLength(spec.knownPermissions.length);
+    // 兼容线新声明的细粒度能力也必须真在 spec 里（不是只有文档承诺）。
+    for (const permission of [
+      "session.lifecycle.read",
+      "runtime.events.read",
+      "runtime.switch.observe",
+      "prompt.contribute.internal",
+      "workspace.metadata.read",
+      "plugin.storage",
+      "ui:overlay",
+      "ui:workspace-menu",
+      "assets:bundle",
+      "assets:directory",
+      "ui:conversation-mode",
+      "host:worktree",
+      "host:window",
+      "host:models",
+    ]) {
+      expect(isKnownPermission(permission)).toBe(true);
+    }
   });
 
   it("accepts well-shaped network: grants (bare host / port / port range)", () => {
@@ -128,8 +148,10 @@ describe("execGrantAllows", () => {
 // TS（本实现）、Rust（plugins.rs include_str!）、模板 validate-manifest.mjs
 // 三方跑同一组向量，任何漂移都会在其中一处失败。
 describe("spec/permissions.json vectors", () => {
-  it("KNOWN_PERMISSIONS is generated from spec.knownPermissions", () => {
-    expect(Object.keys(KNOWN_PERMISSIONS).sort()).toEqual([...spec.knownPermissions].sort());
+  it("accepts shared base permission vectors", () => {
+    for (const permission of spec.knownPermissions) {
+      expect(isKnownPermission(permission), permission).toBe(true);
+    }
   });
 
   it("drives networkGrantShapes.valid through isKnownPermission", () => {
@@ -168,6 +190,17 @@ describe("spec/permissions.json vectors", () => {
   it("drives execAllow vectors through execGrantAllows", () => {
     for (const v of spec.execAllow) {
       expect(execGrantAllows(v.grants, v.bin), JSON.stringify(v)).toBe(v.allowed);
+    }
+  });
+
+  // 插件 id 同时用作目录名（路径穿越护栏），这组向量与 Rust
+  // plugins/manifest.rs::is_valid_id 逐字节对齐，两侧同跑防漂移。
+  it("drives pluginIdShapes vectors through isValidPluginId", () => {
+    for (const id of spec.pluginIdShapes.valid) {
+      expect(isValidPluginId(id), id).toBe(true);
+    }
+    for (const id of spec.pluginIdShapes.invalid) {
+      expect(isValidPluginId(id), id).toBe(false);
     }
   });
 });

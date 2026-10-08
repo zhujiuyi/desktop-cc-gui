@@ -547,6 +547,7 @@ function SettingsRail({
           value={query}
           onChange={onQueryChange}
           onKeyDown={(event) => {
+            if (event.nativeEvent.isComposing) return;
             if (event.key === "Enter" && firstHit) {
               event.preventDefault();
               onSelectHit(firstHit);
@@ -666,9 +667,11 @@ function SettingsContent({
   onClose: () => void;
 }) {
   const bodyRef = useRef<HTMLDivElement | null>(null);
-  /** Row currently flashing; sees the value that is live when an async page
-   *  finally paints it (`settings-rows.tsx`). */
-  const [flashAnchor, setFlashAnchor] = useState<string | null>(null);
+  /** Whether the request's anchor is currently flashing. A transient
+   *  timer-driven flag, not a copy of the anchor prop: the anchor itself is
+   *  read from `anchorRequest` when rendering the provider, so no prop value
+   *  is stored and nothing survives a request change. */
+  const [flashOn, setFlashOn] = useState(false);
 
   useEffect(() => {
     const request = anchorRequest;
@@ -676,7 +679,7 @@ function SettingsContent({
     const container = bodyRef.current;
     if (!container) return;
     const { anchor } = request;
-    setFlashAnchor(null);
+    setFlashOn(false);
     let activated = false;
     let flashTimer: number | undefined;
     let waitTimer: number | undefined;
@@ -707,9 +710,9 @@ function SettingsContent({
         block: "center",
         behavior: prefersReducedMotion() ? "auto" : "smooth",
       });
-      setFlashAnchor(anchor);
+      setFlashOn(true);
       flashTimer = window.setTimeout(
-        () => setFlashAnchor(null),
+        () => setFlashOn(false),
         ANCHOR_FLASH_MS,
       );
       return true;
@@ -773,7 +776,7 @@ function SettingsContent({
           onScroll={(e) => onContentScrolled(e.currentTarget.scrollTop > 0)}
         >
           <div className={CONTENT_COLUMN} ref={bodyRef}>
-            <SettingsAnchorFlashProvider anchor={flashAnchor}>
+            <SettingsAnchorFlashProvider anchor={flashOn ? anchorRequest?.anchor ?? null : null}>
               {renderPage(page)}
             </SettingsAnchorFlashProvider>
           </div>

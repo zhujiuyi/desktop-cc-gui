@@ -1,5 +1,6 @@
 import { memo, useEffect, useRef, useState } from "react";
 import type { IDisposable, Terminal } from "@xterm/xterm";
+import type { FitAddon } from "@xterm/addon-fit";
 import { useTranslation } from "react-i18next";
 import { isMacPlatform } from "@/features/shortcuts/shortcuts";
 import { ipc } from "@/lib/ipc";
@@ -56,12 +57,29 @@ export const TerminalView = memo(function TerminalView({ id, cwd }: { id: string
     if (!host || !xterm) return;
     let resizeTimer: number | undefined;
     let termRef: Terminal | null = null;
+    let fitRef: FitAddon | null = null;
     let inputDisposable: IDisposable | null = null;
     let linkDisposable: IDisposable | null = null;
     let resizeObserver: ResizeObserver | null = null;
     let themeObserver: MutationObserver | null = null;
-    let fontListener: (() => void) | null = null;
     let disposed = false;
+
+    const safeFit = () => {
+      try {
+        fitRef?.fit();
+      } catch {
+        // Zero-size host mid-layout; the next ResizeObserver tick refits.
+      }
+    };
+
+    // Follow 设置 → 通用 → 外观 → 代码字体 changes live. Declared outside
+    // the try so the cleanup below removes the very same listener reference.
+    const onFontChange = () => {
+      if (!termRef) return;
+      termRef.options.fontFamily = terminalFontFamily();
+      safeFit();
+    };
+
     try {
       const { Terminal, FitAddon, WebglAddon } = xterm;
       const term = new Terminal({
@@ -81,6 +99,7 @@ export const TerminalView = memo(function TerminalView({ id, cwd }: { id: string
       termRef = term;
       liveTermRef.current = term;
       const fit = new FitAddon();
+      fitRef = fit;
       term.loadAddon(fit);
       term.open(host);
       try {
@@ -111,13 +130,6 @@ export const TerminalView = memo(function TerminalView({ id, cwd }: { id: string
             if (!disposed) setError(String(e));
           });
 
-      const safeFit = () => {
-        try {
-          fit.fit();
-        } catch {
-          // Zero-size host mid-layout; the next ResizeObserver tick refits.
-        }
-      };
       safeFit();
       void openSession();
 
@@ -172,12 +184,7 @@ export const TerminalView = memo(function TerminalView({ id, cwd }: { id: string
         attributeFilter: ["class"],
       });
       // Follow 设置 → 通用 → 外观 → 代码字体 changes live.
-      const onFontChange = () => {
-        term.options.fontFamily = terminalFontFamily();
-        safeFit();
-      };
       window.addEventListener(FONT_CHANGE_EVENT, onFontChange);
-      fontListener = onFontChange;
     } catch (e: unknown) {
       setError(String(e));
     }
@@ -189,7 +196,7 @@ export const TerminalView = memo(function TerminalView({ id, cwd }: { id: string
       linkDisposable?.dispose();
       resizeObserver?.disconnect();
       themeObserver?.disconnect();
-      if (fontListener) window.removeEventListener(FONT_CHANGE_EVENT, fontListener);
+      window.removeEventListener(FONT_CHANGE_EVENT, onFontChange);
       if (termRef) {
         setTerminalWriter(id, null);
         termRef.dispose();

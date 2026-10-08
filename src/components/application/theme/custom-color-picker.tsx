@@ -262,6 +262,7 @@ export function CustomColorPicker({ value, onChange, className }: CustomColorPic
           onChange={(event) => setHexDraft(event.target.value)}
           onBlur={commitHexDraft}
           onKeyDown={(event) => {
+            if (event.nativeEvent.isComposing) return;
             if (event.key === "Enter") {
               event.preventDefault();
               commitHexDraft();

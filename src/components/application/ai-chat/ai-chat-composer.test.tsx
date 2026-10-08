@@ -3,7 +3,8 @@ import { createRoot, type Root } from "react-dom/client";
 import { HashRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@/lib/i18n";
-import { Composer, StatusBar, getProxyQuickToggleAction } from "./ai-chat-composer";
+import { Composer, StatusBar } from "./ai-chat-composer";
+import { getProxyQuickToggleAction } from "./proxy-toggle";
 import { ipc, type AppSettings } from "@/lib/ipc";
 import { extractText, getCaretOffset } from "./file-tags";
 

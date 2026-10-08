@@ -237,6 +237,9 @@ pub(super) fn apply_channel(
     }
     // Keep the existing provider contract: unrelated native hooks, trust and
     // MCP settings are inherited, not replaced by a channel's document.
+    // `disable_response_storage` is retired by current Codex versions: they
+    // log it as an ignored session flag, so saved legacy channels must not
+    // keep injecting it as a process override.
     for key in [
         "model",
         "model_provider",
@@ -244,7 +247,6 @@ pub(super) fn apply_channel(
         "model_context_window",
         "model_auto_compact_token_limit",
         "preferred_auth_method",
-        "disable_response_storage",
         "model_providers",
     ] {
         if (key == "model" && req.model.is_some())
@@ -662,6 +664,7 @@ mod tests {
             session_id: None,
             workspace: std::path::PathBuf::from("/tmp"),
             prompt: "hi".into(),
+            prompt_contributions: Vec::new(),
             native_compact: false,
             images: Vec::new(),
             model: Some("gpt-6-astra".into()),
@@ -815,7 +818,7 @@ mod tests {
     fn channel_toml_is_applied_for_new_and_resumed_sessions_without_auth_in_argv() {
         let provider = serde_json::json!({"settingsConfig": {
             "auth": {"OPENAI_API_KEY":"test-channel-secret"},
-            "config": "model_provider = \"relay\"\nmodel = \"channel-model\"\nmodel_reasoning_effort = \"low\"\n[model_providers.relay]\nname = \"Relay\"\nbase_url = \"https://relay.example/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\n[model_providers.relay.http_headers]\nX-Route = \"channel\"\n"
+            "config": "disable_response_storage = true\nmodel_provider = \"relay\"\nmodel = \"channel-model\"\nmodel_reasoning_effort = \"low\"\n[model_providers.relay]\nname = \"Relay\"\nbase_url = \"https://relay.example/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\n[model_providers.relay.http_headers]\nX-Route = \"channel\"\n"
         }});
         for session_id in [None, Some("existing-session".into())] {
             let mut req = base_req();
@@ -826,6 +829,7 @@ mod tests {
             assert_eq!(config["model_provider"].as_str(), Some("relay"));
             assert_eq!(config["model_reasoning_effort"].as_str(), Some("high"));
             assert!(!config.contains_key("model"), "explicit -m wins");
+            assert!(!config.contains_key("disable_response_storage"));
             let relay = &config["model_providers"]["relay"];
             assert_eq!(relay["base_url"].as_str(), Some("https://relay.example/v1"));
             assert!(relay.get("http_headers").is_none());

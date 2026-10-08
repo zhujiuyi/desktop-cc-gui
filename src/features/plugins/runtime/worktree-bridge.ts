@@ -62,6 +62,67 @@ function awaitCreation(creationId: string, worktreePath: string): Promise<{ work
   });
 }
 
+export interface PluginWorktreeRemoveDef {
+  repoPath: string;
+  worktreePath: string;
+  branch?: string | null;
+  deleteBranch?: boolean;
+}
+
+/** ctx.worktrees.remove 的宿主实现（SDK 0.3.19，权限 host:worktree）。
+ *
+ *  与侧栏右键「删除 Worktree」同一条路：git worktree remove（可选删分支）
+ *  + 终端会话清理 + 侧栏登记注销 + 非致命尾巴（目录残留 / 分支保留原因）。
+ *  插件只给路径，workspaceId 由宿主按路径反查；silent + onResult 让结果回到
+ *  插件而不是弹宿主的横幅。 */
+export function removePluginWorktree(
+  pluginId: string,
+  def: PluginWorktreeRemoveDef,
+): Promise<{ orphanDirectory: boolean; branchKeptReason: string | null }> {
+  const repoPath = def.repoPath?.trim();
+  const worktreePath = def.worktreePath?.trim();
+  if (!repoPath) {
+    return Promise.reject(new Error(`invalid_args: ${pluginId} worktrees.remove: empty repoPath`));
+  }
+  if (!worktreePath) {
+    return Promise.reject(new Error(`invalid_args: ${pluginId} worktrees.remove: empty worktreePath`));
+  }
+  const workspace = useChatStore
+    .getState()
+    .workspaces.find((row) => row.kind === "worktree" && row.path === worktreePath);
+  const branch = typeof def.branch === "string" && def.branch.trim() ? def.branch.trim() : null;
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(`remove_failed: ${pluginId} worktrees.remove timed out`));
+    }, 120000);
+    useWorktreeStore.getState().remove({
+      workspaceId: workspace ? workspace.id : "",
+      worktreePath,
+      repoPath,
+      branch,
+      deleteBranch: def.deleteBranch === true,
+      silent: true,
+      onResult: (outcome) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (outcome.ok) {
+          resolve({
+            orphanDirectory: outcome.value.orphanDirectory,
+            branchKeptReason: outcome.value.branchKeptReason ?? null,
+          });
+          return;
+        }
+        const detail = outcome.error instanceof Error ? outcome.error.message : String(outcome.error);
+        reject(new Error(`remove_failed: ${detail}`));
+      },
+    });
+  });
+}
+
 export function createPluginWorktree(
   pluginId: string,
   def: PluginWorktreeCreateDef,

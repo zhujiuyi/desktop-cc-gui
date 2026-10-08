@@ -25,6 +25,7 @@ import { modelDisplayName } from "@/features/settings/usage-model";
 import { ProcessDisclosure, type ProcessSearchTarget } from "./ProcessDisclosure";
 import { BackgroundTasksLine } from "./BackgroundTasksPanel";
 import { runningTaskCount } from "../background-tasks";
+import { ResponseCheckBadge } from "./response-check-badge";
 import { CollapsibleMessage } from "./CollapsibleMessage";
 import { useScrollFollow, useTailPin } from "./use-scroll-follow";
 import { ScrollControl } from "./ScrollControl";
@@ -33,7 +34,8 @@ import { PluginBoundary } from "@/features/plugins/boundary/PluginBoundary";
 import { useAnchorRailScroll } from "./use-anchor-rail-scroll";
 import { useLoadEarlier } from "./use-load-earlier";
 import { stripAgentBlock } from "./agent-block";
-import { BotAvatarView, avatarFromLegacyIcon } from "@/features/bots/bot-avatar";
+import { BotAvatarView } from "@/features/bots/bot-avatar";
+import { avatarFromLegacyIcon } from "@/features/bots/bot-avatar-model";
 import { useBotStore } from "@/features/bots/bot-store";
 import { registerShortcutHandler } from "@/features/shortcuts/runtime";
 import { TimelineSearchBar } from "./TimelineSearchBar";
@@ -89,6 +91,9 @@ const TimelineRowView = memo(function TimelineRowView({
       </PluginBoundary>
     );
   }
+  // The compaction command renders in place, not as a bubble: one grey line
+  // that stays after the compaction ends.
+  if (row.kind === "curtain") return <CompactionCurtain />;
   // Every process run — thinking, tools, or both — folds into the same
   // collapsed summary line ("思考 N 次 工具调用 M 次 >"); expanding shows
   // the per-step details.
@@ -115,6 +120,21 @@ const TimelineRowView = memo(function TimelineRowView({
     />
   );
 });
+
+/** The one trace host automatic compaction leaves in the transcript: a grey,
+ *  right-aligned line where the /compact bubble used to be. It belongs to the
+ *  row, so it survives the compaction ending; the engine's own mid-turn
+ *  compaction has no row and mounts this component as the tail instead. */
+export function CompactionCurtain() {
+  const { t } = useTranslation();
+  return (
+    <div className="flex justify-end py-2 pr-1" data-testid="compaction-curtain">
+      <span className="text-caption-1-medium text-text-tertiary">
+        {`< ${t("chat.compactingContext")} >`}
+      </span>
+    </div>
+  );
+}
 
 const LazyMarkdown = lazy(() => import("./Markdown"));
 
@@ -196,10 +216,17 @@ function MessageMeta({ message }: { message: Message }) {
     modelFormatted,
     effortText,
   ].filter((p): p is string => Boolean(p));
-  if (parts.length === 0) return null;
+  const check = message.responseCheck ?? null;
+  if (parts.length === 0 && !check) return null;
   return (
     <span className="text-caption-1-regular tabular-nums text-text-tertiary opacity-0 transition-opacity duration-150 group-hover:opacity-100">
       {parts.join(" · ")}
+      {/* Recorded at settle: the response check outlives the tail indicator. */}
+      {check && (
+        <span className="ml-1.5 inline-flex items-center align-middle">
+          <ResponseCheckBadge check={check} />
+        </span>
+      )}
     </span>
   );
 }
@@ -392,6 +419,10 @@ function useTimelineSearch({
   useEffect(
     () =>
       registerShortcutHandler("chatSearch", () => {
+        // 对话面可能只是保活挂载（文件/浏览器等中心面在视）。不可见时让位，
+        // 否则 ⌘F 会在看不到的对话里开关搜索（Markdown 预览的搜索同时点亮）。
+        const el = scrollRef.current;
+        if (!el || getComputedStyle(el).visibility === "hidden") return;
         if (searchOpenRef.current) {
           setSearchOpen(false);
           return;
@@ -402,7 +433,7 @@ function useTimelineSearch({
           searchInputRef.current?.select();
         });
       }),
-    [],
+    [scrollRef],
   );
   const searchMatches = useMemo(
     () => (searchOpen ? findTimelineMatches(rows, searchQuery) : []),
@@ -557,7 +588,10 @@ export const MessageTimeline = memo(function MessageTimeline({
   // over, even though nothing streams.
   const backgroundActive = session.backgroundActive;
   const runningCount = runningTaskCount(session.tasks);
-  const count = rows.length + (streaming || backgroundActive ? 1 : 0);
+  // The tail item is the turn-status indicator (or the grey compaction line).
+  // A compaction keeps it mounted even between sends, so the line does not
+  // blink out in the gap between the compact turn and the resume turn.
+  const count = rows.length + (streaming || backgroundActive || session.compaction ? 1 : 0);
 
   const virtualizer = useVirtualizer({
     count,
@@ -705,22 +739,23 @@ export const MessageTimeline = memo(function MessageTimeline({
                 className="py-2"
               >
                 {isTail ? (
-                  streaming ? (
-                    <>
-                      {/* Both phases of the turn share this one slot: the
-                          background marker stays visible above the thinking
-                          row while the completion turn streams, and becomes
-                          the slot's only content once the reply settles. */}
-                      {backgroundActive && <BackgroundTasksLine count={runningCount} />}
+                  <>
+                    {/* Background work keeps its own row during streaming
+                        and compaction, then remains after the reply settles. */}
+                    {backgroundActive && <BackgroundTasksLine count={runningCount} />}
+                    {session.compaction?.automatic ? (
+                      <CompactionCurtain />
+                    ) : streaming && !session.compaction ? (
                       <AgentThinking
                         variant="wave"
-                        label={session.compaction ? t("chat.compactingContext") : t("chat.thinking")}
+                        label={t("chat.thinking")}
                         className="py-2"
                         startedAt={session.turnStartedAt ?? undefined}
                         durationFormatter={(d) => t("chat.metaDuration", { duration: d })}
                         model={activeModelFormatted}
                         effort={activeEffortFormatted}
                         usage={liveUsage}
+                        metaExtra={<ResponseCheckBadge check={session.responseCheck} />}
                         retry={
                           session.retry
                             ? session.retry.max > 0
@@ -733,10 +768,8 @@ export const MessageTimeline = memo(function MessageTimeline({
                         }
                         retryDetail={session.retry?.message || null}
                       />
-                    </>
-                  ) : (
-                    <BackgroundTasksLine count={runningCount} />
-                  )
+                    ) : null}
+                  </>
                 ) : (
                   <TimelineRowView
                     row={rows[item.index]}

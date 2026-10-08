@@ -6,7 +6,7 @@
 // avatar, and 拼装预览 lists the blocks the model would receive. Every
 // `bot_*` invoke is answered from the objects below — nothing is written to
 // disk and no model is called.
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "../../src/index.css";
 import "../../src/lib/i18n";
@@ -121,7 +121,9 @@ window.__TAURI_INTERNALS__.invoke = async (cmd: string, args?: Record<string, un
  *  `&preview=1` opens 拼装预览, `&theme=dark` flips the theme class. */
 function Fixture() {
   const [ready, setReady] = useState(false);
-  const params = new URLSearchParams(window.location.search);
+  // Stable across renders: the query string never changes at runtime, and a
+  // fresh URLSearchParams each render would re-run both effects forever.
+  const params = useMemo(() => new URLSearchParams(window.location.search), []);
 
   useEffect(() => {
     if (params.get("theme") === "dark") {

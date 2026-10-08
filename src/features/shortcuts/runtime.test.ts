@@ -110,6 +110,17 @@ describe("shortcut runtime dispatch", () => {
     stop();
   });
 
+  it("runs the close-tab handler on the default ⌘W and prevents default", () => {
+    const stop = startShortcutRuntime();
+    const spy = vi.fn();
+    const unregister = registerShortcutHandler("closeTab", spy);
+    const event = pressKey("w", { meta: true });
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(event.defaultPrevented).toBe(true);
+    unregister();
+    stop();
+  });
+
   it("does not steal the interrupt shortcut from editable targets", () => {
     const stop = startShortcutRuntime();
     const spy = vi.fn();

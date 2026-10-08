@@ -1,7 +1,8 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { SessionSearchPalette, formatSearchDuration } from "./session-search-palette";
+import { SessionSearchPalette } from "./session-search-palette";
+import { formatSearchDuration } from "./session-search-format";
 import type { AiChatRepo } from "./sidebar-types";
 import { ipc, type MessageSearchHit, type MessageSearchPage } from "@/lib/ipc";
 

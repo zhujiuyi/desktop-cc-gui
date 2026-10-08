@@ -105,8 +105,8 @@ fn main() {
     };
     if let Some((engine, path, size)) = biggest {
         let start = Instant::now();
-        let parsed =
-            parse_session_file(&engine, std::path::Path::new(&path)).expect("parse biggest");
+        let parsed = parse_session_file(&engine, std::path::Path::new(&path), &std::collections::HashSet::new())
+            .expect("parse biggest");
         println!(
             "reader: {engine} {} bytes -> {} messages in {:?} ({})",
             size,

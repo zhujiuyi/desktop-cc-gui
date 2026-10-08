@@ -33,6 +33,8 @@ async fn run_one(engine_id: &str, workspace: &PathBuf) -> Result<(), String> {
         session_id: None,
         workspace: workspace.clone(),
         prompt: "Reply with exactly: ok".to_string(),
+        // 冒烟示例不经插件回合,没有可注入的贡献。
+        prompt_contributions: Vec::new(),
         native_compact: false,
         images: Vec::new(),
         model: None,
@@ -43,8 +45,9 @@ async fn run_one(engine_id: &str, workspace: &PathBuf) -> Result<(), String> {
         provider_id: None,
         computer_use: None,
         allowed_tools: None,
+        memory_bot: None,
     };
-    let bin = which::which(engine_id)
+    let bin = which::which(if engine_id == "minimax" { "mcode" } else { engine_id })
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| engine_id.to_string());
     let built = engine.build_command(&req, &bin)?;

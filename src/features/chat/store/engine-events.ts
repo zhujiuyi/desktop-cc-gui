@@ -8,6 +8,8 @@ import {
 } from "./plan-review";
 import { errorText } from "@/lib/errors";
 import { pendingWorkspaceOfKey, dedupeTabs, persistTabs, sessionKey } from "./persistence";
+import { migrateSessionContributions } from "./session-contributions";
+import { migrateAutoCompactSettings } from "../auto-compact-context";
 import {
   EMPTY_SESSION,
   EMPTY_TASKS,
@@ -47,7 +49,416 @@ import {
 } from "./ask-loop";
 import { mergeUsage, parseUsage, reportedContextWindow, type ParsedUsage } from "../usage";
 import { usageTrackingEnabled } from "@/features/settings/usage-tracking";
+import type {
+  RegisteredInternalMessageCapture,
+} from "@/features/plugins/runtime/hooks";
+import {
+  dispatchAfterTurn,
+  dispatchInternalMessage,
+  dispatchRuntimeEvent,
+  dispatchSessionCreated,
+  isInternalMessageCaptureActive,
+} from "@/features/plugins/runtime/hooks";
+import { normalizeEngineEvent, type EngineTerminalFact } from "../normalized-runtime-events";
+import { workspaceMetadata } from "./lifecycle";
+import type { AfterTurnEvent, InternalMessageCapture, WorkspaceMetadata } from "@ccgui/plugin-sdk";
 import { migrateSelectedBot } from "@/features/bots/selected-bot";
+interface RunLifecycle {
+  turnId: string;
+  engine: string;
+  sessionId: string | null;
+  workspace: WorkspaceMetadata;
+  captures: RegisteredInternalMessageCapture[];
+  acceptedFrames?: string[];
+  launchSettled?: boolean;
+  deferredAfterTurn?: AfterTurnEvent;
+}
+
+interface CaptureBuffer {
+  lifecycle: RunLifecycle;
+  text: string;
+}
+
+const runLifecycles = new Map<string, RunLifecycle>();
+const captureBuffers = new Map<string, CaptureBuffer>();
+/** Placeholder id -> lifecycle awaiting its real run id. A fast engine can
+ * emit session/delta/done before the send resolves, so the lifecycle is
+ * registered up front and rekeyed (or bound by the event) once the id exists. */
+const pendingRuns = new Map<string, RunLifecycle>();
+/** Run ids already bound to a lifecycle (bounded, oldest first). Keeps a
+ * trailing event from a settled run off another run's pending lifecycle. */
+const knownRunIds = new Set<string>();
+const KNOWN_RUN_ID_LIMIT = 512;
+/** Events that outran an ambiguous set of same-engine pending sends. The
+ * SendResult later identifies the owner and replays that run in order. */
+const bufferedEarlyEvents = new Map<string, ChatEngineEvent[]>();
+const BUFFERED_EARLY_RUN_LIMIT = 64;
+const BUFFERED_EARLY_EVENT_LIMIT = 256;
+
+function bufferEarlyEvent(event: ChatEngineEvent): void {
+  const buffered = bufferedEarlyEvents.get(event.runId) ?? [];
+  if (buffered.length < BUFFERED_EARLY_EVENT_LIMIT) buffered.push(event);
+  bufferedEarlyEvents.delete(event.runId);
+  bufferedEarlyEvents.set(event.runId, buffered);
+  if (bufferedEarlyEvents.size > BUFFERED_EARLY_RUN_LIMIT) {
+    const oldest = bufferedEarlyEvents.keys().next().value;
+    if (oldest !== undefined) bufferedEarlyEvents.delete(oldest);
+  }
+}
+
+function rememberRunId(runId: string): void {
+  knownRunIds.add(runId);
+  if (knownRunIds.size > KNOWN_RUN_ID_LIMIT) {
+    const oldest = knownRunIds.values().next().value;
+    if (oldest !== undefined) knownRunIds.delete(oldest);
+  }
+}
+
+/** A frame identity the host failed to store would silently unhide that frame
+ * in reloaded history, so a failed record is retried. Attempts are bounded: a
+ * permanently failing backend must not spin. */
+const FRAME_RECORD_RETRY_MS = 500;
+const FRAME_RECORD_MAX_ATTEMPTS = 5;
+
+function recordAcceptedFrame(
+  engine: string,
+  sessionId: string,
+  frame: string,
+  workspacePath: string,
+  attempt: number,
+): void {
+  void ipc.recordAcceptedInternalFrame(engine, sessionId, frame, workspacePath).catch(() => {
+    if (attempt >= FRAME_RECORD_MAX_ATTEMPTS) return;
+    setTimeout(
+      () => recordAcceptedFrame(engine, sessionId, frame, workspacePath, attempt + 1),
+      FRAME_RECORD_RETRY_MS,
+    );
+  });
+}
+
+function persistAcceptedFrames(lifecycle: RunLifecycle): void {
+  const frames = lifecycle.acceptedFrames;
+  const sessionId = lifecycle.sessionId;
+  if (!sessionId || !frames || frames.length === 0) return;
+  for (const frame of frames.splice(0)) {
+    recordAcceptedFrame(lifecycle.engine, sessionId, frame, lifecycle.workspace.path, 1);
+  }
+}
+
+/** Register before sending. Release the returned gate after launch success or
+ * rejection, so early terminal hooks cannot outrun contribution acceptance. */
+export function registerPendingRunLifecycle(
+  placeholderId: string,
+  lifecycle: RunLifecycle,
+): (sessionId?: string | null) => void {
+  lifecycle.acceptedFrames = [];
+  lifecycle.launchSettled = false;
+  runLifecycles.set(placeholderId, lifecycle);
+  captureBuffers.set(placeholderId, { lifecycle, text: "" });
+  pendingRuns.set(placeholderId, lifecycle);
+  return (sessionId) => {
+    if (lifecycle.launchSettled) return;
+    lifecycle.launchSettled = true;
+    if (sessionId && !lifecycle.sessionId) lifecycle.sessionId = sessionId;
+    persistAcceptedFrames(lifecycle);
+    const terminal = lifecycle.deferredAfterTurn;
+    if (terminal) {
+      lifecycle.deferredAfterTurn = undefined;
+      dispatchAfterTurn({ ...terminal, sessionId: lifecycle.sessionId });
+    }
+  };
+}
+
+/** Move a pre-registered lifecycle onto the run id the send returned and adopt
+ * the native session id. Safe to call after an early event already bound it, or
+ * when it is already gone. */
+export function bindRunLifecycle(
+  placeholderId: string,
+  runId: string,
+  sessionId?: string | null,
+): void {
+  const pending = pendingRuns.get(placeholderId);
+  if (!pending) {
+    // An early event already bound it (or the lifecycle is gone). Still record
+    // the native session so later internal-message events carry it.
+    const bound = runLifecycles.get(runId);
+    if (bound && sessionId) {
+      bound.sessionId = sessionId;
+      persistAcceptedFrames(bound);
+    }
+    pendingRuns.delete(placeholderId);
+    rememberRunId(runId);
+    return;
+  }
+  if (sessionId) {
+    pending.sessionId = sessionId;
+    persistAcceptedFrames(pending);
+  }
+  if (placeholderId === runId) {
+    pendingRuns.delete(placeholderId);
+    rememberRunId(runId);
+    return;
+  }
+  const buffer = captureBuffers.get(placeholderId);
+  pendingRuns.delete(placeholderId);
+  runLifecycles.delete(placeholderId);
+  captureBuffers.delete(placeholderId);
+  runLifecycles.set(runId, pending);
+  if (buffer) captureBuffers.set(runId, buffer);
+  rememberRunId(runId);
+}
+
+/** An engine event may outrun the send result. Bind it to the one lifecycle
+ * pre-registered for the same engine (and, when both sides know a native
+ * session, the same session); ambiguous or absent candidates stay unbound and
+ * are rekeyed by the store when the send resolves. */
+function bindUnboundRun(event: ChatEngineEvent): boolean {
+  if (runLifecycles.has(event.runId) || knownRunIds.has(event.runId)) return false;
+  let match: string | undefined;
+  for (const [placeholder, lifecycle] of pendingRuns) {
+    if (lifecycle.engine !== event.engine) continue;
+    if (
+      lifecycle.sessionId !== null &&
+      // Engine events broadcast to every attached client. A pending send that
+      // already knows its native session must only adopt events carrying that
+      // exact id: an identity-less event can belong to a foreign run (a phone
+      // driving the same engine), and binding it would rekey this turn's
+      // capture buffer and hooks onto the wrong run. Unbound events are
+      // buffered and replayed once the send resolves, so nothing is lost.
+      lifecycle.sessionId !== event.sessionId
+    ) continue;
+    if (match !== undefined) return false;
+    match = placeholder;
+  }
+  if (match === undefined) return false;
+  bindRunLifecycle(match, event.runId);
+  return true;
+}
+/** Replay events buffered while multiple pending sends made ownership
+ * ambiguous. Call only after binding and routing the real run id. */
+export function replayBufferedEngineEvents(runId: string, deps: EngineEventDeps): void {
+  const events = bufferedEarlyEvents.get(runId);
+  if (!events) return;
+  bufferedEarlyEvents.delete(runId);
+  handleEngineEvents(events, deps);
+}
+
+export function finishRunLifecycle(
+  runId: string,
+  status: "completed" | "cancelled" | "failed",
+  error?: string,
+  sessionId?: string | null,
+): void {
+  const lifecycle = runLifecycles.get(runId);
+  if (!lifecycle) return;
+  if (sessionId) lifecycle.sessionId = sessionId;
+  unregisterRunLifecycle(runId);
+  const terminal: AfterTurnEvent = {
+    runId,
+    turnId: lifecycle.turnId,
+    engine: lifecycle.engine,
+    sessionId: lifecycle.sessionId,
+    workspace: lifecycle.workspace,
+    occurredAt: new Date().toISOString(),
+    status,
+    ...(error === undefined ? {} : { error }),
+  };
+  if (lifecycle.launchSettled === false) lifecycle.deferredAfterTurn = terminal;
+  else dispatchAfterTurn(terminal);
+}
+export function unregisterRunLifecycle(runId: string): void {
+  // A turn can settle before its send result resolved the native session id.
+  // Frames accepted meanwhile are parked on the lifecycle, so flush them here:
+  // after this the lifecycle is gone and a later bind finds nothing, leaving
+  // the frame hidden live but visible again on reload. A run that never
+  // resolved a session id has no scope to record under and cannot be saved.
+  const lifecycle = runLifecycles.get(runId);
+  if (lifecycle) persistAcceptedFrames(lifecycle);
+  runLifecycles.delete(runId);
+  captureBuffers.delete(runId);
+  pendingRuns.delete(runId);
+  bufferedEarlyEvents.delete(runId);
+}
+
+function frameOpen(nonce: string): string {
+  return `<CCGUI_INTERNAL_${nonce}>`;
+}
+
+function frameClose(nonce: string): string {
+  return `</CCGUI_INTERNAL_${nonce}>`;
+}
+function validInternalNonce(nonce: string | undefined): nonce is string {
+  return (
+    nonce !== undefined &&
+    nonce.length >= 1 &&
+    nonce.length <= 128 &&
+    /^[A-Za-z0-9_-]+$/.test(nonce)
+  );
+}
+
+/**
+ * A frame is consumed (hidden from the transcript and routed to its plugin)
+ * only when it parses as complete JSON, fits the byte budget, and the owning
+ * plugin's synchronous validator explicitly accepts the payload. Rejected,
+ * oversized, and incomplete frames stay visible — the host must not hide
+ * output the plugin cannot vouch for.
+ */
+function acceptsCapture(
+  capture: InternalMessageCapture,
+  payload: unknown,
+  bytes: number,
+): boolean {
+  if (payload === undefined || bytes > capture.maxBytes) return false;
+  if (!capture.validate) return true;
+  try {
+    return capture.validate(payload) === true;
+  } catch {
+    return false;
+  }
+}
+
+function processCaptureBuffer(runId: string, flush: boolean): string {
+  const state = captureBuffers.get(runId);
+  if (!state) return "";
+  // No capture registered for this run (the default when no plugin asked for
+  // one): nothing can ever be a hidden frame, so the buffered text is visible
+  // as-is. Returning it here — and clearing it — keeps deltas flowing; the
+  // frame scanner below would otherwise hold the text forever.
+  if (state.lifecycle.captures.length === 0) {
+    const visible = state.text;
+    state.text = "";
+    return visible;
+  }
+  let visible = "";
+  let rest = state.text;
+  while (rest) {
+    let selected:
+      | { capture: RegisteredInternalMessageCapture; index: number; open: string; close: string }
+      | undefined;
+    for (const capture of state.lifecycle.captures) {
+      if (!isInternalMessageCaptureActive(capture)) continue;
+      const nonce = capture.capture.nonce;
+      if (!validInternalNonce(nonce)) continue;
+      const open = frameOpen(nonce);
+      const index = rest.indexOf(open);
+      if (index >= 0 && (!selected || index < selected.index)) {
+        selected = { capture, index, open, close: frameClose(nonce) };
+      }
+    }
+    if (!selected) {
+      if (flush) {
+        visible += rest;
+        rest = "";
+      } else {
+        // Keep the longest suffix that could still become one of this run's
+        // complete opening tags. Deltas may split anywhere, including inside
+        // the nonce; retaining only the fixed marker leaks that frame before
+        // the next chunk can complete it.
+        let split = rest.length;
+        for (const registered of state.lifecycle.captures) {
+          if (!isInternalMessageCaptureActive(registered)) continue;
+          const nonce = registered.capture.nonce;
+          if (!validInternalNonce(nonce)) continue;
+          const open = frameOpen(nonce);
+          const maxPrefix = Math.min(rest.length, open.length - 1);
+          for (let size = maxPrefix; size > 0; size--) {
+            if (open.startsWith(rest.slice(-size))) {
+              split = Math.min(split, rest.length - size);
+              break;
+            }
+          }
+        }
+        visible += rest.slice(0, split);
+        rest = rest.slice(split);
+      }
+      break;
+    }
+    visible += rest.slice(0, selected.index);
+    const contentStart = selected.index + selected.open.length;
+    const closeIndex = rest.indexOf(selected.close, contentStart);
+    if (closeIndex < 0) {
+      rest = rest.slice(selected.index);
+      // A UTF-16 code unit never encodes to fewer than one UTF-8 byte, so more
+      // pending units than the budget means more pending bytes too. Re-encoding
+      // the whole pending payload on every delta would make this quadratic over
+      // a turn; this bound is O(1) and still releases before growth is
+      // unbounded.
+      const pendingUnits = rest.length - selected.open.length;
+      // Flushing, or a payload already past the capture's own budget: this
+      // frame can never be accepted, so release it instead of holding the rest
+      // of the turn behind one unterminated tag.
+      if (flush || pendingUnits > selected.capture.capture.maxBytes) {
+        visible += rest;
+        rest = "";
+      }
+      break;
+    }
+    const payloadText = rest.slice(contentStart, closeIndex);
+    const bytes = new TextEncoder().encode(payloadText).byteLength;
+    let payload: unknown;
+    try {
+      payload = JSON.parse(payloadText);
+    } catch {
+      payload = undefined;
+    }
+    const frameEnd = closeIndex + selected.close.length;
+    const frame = rest.slice(selected.index, frameEnd);
+    if (!acceptsCapture(selected.capture.capture, payload, bytes) || !isInternalMessageCaptureActive(selected.capture)) {
+      visible += frame;
+    } else {
+      const lifecycle = state.lifecycle;
+      (lifecycle.acceptedFrames ??= []).push(frame);
+      persistAcceptedFrames(lifecycle);
+      dispatchInternalMessage(selected.capture, {
+        runId,
+        turnId: lifecycle.turnId,
+        engine: lifecycle.engine,
+        sessionId: lifecycle.sessionId,
+        workspace: lifecycle.workspace,
+        occurredAt: new Date().toISOString(),
+        channel: selected.capture.capture.channel,
+        ...(selected.capture.capture.nonce ? { nonce: selected.capture.capture.nonce } : {}),
+        payload,
+      });
+    }
+    rest = rest.slice(frameEnd);
+  }
+  state.text = rest;
+  return visible;
+}
+
+export function filterInternalFrameDelta(runId: string, text: string): string {
+  const state = captureBuffers.get(runId);
+  if (!state) return text;
+  state.text += text;
+  return processCaptureBuffer(runId, false);
+}
+
+export function flushInternalFrameDelta(runId: string): string {
+  return processCaptureBuffer(runId, true);
+}
+
+function dispatchNormalized(event: ChatEngineEvent, terminal?: EngineTerminalFact): void {
+  // Plan-review kinds ride the same run envelope but have no runtime-event
+  // projection; skip them so the transport normalizer only sees kinds from
+  // its own union (normalizeEngineEvent returns null for them anyway).
+  if (
+    event.kind === "plan_draft" ||
+    event.kind === "plan_review" ||
+    event.kind === "plan_review_settled"
+  )
+    return;
+  const lifecycle = runLifecycles.get(event.runId);
+  if (!lifecycle) return;
+  const normalized = normalizeEngineEvent(event as EngineEventPayload, {
+    turnId: lifecycle.turnId,
+    workspaceId: lifecycle.workspace.id,
+    workspacePath: lifecycle.workspace.path,
+    occurredAt: new Date().toISOString(),
+    ...(terminal ? { terminal } : {}),
+  });
+  if (normalized) dispatchRuntimeEvent(normalized);
+}
 
 /**
  * Engine-event handling: the main loop resolves each event's session key and
@@ -169,13 +580,12 @@ function stampedEffort(
   return resolveSessionEffort(tab, s.bySession[key], s.efforts[engine]) || null;
 }
 
-function onModel(
-  event: ChatEngineEvent,
+/** Apply an engine-reported model to the display (activeModel + live row). */
+function applyModelDisplay(
+  reported: string,
   key: string,
   deps: EngineEventDeps,
 ) {
-  const reported = typeof event.data === "string" ? event.data.trim() : "";
-  if (!reported) return;
   // The engine reports the bare model name; our own record spells it
   // "provider/model" (see ipc.rememberSessionModel). Same model, more
   // context — keep the qualified one instead of dropping the provider.
@@ -205,13 +615,12 @@ function onModel(
   });
 }
 
-function onEffort(
-  event: ChatEngineEvent,
+/** Apply an engine-reported effort to the display. */
+function applyEffortDisplay(
+  reported: string,
   key: string,
   deps: EngineEventDeps,
 ) {
-  const reported = typeof event.data === "string" ? event.data.trim() : "";
-  if (!reported) return;
   deps.set((s) => {
     const cur = s.bySession[key];
     if (!cur || cur.activeEffort === reported) return {};
@@ -219,6 +628,85 @@ function onEffort(
       bySession: {
         ...s.bySession,
         [key]: { ...cur, activeEffort: reported },
+      },
+    };
+  });
+}
+
+/** `{model?, effort?}` payload of a launch/served selection event. */
+function selectionFields(event: ChatEngineEvent): {
+  model: string | null;
+  effort: string | null;
+} {
+  const data = (event.data ?? {}) as { model?: unknown; effort?: unknown };
+  const model =
+    typeof data.model === "string" && data.model.trim() ? data.model.trim() : null;
+  const effort =
+    typeof data.effort === "string" && data.effort.trim()
+      ? data.effort.trim()
+      : null;
+  return { model, effort };
+}
+
+/** The run's launch selection: seed the display exactly as the old
+ *  model/effort echo did, and open a fresh request side for the check. */
+function onLaunch(event: ChatEngineEvent, key: string, deps: EngineEventDeps) {
+  const { model, effort } = selectionFields(event);
+  if (!model && !effort) return;
+  const data = event.data as { comparisonModel?: string | null };
+  const comparison =
+    data.comparisonModel === undefined
+      ? {}
+      : { comparisonModel: data.comparisonModel };
+  if (model) applyModelDisplay(model, key, deps);
+  if (effort) applyEffortDisplay(effort, key, deps);
+  deps.set((s) => {
+    const cur = s.bySession[key];
+    if (!cur) return {};
+    return {
+      bySession: {
+        ...s.bySession,
+        [key]: {
+          ...cur,
+          responseCheck: {
+            requested: { model, effort, ...comparison },
+            served: { model: null, effort: null },
+          },
+        },
+      },
+    };
+  });
+}
+
+/** What the response reported as served: evidence for the check only — the
+ *  tail's model/effort display keeps coming from the model/effort reports. */
+function onServed(
+  event: ChatEngineEvent,
+  key: string,
+  deps: EngineEventDeps,
+) {
+  const { model, effort } = selectionFields(event);
+  if (!model && !effort) return;
+  deps.set((s) => {
+    const cur = s.bySession[key];
+    if (!cur) return {};
+    const prev = cur.responseCheck ?? {
+      requested: { model: null, effort: null },
+      served: { model: null, effort: null },
+    };
+    return {
+      bySession: {
+        ...s.bySession,
+        [key]: {
+          ...cur,
+          responseCheck: {
+            requested: prev.requested,
+            served: {
+              model: model ?? prev.served.model,
+              effort: effort ?? prev.served.effort,
+            },
+          },
+        },
       },
     };
   });
@@ -235,11 +723,15 @@ function onDelta(
   deps: EngineEventDeps,
 ) {
   // Content resumed: a re-issued request succeeded, so the retry chip goes.
+  // Before the frame filter: a delta that is nothing but an internal frame
+  // still proves the retried request is streaming again.
   if (retryingKeys.has(key)) clearRetry(key, deps);
+  const text = filterInternalFrameDelta(event.runId, event.data as string);
+  if (!text) return;
   bufferStreamPart(
     key,
     "delta",
-    event.data as string,
+    text,
     stampedModel(deps, event.engine, key),
     stampedEffort(deps, event.engine, key),
   );
@@ -275,11 +767,26 @@ function onMessage(
     text: string;
   };
   if (data.role !== "assistant") return;
+  // Snapshots are a stream boundary: feed them through the same run-scoped
+  // capture parser as deltas, then flush any unmatched/incomplete text so it
+  // remains visible instead of leaking into a later event.
+  const text =
+    filterInternalFrameDelta(event.runId, data.text) +
+    flushInternalFrameDelta(event.runId);
   // Full-snapshot assistant lines (kimi/codex non-delta) append as settled
-  // messages; any live row above is finished growing.
+  // messages; any live row above is finished growing even when the snapshot
+  // contained only an accepted internal frame.
   deps.set((s) => {
     const prev = s.bySession[key] ?? EMPTY_SESSION;
     const settled = settleLiveRows(prev.messages);
+    if (!text) {
+      return {
+        bySession: {
+          ...s.bySession,
+          [key]: { ...prev, messages: settled },
+        },
+      };
+    }
     const seq = settled.length ? settled[settled.length - 1].seq + 1 : 1;
     const durationMs = prev.turnStartedAt
       ? Math.max(0, Date.now() - prev.turnStartedAt)
@@ -293,7 +800,7 @@ function onMessage(
             ...settled,
             {
               role: "assistant",
-              text: data.text,
+              text,
               ts: new Date().toISOString(),
               model: stampedModel(deps, event.engine, key),
               effort: stampedEffort(deps, event.engine, key),
@@ -348,6 +855,11 @@ function onSession(
   deps: EngineEventDeps,
 ) {
   const nativeId = event.data as string;
+  const lifecycle = runLifecycles.get(event.runId);
+  if (lifecycle) {
+    lifecycle.sessionId = nativeId;
+    persistAcceptedFrames(lifecycle);
+  }
   // Resolve the workspace from the tab that owns this key — not from the
   // active tab. A first message sent on a background tab must not adopt the
   // foreground tab's workspace (the session would be orphaned there).
@@ -373,6 +885,7 @@ function onSession(
   // 认领成这个会话。
   const routedWorkspace = tab ? "" : pendingWorkspaceOfKey(event.engine, key);
   const workspacePath =
+    lifecycle?.workspace.path ||
     tab?.workspacePath ||
     routedWorkspace ||
     deps.get().active?.workspacePath ||
@@ -419,6 +932,19 @@ function onSession(
   settleOrphanedRuns(deps.set, routeRun(event.runId, newKey));
   // Unflushed stream chunks sit under the pre-migration key; move them too.
   migratePendingStream(fromKey, newKey);
+  // A delta-only engine reports no native id from the send, so a remembered
+  // session contribution still sits under the pending scope. Rekey it onto the
+  // native id exactly like the session state (the workspace resolved above is
+  // the one sendPrompt remembered under), so later turns re-inject it.
+  deps.set((s) => {
+    const next = migrateSessionContributions(
+      s.sessionContributions,
+      event.engine,
+      workspacePath,
+      nativeId,
+    );
+    return next ? { sessionContributions: next } : {};
+  });
   // Migrate pending key -> native key.
   deps.set((s) => {
     const prev = s.bySession[fromKey];
@@ -491,9 +1017,34 @@ function onSession(
     persistTabs(openTabs, s.active);
     return { openTabs };
   });
+  const createdKey = sessionKey(event.engine, nativeId, workspacePath);
+  if (!deps.get().createdSessionKeys[createdKey]) {
+    deps.set((s) => ({
+      createdSessionKeys: { ...s.createdSessionKeys, [createdKey]: true },
+    }));
+    // One workspace, one identity: fall back to the same metadata helper every
+    // other hook event uses — fabricating id = path would hand plugins a
+    // second identity for the same directory.
+    // Test doubles and early boot states may lack the workspaces list; the
+    // helper derives a stable id from the path either way.
+    const workspace =
+      lifecycle?.workspace ?? workspaceMetadata(deps.get().workspaces ?? [], workspacePath);
+    dispatchSessionCreated({
+      engine: event.engine,
+      sessionId: nativeId,
+      workspace,
+      occurredAt: new Date().toISOString(),
+    });
+  }
   // The pinned agent followed the draft key; move it onto the native id so
   // the next send in this tab injects it again.
   migrateSelectedBot(workspacePath, nativeId);
+  // The auto-compaction threshold/toggle follows the draft too: a value set on
+  // a brand-new chat must survive the adoption of the native session id.
+  migrateAutoCompactSettings(
+    sessionKey(event.engine, null, workspacePath),
+    newKey,
+  );
   // Sidebar row + tab title pick the new session up immediately instead of
   // waiting for the post-turn rescan.
   const firstUser = (deps.get().bySession[newKey]?.messages ?? []).find(
@@ -555,6 +1106,9 @@ const FOREIGN_CONTENT_KINDS = new Set<ChatEngineEvent["kind"]>([
   "message",
   "usage",
   "model",
+  "effort",
+  "launch",
+  "served",
   "retry",
   "warn",
   "compaction",
@@ -761,9 +1315,18 @@ export function settleOrphanedRuns(
   orphaned: Array<[string, string]>,
 ) {
   if (orphaned.length === 0) return;
+  const bufferedOrphans = new Map<string, string>();
   for (const [runId] of orphaned) {
     dropRunUsage(runId);
     droppedContentRuns.delete(runId);
+    // An orphaned run is exactly the case where done/error never arrive
+    // (engine hung or died), so settle its plugin lifecycle here: flush any
+    // buffered partial frame back to visible text like onError does, and
+    // deliver the terminal afterTurn — otherwise the lifecycle and capture
+    // buffer leak and a plugin that saw onTurnStarted waits forever.
+    const buffered = flushInternalFrameDelta(runId);
+    if (buffered) bufferedOrphans.set(runId, buffered);
+    finishRunLifecycle(runId, "failed");
   }
   set((s) => {
     let streamingByKey = s.streamingByKey;
@@ -778,6 +1341,8 @@ export function settleOrphanedRuns(
       // window spawns a third concurrent run.
       const foreignOwned = cur != null && cur.currentRunId != null && cur.currentRunId !== runId;
       if (!foreignOwned) {
+        const buffered = bufferedOrphans.get(runId);
+        if (buffered) bufferStreamPart(key, "delta", buffered, null);
         streamingByKey = setStreamingFlag(streamingByKey, key, false);
         retryingByKey = setRetryingFlag(retryingByKey, key, false);
         retryingKeys.delete(key);
@@ -786,21 +1351,22 @@ export function settleOrphanedRuns(
       // A reaped run can leave tasks running with the turn already settled
       // (background work outlives its spawner's reply), so the task settle
       // decides on its own whether this session needs a write.
-      const unsettled = cur.tasks.some((t) => t.runId === runId && t.status === "running");
+      const tasks = cur.tasks ?? EMPTY_TASKS;
+      const unsettled = tasks.some((t) => t.runId === runId && t.status === "running");
       if (!cur.streaming && !cur.retry && !unsettled && !cur.awaitingTasks) continue;
       if (bySession === s.bySession) bySession = { ...s.bySession };
       bySession[key] = withTaskDerived({
         ...cur,
         // The owner's streaming state survives; the reaped run's own
         // leftovers (its task rows, the background wait) still settle.
-        ...(foreignOwned ? {} : { streaming: false, turnStartedAt: null, retry: null }),
+        ...(foreignOwned ? {} : {
+          streaming: false, turnStartedAt: null, retry: null,
+          compaction: null, awaitingTasks: false,
+        }),
         // A reaped run can never settle this turn again: drop its claim so the
         // next run's own terminal event is not read as a foreign one.
         ...(cur.currentRunId === runId ? { currentRunId: null } : {}),
-        compaction: null,
-        // The reaped run's completion turn is never coming.
-        awaitingTasks: false,
-        ...(unsettled ? { tasks: settleRunTasks(cur.tasks, runId, "interrupted") } : {}),
+        tasks: unsettled ? settleRunTasks(tasks, runId, "interrupted") : tasks,
       });
     }
     return { bySession, streamingByKey, retryingByKey };
@@ -906,7 +1472,15 @@ function onError(
   if (droppedContentRuns.delete(event.runId)) deps.reloadTranscript?.(key);
   const prev = deps.get().bySession[key] ?? EMPTY_SESSION;
   const ownTurn = ownsTurn(prev, key, event.runId);
+  const buffered = flushInternalFrameDelta(event.runId);
   if (ownTurn) {
+    if (buffered) {
+      bufferStreamPart(
+        key, "delta", buffered,
+        stampedModel(deps, event.engine, key),
+        stampedEffort(deps, event.engine, key),
+      );
+    }
     // Retry, ask-loop and compaction state belong to the turn owner. A late
     // error from an overlapping run must not clear the current run's UI state.
     clearRetry(key, deps);
@@ -936,6 +1510,8 @@ function onError(
     untrackRun(event.runId);
     dropRunUsage(event.runId);
     ipc.rescanSessions().catch(() => {});
+    dispatchNormalized(event);
+    finishRunLifecycle(event.runId, "failed", typeof event.data === "string" ? event.data : undefined, event.sessionId);
     return;
   }
   // Fold unflushed chunks into rows and settle them: the turn stops here,
@@ -999,6 +1575,8 @@ function onError(
   // Failed turns can still create a transcript; index it just as onDone does.
   ipc.rescanSessions().catch(() => {});
   deps.markUnseenIfBackground(key);
+  dispatchNormalized(event);
+  finishRunLifecycle(event.runId, "failed", typeof event.data === "string" ? event.data : undefined, event.sessionId);
   void deps.refreshSessionUsage?.(key).catch(() => {});
   // An error settles the turn exactly like done does — the messages typed
   // behind it are the user's next step, and parking them here left the queue
@@ -1459,6 +2037,16 @@ function onDone(event: ChatEngineEvent, key: string, deps: EngineEventDeps) {
   // below (settled ids, routing, ledger booking) stays off.
   const runContinues =
     (event.data as { runContinues?: unknown } | null)?.runContinues === true;
+  const buffered = runContinues ? "" : flushInternalFrameDelta(event.runId);
+  if (ownTurn && buffered) {
+    bufferStreamPart(
+      key,
+      "delta",
+      buffered,
+      stampedModel(deps, event.engine, key),
+      stampedEffort(deps, event.engine, key),
+    );
+  }
   // Occupancy for the context meter: the newest single report (claude's one
   // payload already carries the turn's totals).
   const turnTotals = turnUsageTotals.get(event.runId);
@@ -1532,6 +2120,8 @@ function onDone(event: ChatEngineEvent, key: string, deps: EngineEventDeps) {
     untrackRun(event.runId);
     dropRunUsage(event.runId);
     void ipc.rescanSessions().catch(() => {});
+    dispatchNormalized(event, { status: "completed" });
+    finishRunLifecycle(event.runId, "completed", undefined, event.sessionId);
     return;
   }
 
@@ -1574,6 +2164,7 @@ function onDone(event: ChatEngineEvent, key: string, deps: EngineEventDeps) {
     // degenerated to ownTurn because the claim was cleared) must not
     // overwrite a row that already carries another run's usage stamp.
     const claimed = turnOwner(cur, key) === event.runId;
+    const settledCheck = claimed ? cur.responseCheck ?? null : null;
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i].role === "assistant") {
         if (claimed || messages[i].usage == null) {
@@ -1585,6 +2176,7 @@ function onDone(event: ChatEngineEvent, key: string, deps: EngineEventDeps) {
               ...(durationMs != null ? { durationMs } : {}),
               ...(effort ? { effort } : {}),
               ...(model ? { model } : {}),
+              ...(settledCheck ? { responseCheck: settledCheck } : {}),
             },
             ...messages.slice(i + 1),
           ];
@@ -1634,6 +2226,9 @@ function onDone(event: ChatEngineEvent, key: string, deps: EngineEventDeps) {
   }
   // The run is over: drop its routing entry so the map cannot grow forever.
   runRouting.delete(event.runId);
+  const cancelled = prev.interrupted;
+  dispatchNormalized(event, { status: cancelled ? "cancelled" : "completed" });
+  finishRunLifecycle(event.runId, cancelled ? "cancelled" : "completed", undefined, event.sessionId);
   untrackRun(event.runId);
   dropRunUsage(event.runId);
   // Native file changed; refresh list cache in background.
@@ -1690,6 +2285,7 @@ function adoptObservedRun(
   key: string,
   deps: EngineEventDeps,
 ) {
+  const freshLaunch = event.kind === "launch" && !runRouting.has(event.runId);
   if (!runRouting.has(event.runId)) {
     settleOrphanedRuns(deps.set, routeRun(event.runId, key));
   }
@@ -1713,20 +2309,21 @@ function adoptObservedRun(
   // for content frames: only proof the run is producing the reply may take
   // the turn over.
   const contentFrame =
-    event.kind === "delta" || event.kind === "thinking" || event.kind === "message";
-  if (!cur?.streaming) {
+    event.kind === "delta" || event.kind === "thinking" || event.kind === "message" || event.kind === "launch";
+  if (!cur?.streaming || freshLaunch) {
     // A completion turn reopens the run after its background phase: its text
     // is a fresh segment, so the elapsed timer restarts and the background
     // marker clears. The run also claims the session here: from now on its
     // frames are the turn, and another run's settle may not write over them.
-    const reopen = cur?.awaitingTasks === true;
+    const reopen = !freshLaunch && cur?.awaitingTasks === true;
     patchSession(deps.set, key, {
       streaming: true,
-      turnStartedAt: reopen ? Date.now() : (cur?.turnStartedAt ?? Date.now()),
+      turnStartedAt: reopen || freshLaunch ? Date.now() : (cur?.turnStartedAt ?? Date.now()),
       currentRunId: event.runId,
       // 重开＝CLI 自排的通知/完成回合（回复已结算、无用户发送）——打下时间戳
       // 让宠物能把它与真实轮内活动区分开（见 stream.ts 字段注释）。
       ...(reopen ? { awaitingTasks: false, notificationTurnStartedAt: Date.now() } : {}),
+      ...(freshLaunch ? { awaitingTasks: false } : {}),
     });
   } else if (contentFrame && !cur.awaitingTasks && turnOwner(cur, key) === null) {
     // Streaming without a claimed run (a session restored without one): the
@@ -1803,6 +2400,30 @@ export function handleEngineEvents(
     ) {
       continue;
     }
+    // A fast engine's events can land before the send returns its run id:
+    // adopt the pre-registered lifecycle (and route the run) so no session,
+    // runtime, or afterTurn event is dropped.
+    if (bindUnboundRun(event)) {
+      const lifecycle = runLifecycles.get(event.runId);
+      if (lifecycle) {
+        settleOrphanedRuns(
+          deps.set,
+          routeRun(
+            event.runId,
+            sessionKey(
+              lifecycle.engine,
+              lifecycle.sessionId,
+              lifecycle.workspace.path,
+            ),
+          ),
+        );
+      }
+      // Events that arrived while this run's ownership was ambiguous are
+      // buffered, not queued behind the send result. Ownership is known now,
+      // so drain them first: otherwise this event leapfrogs its own prefix
+      // and a terminal event's lifecycle cleanup drops the prefix entirely.
+      replayBufferedEngineEvents(event.runId, deps);
+    }
     const state = deps.get();
     let key = runRouting.get(event.runId) ?? Object.keys(state.bySession).find(
       (candidate) => state.bySession[candidate]?.settledRunIds?.includes(event.runId),
@@ -1818,7 +2439,12 @@ export function handleEngineEvents(
         if (match) key = match;
       }
     }
-    if (!key) continue;
+    if (!key) {
+      if ([...pendingRuns.values()].some((lifecycle) => lifecycle.engine === event.engine)) {
+        bufferEarlyEvent(event);
+      }
+      continue;
+    }
     if (event.kind === "done" || event.kind === "error") {
       const bg =
         event.kind === "done" &&
@@ -1870,6 +2496,14 @@ export function handleEngineEvents(
       continue;
     }
 
+    // A first launch proves a new observed request. Known background runs
+    // remain behind the ownership gate, including their later launch echoes.
+    if (event.kind === "launch" && !runRouting.has(event.runId)) {
+      adoptObservedRun(event, key, deps);
+    }
+    if (event.kind !== "done" && event.kind !== "error") {
+      dispatchNormalized(event);
+    }
     // 同会话双 run 的降级口径：会话正在流 run B 时，同会话另一个仍在路由中的
     // run A（后台任务尚未收尾）还会说它自己的通知轮。A 的内容帧不并入 B 的 live
     // 行——按 run 记入 droppedContentRuns，待 A 的终局 done/error 到达时对该
@@ -1880,6 +2514,14 @@ export function handleEngineEvents(
       FOREIGN_CONTENT_KINDS.has(event.kind) &&
       isForeignContent(deps.get().bySession[key], key, event.runId)
     ) {
+      // Internal capture belongs to this run even when its visible content is
+      // held back from a newer turn of the same conversation.
+      if (event.kind === "delta" && typeof event.data === "string") {
+        filterInternalFrameDelta(event.runId, event.data);
+      } else if (event.kind === "message" && data?.role === "assistant") {
+        filterInternalFrameDelta(event.runId, data.text);
+        flushInternalFrameDelta(event.runId);
+      }
       droppedContentRuns.add(event.runId);
       continue;
     }
@@ -1950,11 +2592,21 @@ export function handleEngineEvents(
       case "done":
         onDone(event, key, deps);
         break;
-      case "model":
-        onModel(event, key, deps);
+      case "model": {
+        const reported = typeof event.data === "string" ? event.data.trim() : "";
+        if (reported) applyModelDisplay(reported, key, deps);
         break;
-      case "effort":
-        onEffort(event, key, deps);
+      }
+      case "effort": {
+        const reported = typeof event.data === "string" ? event.data.trim() : "";
+        if (reported) applyEffortDisplay(reported, key, deps);
+        break;
+      }
+      case "launch":
+        onLaunch(event, key, deps);
+        break;
+      case "served":
+        onServed(event, key, deps);
         break;
       case "task_started":
       case "task_progress":

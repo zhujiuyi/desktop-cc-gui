@@ -142,10 +142,11 @@ export function ensureCustomFontLoaded(
 }
 
 async function loadCustomFont(role: CustomFontRole, path: string): Promise<void> {
-  const encoded = await ipc.readFontFile(path);
   // Environments without the FontFace API (jsdom in tests) cannot register a
-  // face; the preference still persists and applies where supported.
+  // face; the preference still persists and applies where supported. Checked
+  // before the read so the skip path does not touch the disk.
   if (typeof FontFace === "undefined" || !document.fonts) return;
+  const encoded = await ipc.readFontFile(path);
   const face = new FontFace(customFontFamily(role), decodeBase64(encoded));
   let loaded: FontFace;
   try {

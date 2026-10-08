@@ -12,9 +12,9 @@
 //!
 //! Wire (verified against the installed CLI, whose shipped JSON schema is the
 //! source of truth here): `initialize {clientInfo}` → `thread/start
-//! {cwd, sandbox, approvalPolicy}` (or `thread/resume {threadId}` for a session
-//! the app already holds) → `turn/start {threadId, input}`, which acknowledges
-//! immediately with `{turn:{id}}`; the work then streams as `item/*` and
+//! {cwd, sandbox, approvalPolicy}` (or `thread/resume {threadId, excludeTurns}`
+//! for a session the app already holds) → `turn/start {threadId, input}`, which
+//! acknowledges immediately with `{turn:{id}}`; the work then streams as `item/*` and
 //! `item/agentMessage/delta` notifications and only `turn/completed` ends the
 //! turn. Two schema facts shape the code below: `turn/completed` carries no
 //! usage (it arrives earlier via `thread/tokenUsage/updated`), and there is no
@@ -435,6 +435,25 @@ fn handle_notification(
         "thread/started" => {
             if let Some(thread_id) = params.pointer("/thread/id").and_then(Value::as_str) {
                 core.dispatch_event(state, EngineEvent::SessionId(thread_id.to_string()));
+            }
+        }
+        // The server moved this turn to another model (safety reroute): the
+        // response's own account of what is answering, so the check flags it
+        // instead of leaving the launch selection looking confirmed.
+        "model/rerouted" => {
+            if let Some(to) = params
+                .get("toModel")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|to| !to.is_empty())
+            {
+                core.dispatch_event(
+                    state,
+                    EngineEvent::Served {
+                        model: Some(to.to_string()),
+                        effort: None,
+                    },
+                );
             }
         }
         // Terminal. A failed turn arrives here as a completion whose status is
@@ -1372,7 +1391,10 @@ async fn handshake_and_start(
     // schema: the client must opt into the experimental API to negotiate
     // them. If the server then refuses the fields, the rpc error fails the
     // turn — there is no degraded fallback.
-    let experimental = codex_read_only::requested(req)
+    // Codex 0.150 requires this opt-in for `thread/resume.excludeTurns`;
+    // the field is stable from 0.151, which also accepts the capability.
+    let experimental = req.session_id.is_some()
+        || codex_read_only::requested(req)
         || decision.is_some()
         || req.permission.as_deref() == Some("plan");
     let key = server
@@ -1441,10 +1463,7 @@ async fn handshake_and_start(
         } else {
             THREAD_TIMEOUT
         };
-    let (method, mut params) = match req.session_id.as_deref() {
-        Some(thread_id) => ("thread/resume", json!({ "threadId": thread_id })),
-        None => ("thread/start", json!({})),
-    };
+    let (method, mut params) = thread_open_request(req.session_id.as_deref());
     params["cwd"] = json!(req.workspace.to_string_lossy());
     params["sandbox"] = json!(sandbox_for(req.permission.as_deref()));
     params["approvalPolicy"] = json!("never");
@@ -1492,7 +1511,22 @@ async fn handshake_and_start(
         .or_else(|| req.session_id.clone())
         .ok_or_else(|| format!("{method} returned no thread id"))?;
     core.dispatch_event(state, EngineEvent::SessionId(thread_id.clone()));
-    let thread_model = result.get("model").and_then(Value::as_str).map(str::to_string);
+    // The request side of the response check: what this client asked for,
+    // before the thread's own settings are known.
+    if req.model.is_some() || req.effort.is_some() {
+        core.dispatch_event(
+            state,
+            EngineEvent::Launch {
+                comparison_model: None,
+                model: req.model.clone(),
+                effort: req.effort.clone(),
+            },
+        );
+    }
+    let thread_model = result
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     if let Some(model) = thread_model.as_deref() {
         core.dispatch_event(state, EngineEvent::Model(model.to_string()));
     }
@@ -1503,6 +1537,18 @@ async fn handshake_and_start(
         .map(str::to_string);
     if let Some(effort) = req.effort.as_deref().or(reported_effort.as_deref()) {
         core.dispatch_event(state, EngineEvent::Effort(effort.to_string()));
+    }
+    // The thread's effective settings are the closest thing codex has to a
+    // served selection: codex can clamp what it cannot honor, and a later
+    // `model/rerouted` notification supersedes them.
+    if thread_model.is_some() || reported_effort.is_some() {
+        core.dispatch_event(
+            state,
+            EngineEvent::Served {
+                model: thread_model.clone(),
+                effort: reported_effort.clone(),
+            },
+        );
     }
     // A decision turn may only start once the reviewed plan is proven live and
     // unchanged: re-fetch the final plan item from the thread and compare id +
@@ -1561,6 +1607,20 @@ async fn handshake_and_start(
         .and_then(Value::as_str)
         .map(str::to_string);
     Ok(Some(TurnStarted { thread_id, turn_id }))
+}
+
+/// A resume reply is one NDJSON frame. Asking Codex to hydrate every prior
+/// turn can make that otherwise valid frame exceed the host's safety bound.
+/// `excludeTurns` only omits history from the reply; Codex still resumes its
+/// own persisted context for the next turn.
+fn thread_open_request(session_id: Option<&str>) -> (&'static str, Value) {
+    match session_id {
+        Some(thread_id) => (
+            "thread/resume",
+            json!({ "threadId": thread_id, "excludeTurns": true }),
+        ),
+        None => ("thread/start", json!({})),
+    }
 }
 
 /// Everything after the `turn/start` ack: stream the turn to its terminal
@@ -1689,6 +1749,8 @@ pub(crate) async fn run_plan_decision(
         session_id: Some(thread_id.clone()),
         workspace: PathBuf::from(&review.workspace_path),
         prompt: spec.prompt,
+        // 内部校验 spawn:不属于任何插件回合,没有可注入的贡献。
+        prompt_contributions: Vec::new(),
         native_compact: false,
         images: Vec::new(),
         // Settings inherit the thread's reported model/effort instead.
@@ -2029,6 +2091,7 @@ mod tests {
             session_id: None,
             workspace: workspace.clone(),
             prompt: "not sent".into(),
+            prompt_contributions: Vec::new(),
             native_compact: false,
             images: vec![],
             model: Some("probe".into()),
@@ -2113,6 +2176,7 @@ mod tests {
             session_id: None,
             workspace: directory.clone(),
             prompt: "hi".into(),
+            prompt_contributions: Vec::new(),
             native_compact: false,
             images: vec![],
             model: None,
@@ -2314,6 +2378,119 @@ mod tests {
     }
 
     #[test]
+    fn resumed_threads_skip_full_history_hydration() {
+        let (method, params) = thread_open_request(Some("thread-123"));
+        assert_eq!(method, "thread/resume");
+        assert_eq!(params["threadId"], json!("thread-123"));
+        assert_eq!(params["excludeTurns"], json!(true));
+
+        let (method, params) = thread_open_request(None);
+        assert_eq!(method, "thread/start");
+        assert!(params.get("excludeTurns").is_none());
+    }
+
+    #[tokio::test]
+    async fn metadata_only_resume_preserves_the_turn_and_plan_verification_handshake() {
+        // Exercise the real pipe, request builder and reply parser. The peer
+        // enforces the older experimental gate and sends no hydrated turns.
+        let peer = r#"
+const assert = require('node:assert/strict');
+const mode = process.argv[1];
+const resumed = mode !== 'new';
+const methods = ['initialize', resumed ? 'thread/resume' : 'thread/start'];
+if (mode === 'decision') methods.push('thread/turns/list');
+methods.push('turn/start');
+let step = 0;
+require('node:readline').createInterface({input: process.stdin}).on('line', line => {
+  const {id, method, params} = JSON.parse(line);
+  assert.equal(method, methods[step++]);
+  let result;
+  if (method === 'initialize') {
+    assert.equal(params.capabilities.experimentalApi, resumed);
+    result = {};
+  } else if (method === 'thread/resume' || method === 'thread/start') {
+    assert.equal(params.approvalPolicy, 'never');
+    assert.equal(params.sandbox, 'workspace-write');
+    assert.equal(params.excludeTurns, resumed ? true : undefined);
+    assert.equal(params.threadId, resumed ? 'thread-123' : undefined);
+    assert.equal(params.history, undefined);
+    result = {thread: {id: 'thread-123', turns: []}, model: 'test-model', reasoningEffort: 'high'};
+  } else if (method === 'thread/turns/list') {
+    assert.equal(params.threadId, 'thread-123');
+    assert.equal(params.itemsView, 'full');
+    result = {data: [{id: 'plan-turn', items: [{id: 'plan-1', type: 'plan', text: '# Plan'}]}]};
+  } else {
+    assert.equal(params.threadId, 'thread-123');
+    assert.equal(params.input[0].text, 'Continue the conversation');
+    assert.equal(params.history, undefined);
+    if (mode === 'decision') {
+      assert.equal(params.collaborationMode.mode, 'default');
+      assert.equal(params.collaborationMode.settings.model, 'test-model');
+      assert.equal(params.collaborationMode.settings.reasoning_effort, 'high');
+    }
+    result = {turn: {id: 'next-turn'}};
+  }
+  process.stdout.write(JSON.stringify({jsonrpc: '2.0', id, result}) + '\n', () => {
+    if (method === 'turn/start') process.exit(0);
+  });
+});
+"#;
+        for mode in ["new", "resume", "decision"] {
+            let mut child = Command::new("node")
+                .args(["-e", peer, mode])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .expect("protocol test requires the project's Node runtime");
+            let stdin = Arc::new(TokioMutex::new(child.stdin.take()));
+            let mut server = AppServer::new(stdin, child.stdout.take().unwrap());
+            let req = SendRequest {
+                session_id: (mode != "new").then(|| "thread-123".into()),
+                workspace: std::env::temp_dir(),
+                prompt: "Continue the conversation".into(),
+                prompt_contributions: Vec::new(),
+                native_compact: false,
+                images: Vec::new(),
+                model: None,
+                effort: None,
+                service_tier: None,
+                permission: Some("auto".into()),
+                additional_dirs: Vec::new(),
+                provider_id: None,
+                computer_use: None,
+                memory_bot: None,
+                allowed_tools: None,
+            };
+            let decision = (mode == "decision").then(|| DecisionCheck {
+                mode: "default",
+                native_plan_id: "plan-1".into(),
+                content_hash: plan_review::content_hash("# Plan"),
+            });
+            let (core, _registry, _emitter) = test_core();
+            let result = handshake_and_start(
+                &mut server,
+                &core,
+                &mut TurnState::new(req.session_id.clone()),
+                &mut TurnView::default(),
+                &req,
+                &Arc::new(AtomicBool::new(false)),
+                decision.as_ref(),
+                Duration::from_secs(5),
+            )
+            .await;
+            let status = timeout(Duration::from_secs(5), child.wait())
+                .await
+                .expect("protocol peer must exit")
+                .unwrap();
+            assert!(status.success(), "{mode}: peer rejected the handshake");
+            let started = result.expect(mode).expect("turn must be acknowledged");
+            assert_eq!(started.thread_id, "thread-123");
+            assert_eq!(started.turn_id.as_deref(), Some("next-turn"));
+        }
+    }
+
+    #[test]
     fn usage_payload_projects_the_protocol_fields_onto_snake_case() {
         let usage = json!({
             "last": {
@@ -2347,6 +2524,36 @@ mod tests {
     // Every test below drives the router, so each needs a runtime: the sink
     // schedules its batch flush with `tokio::spawn`, and an error dispatch
     // kills the run through `spawn_blocking`.
+
+    #[tokio::test]
+    async fn model_reroute_reports_the_served_model() {
+        let (core, _registry, emitter) = test_core();
+        let mut state = TurnState::new(None);
+        let mut view = TurnView::default();
+        route(
+            &core,
+            &mut state,
+            &mut view,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "model/rerouted",
+                "params": {
+                    "fromModel": "gpt-5.6-luna",
+                    "reason": "highRiskCyberActivity",
+                    "threadId": "t-1",
+                    "toModel": "gpt-5.6-cyber",
+                    "turnId": "u-1",
+                },
+            }),
+        );
+        let events = flushed(&core, &emitter);
+        assert!(
+            events.iter().any(|(kind, data)| {
+                kind == "served" && data.get("model").and_then(Value::as_str) == Some("gpt-5.6-cyber")
+            }),
+            "{events:?}"
+        );
+    }
 
     #[tokio::test]
     async fn route_parks_a_question_and_the_answer_frame_reads_what_it_parked() {

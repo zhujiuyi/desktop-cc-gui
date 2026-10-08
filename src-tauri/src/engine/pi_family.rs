@@ -757,6 +757,14 @@ fn parse_pi_family_line(line: &str, out: &mut Vec<EngineEvent>) {
                 let trimmed = level.trim();
                 if !trimmed.is_empty() {
                     out.push(EngineEvent::Effort(trimmed.to_string()));
+                    // The session's effective level is the runtime's own
+                    // account of the level in force — auto-thinking can move
+                    // it away from the request, which is exactly what the
+                    // response check should surface.
+                    out.push(EngineEvent::Served {
+                        model: None,
+                        effort: Some(trimmed.to_string()),
+                    });
                 }
             }
         }
@@ -809,36 +817,63 @@ fn parse_pi_family_line(line: &str, out: &mut Vec<EngineEvent>) {
                 .and_then(Value::as_str)
                 .unwrap_or("tool");
             let intent = value.get("intent").and_then(Value::as_str);
-            out.push(super::tool_call_message(
+            out.push(super::tool_call_message_with_id(
                 tool_label(name, intent),
                 value.get("args"),
+                value.get("toolCallId").and_then(Value::as_str),
             ));
         }
         "tool_execution_end" => {
             let name = value.get("toolName").and_then(Value::as_str).unwrap_or("");
             let result = value.get("result");
-            out.push(super::tool_result_patch(name, result));
+            out.push(super::tool_result_patch_with_id(
+                name,
+                result,
+                value.get("toolCallId").and_then(Value::as_str),
+            ));
         }
         "message_end" => {
-            if let Some(model) = value
+            let reported_model = value
                 .get("message")
                 .and_then(|m| m.get("model"))
                 .or_else(|| value.get("model"))
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-            {
-                out.push(EngineEvent::Model(model.to_string()));
-            }
-            if let Some(effort) = value
+                .map(str::to_string);
+            let reported_effort = value
                 .get("message")
                 .and_then(|m| m.get("thinking_effort"))
                 .or_else(|| value.get("thinking_effort"))
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-            {
-                out.push(EngineEvent::Effort(effort.to_string()));
+                .map(str::to_string);
+            if let Some(model) = reported_model.clone() {
+                out.push(EngineEvent::Model(model));
+            }
+            if let Some(effort) = reported_effort.clone() {
+                out.push(EngineEvent::Effort(effort));
+            }
+            // What actually served the turn, when the runtime can tell:
+            // `upstreamModel` is the id recovered from the response itself
+            // (thinking signature / router), while `model` is the runtime's
+            // record — which becomes the served id on a server-side fallback.
+            // Emitted as evidence; a runtime that knows nothing reports
+            // nothing rather than echoing the request.
+            let served_model = value
+                .get("message")
+                .and_then(|m| m.get("upstreamModel"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| reported_model.clone());
+            if served_model.is_some() || reported_effort.is_some() {
+                out.push(EngineEvent::Served {
+                    model: served_model,
+                    effort: reported_effort,
+                });
             }
             if let Some(usage) = value
                 .get("message")
@@ -1101,6 +1136,7 @@ mod tests {
             session_id: None,
             workspace: std::path::PathBuf::from("/tmp/ccgui-pi-family-test"),
             prompt: "规划一下".to_string(),
+            prompt_contributions: Vec::new(),
             native_compact: false,
             images: Vec::new(),
             model: None,
@@ -1289,6 +1325,51 @@ mod tests {
         assert!(!ws.join(".omp").join("mcp.json").exists());
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn message_end_reports_the_served_model() {
+        // `upstreamModel` is the id recovered from the response itself
+        // (thinking signature / router) and wins over the runtime's record.
+        let mut out = Vec::new();
+        parse_pi_family_line(
+            &serde_json::json!({
+                "type": "message_end",
+                "message": {
+                    "model": "claude-opus-5-5",
+                    "upstreamModel": "claude-opus-4-1-20250805"
+                }
+            })
+            .to_string(),
+            &mut out,
+        );
+        assert!(
+            out.iter().any(|e| matches!(
+                e,
+                EngineEvent::Served { model: Some(model), effort: None }
+                    if model == "claude-opus-4-1-20250805"
+            )),
+            "got {out:?}"
+        );
+
+        // No upstream id recovered: the runtime's record is the served model
+        // (it becomes the fallback target on a server-side fallback).
+        let mut out = Vec::new();
+        parse_pi_family_line(
+            &serde_json::json!({
+                "type": "message_end",
+                "message": { "model": "kimi-k2" }
+            })
+            .to_string(),
+            &mut out,
+        );
+        assert!(
+            out.iter().any(|e| matches!(
+                e,
+                EngineEvent::Served { model: Some(model), effort: None } if model == "kimi-k2"
+            )),
+            "got {out:?}"
+        );
     }
 
     #[test]
@@ -1680,6 +1761,7 @@ mod tests {
                 text,
                 path,
                 args,
+                tool_call_id,
                 ..
             } => {
                 assert_eq!(role, "tool");
@@ -1689,6 +1771,7 @@ mod tests {
                     args,
                     &Some(serde_json::json!({"path": "src/app.tsx", "input": {}}))
                 );
+                assert_eq!(tool_call_id.as_deref(), Some("tool_1"));
             }
             _ => panic!("expected tool message"),
         }
@@ -1705,11 +1788,41 @@ mod tests {
         let mut out = Vec::new();
         parse_pi_family_line(&line, &mut out);
         match &out[0] {
-            EngineEvent::Message { path, args, .. } => {
+            EngineEvent::Message {
+                path,
+                args,
+                tool_call_id,
+                ..
+            } => {
                 assert_eq!(*path, None);
                 assert_eq!(args, &Some(serde_json::json!({"command": "ls"})));
+                assert_eq!(tool_call_id.as_deref(), Some("tool_2"));
             }
             _ => panic!("expected tool message"),
+        }
+    }
+
+    #[test]
+    fn tool_execution_end_carries_tool_call_identity() {
+        let line = serde_json::json!({
+            "type": "tool_execution_end",
+            "toolCallId": "tool_2",
+            "toolName": "bash",
+            "result": { "exitCode": 3 }
+        })
+        .to_string();
+        let mut out = Vec::new();
+        parse_pi_family_line(&line, &mut out);
+        match &out[0] {
+            EngineEvent::Message {
+                tool_call_id,
+                result,
+                ..
+            } => {
+                assert_eq!(tool_call_id.as_deref(), Some("tool_2"));
+                assert_eq!(result, &Some(serde_json::json!({"exitCode": 3})));
+            }
+            _ => panic!("expected tool result"),
         }
     }
 
@@ -1990,6 +2103,7 @@ mod tests {
         let req = SendRequest {
             session_id: None,
             prompt: "hi".into(),
+            prompt_contributions: vec![],
             native_compact: false,
             images: vec![],
             workspace: std::path::PathBuf::from("/tmp"),
@@ -2019,6 +2133,7 @@ mod tests {
         let req = SendRequest {
             session_id: Some("s1".into()),
             prompt: "hi".into(),
+            prompt_contributions: vec![],
             native_compact: false,
             images: vec![],
             workspace: std::path::PathBuf::from("/tmp"),
@@ -2061,6 +2176,12 @@ mod tests {
         assert!(out
             .iter()
             .any(|e| matches!(e, EngineEvent::Effort(l) if l == "high")));
+        // The effective level is also evidence for the response check:
+        // auto-thinking can move it away from the request.
+        assert!(out.iter().any(|e| matches!(
+            e,
+            EngineEvent::Served { model: None, effort: Some(l) } if l == "high"
+        )));
     }
 
     #[test]
@@ -2069,6 +2190,7 @@ mod tests {
         let req = SendRequest {
             session_id: None,
             prompt: "hi".into(),
+            prompt_contributions: vec![],
             native_compact: false,
             images: vec![],
             workspace: std::path::PathBuf::from("/tmp"),

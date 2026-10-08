@@ -2,10 +2,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { WorktreeCreateProgress } from "@/lib/ipc";
 
 const createMock = vi.fn();
+const removeMock = vi.fn();
 vi.mock("@/lib/ipc", () => ({
   ipc: {
     gitWorktreeCreate: (...args: unknown[]) => createMock(...args),
     gitWorktreeCreateCancel: vi.fn(async () => undefined),
+    gitWorktreeRemove: (...args: unknown[]) => removeMock(...args),
     // workspace-bridge 的投影在本测试里不走（chat store 已 mock），但
     // worktree-bridge 经 pr-input 只取纯函数，这里不需要真实 ipc 实现。
   },
@@ -18,16 +20,27 @@ vi.mock("@/lib/transport", () => ({
 }));
 
 const refreshWorkspacesMock = vi.fn();
+const removeWorkspaceMock = vi.fn(async () => {});
+const setChatStateMock = vi.fn();
 vi.mock("@/features/chat/store", () => ({
   useChatStore: {
     getState: () => ({
       workspaces: [
         { id: "ws-parent", path: "/repo/app", name: "app", lastOpenedAt: 1, sortOrder: null, groupId: null },
+        { id: "ws-wt", path: "/repo/app-worktrees/pr-7-x", name: "pr-7-x", kind: "worktree", parentId: "ws-parent", lastOpenedAt: null, sortOrder: null, groupId: null },
       ],
       refreshWorkspaces: refreshWorkspacesMock,
+      removeWorkspace: removeWorkspaceMock,
     }),
+    setState: (...args: unknown[]) => setChatStateMock(...args),
   },
 }));
+
+const terminalRemoveMock = vi.fn();
+vi.mock("@/features/terminal/store", () => ({
+  useTerminalStore: { getState: () => ({ removeWorkspace: terminalRemoveMock }) },
+}));
+vi.mock("@/lib/i18n", () => ({ default: { t: (key: string) => key } }));
 
 const dismissCenterSurfacesMock = vi.fn();
 vi.mock("@/features/chat/center-surfaces", () => ({
@@ -36,7 +49,7 @@ vi.mock("@/features/chat/center-surfaces", () => ({
 
 // vi.mock 提升后静态导入拿到的是 mock 版。
 import { useWorktreeStore } from "@/features/worktree/store";
-import { createPluginWorktree } from "./worktree-bridge";
+import { createPluginWorktree, removePluginWorktree } from "./worktree-bridge";
 
 const DEF = {
   repoPath: "/repo/app",
@@ -105,6 +118,33 @@ describe("plugin worktree bridge", () => {
       createPluginWorktree("git-tasks", { ...DEF, parentWorkspaceId: "missing" }),
     ).rejects.toThrow(/unknown parent workspace missing/);
     expect(useWorktreeStore.getState().pending).toHaveLength(0);
+  });
+
+  it("remove 走宿主删除流程：按路径反查 workspaceId，回传结果尾巴", async () => {
+    removeMock.mockResolvedValueOnce({ orphanDirectory: true, branchDeleted: false, branchKeptReason: "unknown" });
+    const result = await removePluginWorktree("git-tasks", {
+      repoPath: "/repo/app",
+      worktreePath: "/repo/app-worktrees/pr-7-x",
+      branch: "pr-7-x",
+      deleteBranch: true,
+    });
+    expect(removeMock).toHaveBeenCalledWith("/repo/app", "/repo/app-worktrees/pr-7-x", "pr-7-x", true);
+    expect(removeWorkspaceMock).toHaveBeenCalledWith("ws-wt");
+    expect(terminalRemoveMock).toHaveBeenCalledWith("/repo/app-worktrees/pr-7-x");
+    expect(result).toEqual({ orphanDirectory: true, branchKeptReason: "unknown" });
+    // silent：不要同时弹宿主的 actionError 横幅
+    expect(setChatStateMock).not.toHaveBeenCalled();
+  });
+
+  it("remove 失败以 remove_failed 前缀 reject", async () => {
+    removeMock.mockRejectedValueOnce(new Error("worktree is dirty"));
+    await expect(
+      removePluginWorktree("git-tasks", { repoPath: "/repo/app", worktreePath: "/repo/app-worktrees/pr-7-x" }),
+    ).rejects.toThrow(/^remove_failed: worktree is dirty/);
+  });
+
+  it("remove 缺参数直接 reject invalid_args", async () => {
+    await expect(removePluginWorktree("git-tasks", { repoPath: "", worktreePath: "/x" })).rejects.toThrow(/invalid_args/);
   });
 
   it("rejects empty branch / repoPath synchronously-ish without IPC", async () => {

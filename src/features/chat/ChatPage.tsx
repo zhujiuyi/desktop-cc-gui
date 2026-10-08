@@ -190,11 +190,19 @@ export default function ChatPage() {
   const betaNewBrowser = useBetaFeature("newBrowser");
   const betaMissionWorkbench = useBetaFeature("missionWorkbench");
 
+  // ⌘W: close the tab in view, same path as the tab strip's × (a dirty file
+  // still routes through the save-confirm dialog — unsaved edits are never
+  // dropped silently).
+  const closeActiveTab = useCallback(() => {
+    if (activeTabKey) handleTabClose(activeTabKey);
+  }, [activeTabKey, handleTabClose]);
+
   useChatPageLifecycle(init, gitRefresh, active?.workspacePath);
   useChatShortcutHandlers(
     active?.workspacePath,
     toggleTerminal,
     handleNewSession,
+    closeActiveTab,
   );
 
   return (

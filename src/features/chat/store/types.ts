@@ -10,6 +10,7 @@ import type {
 import type { EffortLevel } from "@/components/application/ai-chat/cli-menu";
 import type { ComposerPermission } from "@/components/application/ai-chat/permission-menu";
 import type { ActiveSession } from "./persistence";
+import type { SessionContributions } from "./session-contributions";
 import type { QueueMoveDirection, SessionState } from "./stream";
 
 /** Result of a plan-decision submit. `applied`/`conflict` come from the
@@ -101,6 +102,22 @@ export interface ChatStore {
    * session); surfaced as a dismissable banner in ChatPage. */
   actionError: string | null;
   initialized: boolean;
+  /** Session lifecycle events already emitted for the current frontend lifetime. */
+  restoredSessionKeys: Record<string, true>;
+  createdSessionKeys: Record<string, true>;
+  /** `persistence:"session"` internal contributions remembered per
+   * (engine, nativeSessionId) scope and keyed by contribution id; re-injected
+   * on every later turn of that session. Bounded; cleared with the tab or
+   * session. */
+  sessionContributions: SessionContributions;
+  /** A never-launched tab retargeted to another runtime; consumed on first send. */
+  pendingRuntimeSwitch: {
+    sourceEngine: string;
+    targetEngine: string;
+    sourceSessionId: string | null;
+    targetSessionId: string | null;
+    workspacePath: string;
+  } | null;
 
   init: () => Promise<void>;
   refreshSessions: () => Promise<void>;
@@ -256,8 +273,13 @@ export interface ChatStore {
     sessionId: string,
     title: string,
   ) => Promise<void>;
-  /** Send /compact to compress conversation context. */
-  compactContext: (key?: string) => Promise<void>;
+  /** Send /compact to compress conversation context. `trigger` records who
+   *  asked: the composer action/command ("manual") or the per-session
+   *  auto-compaction threshold ("threshold"). */
+  compactContext: (
+    key?: string,
+    options?: { trigger?: "manual" | "threshold" },
+  ) => Promise<void>;
   /** Re-fetch the latest token usage from session history for the current session. */
   refreshSessionUsage: (key?: string) => Promise<void>;
 }

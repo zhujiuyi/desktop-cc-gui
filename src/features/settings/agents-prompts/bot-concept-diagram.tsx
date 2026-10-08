@@ -11,6 +11,7 @@ import { Chip } from "@/components/base/chips/chip";
 import { cx } from "@/utils/cx";
 import { BotAvatarView } from "@/features/bots/bot-avatar";
 import type { BotAvatar } from "@/lib/ipc";
+import { type PlannedTabId } from "./bot-concept-model";
 
 /**
  * 「即将支持」四个分区里的概念图：抽象流程图（方框 + 箭头），节点用与
@@ -21,28 +22,9 @@ import type { BotAvatar } from "@/lib/ipc";
  * 能点的东西——一个看起来能按的开关比一句「即将支持」更容易被当成 bug。
  * 因此这里也不放 `Switch` 这类真控件，只用 `Chip`（无 `onClick` 时它自己就是
  * 纯展示的 `<span>`）展示限制与状态。
+ *
+ * 页签清单与文案在 `bot-concept-model.ts`；这里只画图。
  */
-
-/** 概念图能画的分区：也是「还没做完」的页签清单。文案与页签标签共用同一份，
- *  避免同一个东西写两遍。记忆已上线（真实面板在 memory-section.tsx），不再
- *  属于这里。 */
-export const PLANNED_TABS = ["runtime", "routines", "collab"] as const;
-export type PlannedTabId = (typeof PLANNED_TABS)[number];
-
-/** 这个页签是否属于「即将支持」的四个分区。 */
-export function isPlannedTab(id: string): id is PlannedTabId {
-  return (PLANNED_TABS as readonly string[]).includes(id);
-}
-
-/** 页签与分区标题的文案（页签标签本身就是分区标题）。 */
-export const PLANNED_TAB_COPY: Record<
-  PlannedTabId,
-  { titleKey: string; descKey: string }
-> = {
-  runtime: { titleKey: "settings.botTabRuntime", descKey: "settings.botRuntimeDesc" },
-  routines: { titleKey: "settings.botTabRoutines", descKey: "settings.botRoutinesDesc" },
-  collab: { titleKey: "settings.botTabCollab", descKey: "settings.botCollabDesc" },
-};
 
 /** 流程图里一个环节：图标 + 标题 + 一行说明。 */
 function Step({

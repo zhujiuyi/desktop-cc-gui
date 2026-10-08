@@ -26,12 +26,18 @@ test("Windows MSVC embeds the manifest for library tests as well as the applicat
   assert.match(manifest, /publicKeyToken="6595b64144ccf1df"/);
 });
 
-test("Both Windows workflows continue to execute Rust library tests", () => {
-  for (const path of [".github/workflows/release.yml", ".github/workflows/build-windows-artifact.yml"]) {
-    const workflow = read(path);
-    assert.match(workflow, /run: cargo test --manifest-path src-tauri\/Cargo\.toml --lib/);
-    assert.doesNotMatch(workflow, /continue-on-error: true/);
-  }
+test("Windows keeps explicit Rust coverage: release runs the lib suite, the artifact workflow compiles every target", () => {
+  // windows-latest cannot load the computer-use test EXEs (0xc0000139), so
+  // build-windows-artifact.yml is deliberately compile-only — it must still
+  // compile the integration targets, and it must not hide failures with
+  // continue-on-error. release.yml keeps executing the lib tests on Windows.
+  // Keep this split in sync with both workflow comments.
+  const release = read(".github/workflows/release.yml");
+  assert.match(release, /run: cargo test --manifest-path src-tauri\/Cargo\.toml --lib/);
+  assert.doesNotMatch(release, /continue-on-error: true/);
+  const artifact = read(".github/workflows/build-windows-artifact.yml");
+  assert.match(artifact, /run: cargo test --manifest-path src-tauri\/Cargo\.toml --tests --no-run/);
+  assert.doesNotMatch(artifact, /continue-on-error: true/);
 });
 
 // Packaged builds apply their CSP plus a build step that tags every inline

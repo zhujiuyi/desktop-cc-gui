@@ -14,37 +14,7 @@ import { cx } from "@/utils/cx";
 import type { GitFileEntry } from "@/lib/ipc";
 import { getFileTreeIconSvg } from "@/features/files/fileIcons";
 import type { GitTreeDirNode } from "./git-tree";
-
-/**
- * Git status letter badge color matching IntelliJ IDEA style.
- */
-export const STATUS_COLOR: Record<string, string> = {
-  M: "text-[#0088D2] dark:text-[#589DF6]",
-  A: "text-[#208A3C] dark:text-[#59A869]",
-  D: "text-text-tertiary",
-  R: "text-[#0088D2] dark:text-[#389FD6]",
-  C: "text-[#0088D2] dark:text-[#589DF6]",
-  "?": "text-[#B00020] dark:text-[#E05555]",
-  U: "text-[#E5534B] dark:text-[#E5534B]",
-};
-
-/**
- * File name colors matching IntelliJ IDEA Git changes style:
- * - Deleted (D): Gray + line-through
- * - Modified (M): Sky Blue
- * - Added (A): Forest Green
- * - Untracked (?): Crimson Red
- * - Renamed (R): Cyan
- */
-export const FILE_NAME_COLOR: Record<string, string> = {
-  M: "text-[#0088D2] dark:text-[#589DF6]",
-  A: "text-[#208A3C] dark:text-[#59A869]",
-  D: "text-text-tertiary line-through opacity-75",
-  R: "text-[#0088D2] dark:text-[#389FD6]",
-  C: "text-[#0088D2] dark:text-[#589DF6]",
-  "?": "text-[#B00020] dark:text-[#E05555]",
-  U: "text-[#E5534B] dark:text-[#E5534B]",
-};
+import { FILE_NAME_COLOR, STATUS_COLOR } from "./git-tree-colors";
 
 export interface FileRowProps {
   entry: GitFileEntry;
@@ -65,6 +35,172 @@ export interface FileRowProps {
   displayName?: string;
 }
 
+/** File name cell: icon, left-truncated directory + filename, full path in
+ *  the tooltip. Split out of FileRow so the row keeps only its layout. */
+function FileNameCell({
+  path,
+  displayName,
+  nameColor,
+  isNew,
+  onOpen,
+}: {
+  path: string;
+  displayName?: string;
+  nameColor: string;
+  isNew: boolean;
+  onOpen: (path: string) => void;
+}) {
+  const { t } = useTranslation();
+  const sepIdx = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  const dirPart = sepIdx > 0 ? path.slice(0, sepIdx + 1) : "";
+  const filePart = sepIdx >= 0 ? path.slice(sepIdx + 1) : path;
+  const iconSvg = useMemo(
+    () => getFileTreeIconSvg(displayName ?? filePart, false),
+    [displayName, filePart],
+  );
+  return (
+    <>
+      <span
+        className="size-4 shrink-0 flex items-center justify-center [&>svg]:size-4"
+        aria-hidden
+        dangerouslySetInnerHTML={{ __html: iconSvg }}
+      />
+      <Tooltip>
+        <Focusable>
+          <button
+            type="button"
+            onClick={() => onOpen(path)}
+            aria-label={isNew ? `${path} (${t("git.newFile")})` : undefined}
+            className="flex min-w-0 flex-1 items-baseline overflow-hidden text-left font-mono text-xs"
+          >
+            {displayName ? (
+              <span className={cx("min-w-0 truncate font-medium", nameColor)}>{displayName}</span>
+            ) : (
+              <>
+                {/* Directory truncates from the left (…/foo/bar) so the filename
+                    — the most important part — stays visible as long as possible;
+                    it right-truncates only when it alone overflows. The tooltip
+                    below shows the full path on hover. */}
+                {dirPart && (
+                  <span dir="rtl" className="min-w-0 truncate text-left text-text-tertiary">
+                    <bdo dir="ltr">{dirPart}</bdo>
+                  </span>
+                )}
+                <span className={cx("min-w-0 truncate font-medium", nameColor)}>{filePart}</span>
+              </>
+            )}
+          </button>
+        </Focusable>
+        <TooltipContent className="break-all font-mono">{path}</TooltipContent>
+      </Tooltip>
+    </>
+  );
+}
+
+/** Trailing +/− line stats and the untracked "new" dot. */
+function FileStats({ entry, isNew }: { entry: GitFileEntry; isNew: boolean }) {
+  const { t } = useTranslation();
+  return (
+    <span className="flex min-w-0 items-center justify-end gap-1 font-mono text-xs tabular-nums">
+      {isNew && (
+        <Tooltip>
+          <Focusable>
+            <span
+              role="img"
+              aria-label={t("git.newFile")}
+              className="size-1.5 shrink-0 rounded-full bg-notification-success-foreground"
+            />
+          </Focusable>
+          <TooltipContent>{t("git.newFile")}</TooltipContent>
+        </Tooltip>
+      )}
+      {entry.additions !== undefined && (
+        <span className="truncate text-state-success-text">+{entry.additions}</span>
+      )}
+      {entry.deletions !== undefined && entry.deletions > 0 && (
+        <span className="truncate text-text-error-primary">−{entry.deletions}</span>
+      )}
+    </span>
+  );
+}
+
+/** Hover/focus overlay with the discard and stage/unstage row actions. */
+function FileRowActions({
+  path,
+  actionLabel,
+  actionKind,
+  actionBusy,
+  discardLabel,
+  onDiscard,
+  onAction,
+}: {
+  path: string;
+  actionLabel: string;
+  actionKind: "stage" | "unstage";
+  actionBusy: boolean;
+  discardLabel?: string;
+  onDiscard?: (path: string) => void;
+  onAction: (path: string) => void;
+}) {
+  return (
+    <div
+      // Row actions overlay the trailing edge instead of reserving
+      // permanent columns, so path + stats use the full row width. The
+      // solid background (matching the row's own bg in each state) hides
+      // the text underneath; reveal happens on row hover or keyboard
+      // focus within the row.
+      className={cx(
+        "absolute inset-y-0 right-1.5 flex items-center gap-0.5 pl-3",
+        "bg-background-primary-default group-hover:bg-background-secondary-hover",
+        "pointer-events-none opacity-0",
+        "group-hover:pointer-events-auto group-hover:opacity-100",
+        "focus-within:pointer-events-auto focus-within:opacity-100",
+      )}
+    >
+      {discardLabel !== undefined && onDiscard !== undefined && (
+        <Tooltip>
+          <Focusable>
+            <button
+              type="button"
+              disabled={actionBusy}
+              onClick={() => onDiscard(path)}
+              aria-label={discardLabel}
+              className={cx(
+                "rounded p-0.5 text-foreground-icon-secondary",
+                "hover:bg-background-tertiary-hover disabled:text-foreground-icon-disabled",
+              )}
+            >
+              <Undo2 aria-hidden className="size-4" />
+            </button>
+          </Focusable>
+          <TooltipContent>{discardLabel}</TooltipContent>
+        </Tooltip>
+      )}
+      <Tooltip>
+        <Focusable>
+          <button
+            type="button"
+            disabled={actionBusy}
+            onClick={() => onAction(path)}
+            aria-label={actionLabel}
+            className={cx(
+              "rounded p-0.5 text-foreground-icon-secondary",
+              "hover:bg-background-tertiary-hover disabled:text-foreground-icon-disabled",
+            )}
+          >
+            {actionKind === "stage" ? (
+              <Plus aria-hidden className="size-4" />
+            ) : (
+              <Minus aria-hidden className="size-4" />
+            )}
+          </button>
+        </Focusable>
+        <TooltipContent>{actionLabel}</TooltipContent>
+      </Tooltip>
+    </div>
+  );
+}
+
 export const FileRow = memo(function FileRow({
   entry,
   style,
@@ -81,21 +217,12 @@ export const FileRow = memo(function FileRow({
   actionBusy,
   displayName,
 }: FileRowProps) {
-  const { t } = useTranslation();
   const isUntracked = entry.status.includes("?") || isNew;
   const raw = entry.status.replace(/\?/g, "").trim().charAt(0).toUpperCase();
   const letter = isUntracked ? "?" : raw.length > 0 ? raw : "?";
-  const sepIdx = Math.max(entry.path.lastIndexOf("/"), entry.path.lastIndexOf("\\"));
-  const dirPart = sepIdx > 0 ? entry.path.slice(0, sepIdx + 1) : "";
-  const filePart = sepIdx >= 0 ? entry.path.slice(sepIdx + 1) : entry.path;
 
   const statusColor = STATUS_COLOR[letter] ?? "text-text-tertiary";
   const nameColor = FILE_NAME_COLOR[letter] ?? "text-text-primary";
-
-  const iconSvg = useMemo(
-    () => getFileTreeIconSvg(displayName ?? filePart, false),
-    [displayName, filePart],
-  );
 
   return (
     <li
@@ -123,117 +250,27 @@ export const FileRow = memo(function FileRow({
       >
         {letter}
       </span>
-      <span
-        className="size-4 shrink-0 flex items-center justify-center [&>svg]:size-4"
-        aria-hidden
-        dangerouslySetInnerHTML={{ __html: iconSvg }}
+      <FileNameCell
+        path={entry.path}
+        displayName={displayName}
+        nameColor={nameColor}
+        isNew={isNew}
+        onOpen={onOpen}
       />
-      <Tooltip>
-        <Focusable>
-          <button
-            type="button"
-            onClick={() => onOpen(entry.path)}
-            aria-label={isNew ? `${entry.path} (${t("git.newFile")})` : undefined}
-            className="flex min-w-0 flex-1 items-baseline overflow-hidden text-left font-mono text-xs"
-          >
-            {displayName ? (
-              <span className={cx("min-w-0 truncate font-medium", nameColor)}>{displayName}</span>
-            ) : (
-              <>
-                {/* Directory truncates from the left (…/foo/bar) so the filename
-                    — the most important part — stays visible as long as possible;
-                    it right-truncates only when it alone overflows. The tooltip
-                    below shows the full path on hover. */}
-                {dirPart && (
-                  <span dir="rtl" className="min-w-0 truncate text-left text-text-tertiary">
-                    <bdo dir="ltr">{dirPart}</bdo>
-                  </span>
-                )}
-                <span className={cx("min-w-0 truncate font-medium", nameColor)}>{filePart}</span>
-              </>
-            )}
-          </button>
-        </Focusable>
-        <TooltipContent className="break-all font-mono">{entry.path}</TooltipContent>
-      </Tooltip>
-      <span className="flex min-w-0 items-center justify-end gap-1 font-mono text-xs tabular-nums">
-        {isNew && (
-          <Tooltip>
-            <Focusable>
-              <span
-                role="img"
-                aria-label={t("git.newFile")}
-                className="size-1.5 shrink-0 rounded-full bg-notification-success-foreground"
-              />
-            </Focusable>
-            <TooltipContent>{t("git.newFile")}</TooltipContent>
-          </Tooltip>
-        )}
-        {entry.additions !== undefined && (
-          <span className="truncate text-state-success-text">+{entry.additions}</span>
-        )}
-        {entry.deletions !== undefined && entry.deletions > 0 && (
-          <span className="truncate text-text-error-primary">−{entry.deletions}</span>
-        )}
-      </span>
-      <div
-        // Row actions overlay the trailing edge instead of reserving
-        // permanent columns, so path + stats use the full row width. The
-        // solid background (matching the row's own bg in each state) hides
-        // the text underneath; reveal happens on row hover or keyboard
-        // focus within the row.
-        className={cx(
-          "absolute inset-y-0 right-1.5 flex items-center gap-0.5 pl-3",
-          "bg-background-primary-default group-hover:bg-background-secondary-hover",
-          "pointer-events-none opacity-0",
-          "group-hover:pointer-events-auto group-hover:opacity-100",
-          "focus-within:pointer-events-auto focus-within:opacity-100",
-        )}
-      >
-        {discardLabel !== undefined && onDiscard !== undefined && (
-          <Tooltip>
-            <Focusable>
-              <button
-                type="button"
-                disabled={actionBusy}
-                onClick={() => onDiscard(entry.path)}
-                aria-label={discardLabel}
-                className={cx(
-                  "rounded p-0.5 text-foreground-icon-secondary",
-                  "hover:bg-background-tertiary-hover disabled:text-foreground-icon-disabled",
-                )}
-              >
-                <Undo2 aria-hidden className="size-4" />
-              </button>
-            </Focusable>
-            <TooltipContent>{discardLabel}</TooltipContent>
-          </Tooltip>
-        )}
-        <Tooltip>
-          <Focusable>
-            <button
-              type="button"
-              disabled={actionBusy}
-              onClick={() => onAction(entry.path)}
-              aria-label={actionLabel}
-              className={cx(
-                "rounded p-0.5 text-foreground-icon-secondary",
-                "hover:bg-background-tertiary-hover disabled:text-foreground-icon-disabled",
-              )}
-            >
-              {actionKind === "stage" ? (
-                <Plus aria-hidden className="size-4" />
-              ) : (
-                <Minus aria-hidden className="size-4" />
-              )}
-            </button>
-          </Focusable>
-          <TooltipContent>{actionLabel}</TooltipContent>
-        </Tooltip>
-      </div>
+      <FileStats entry={entry} isNew={isNew} />
+      <FileRowActions
+        path={entry.path}
+        actionLabel={actionLabel}
+        actionKind={actionKind}
+        actionBusy={actionBusy}
+        discardLabel={discardLabel}
+        onDiscard={onDiscard}
+        onAction={onAction}
+      />
     </li>
   );
 });
+
 
 export interface DirectoryRowProps {
   node: GitTreeDirNode;
@@ -266,6 +303,7 @@ export const DirectoryRow = memo(function DirectoryRow({
   onDiscard,
   actionBusy,
 }: DirectoryRowProps) {
+  const { t } = useTranslation();
 
   return (
     <li
@@ -280,6 +318,11 @@ export const DirectoryRow = memo(function DirectoryRow({
         onClick={() => onToggleOpen(node.id)}
         className="flex size-4 shrink-0 items-center justify-center text-foreground-icon-tertiary hover:text-foreground-icon-secondary"
         aria-expanded={isOpen}
+        aria-label={
+          isOpen
+            ? t("git.collapseFolder", { name: node.name })
+            : t("git.expandFolder", { name: node.name })
+        }
       >
         {isOpen ? (
           <ChevronDown aria-hidden className="size-3.5" />

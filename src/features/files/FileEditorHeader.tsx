@@ -2,6 +2,7 @@ import { useTranslation } from "react-i18next";
 import Eye from "lucide-react/dist/esm/icons/eye";
 import PencilLine from "lucide-react/dist/esm/icons/pencil-line";
 import Save from "lucide-react/dist/esm/icons/save";
+import Search from "lucide-react/dist/esm/icons/search";
 import { Button } from "@/components/base/buttons/button";
 import { cx } from "@/utils/cx";
 
@@ -15,6 +16,8 @@ export function FileEditorHeader({
   onMdModeChange,
   saving,
   onSave,
+  searchOpen,
+  onToggleSearch,
 }: {
   path: string;
   name: string;
@@ -25,6 +28,9 @@ export function FileEditorHeader({
   onMdModeChange: (mode: "edit" | "preview") => void;
   saving: boolean;
   onSave: () => void;
+  /** Markdown preview find bar visibility / toggle (⌘F). */
+  searchOpen: boolean;
+  onToggleSearch: () => void;
 }) {
   const { t } = useTranslation();
 
@@ -44,6 +50,23 @@ export function FileEditorHeader({
         </span>
       )}
       <div className="flex-1" />
+      {isMarkdown && mdMode === "preview" && (
+        <button
+          type="button"
+          onClick={onToggleSearch}
+          aria-label={t("files.markdown.searchToggle")}
+          title={t("files.markdown.searchToggle")}
+          aria-pressed={searchOpen}
+          className={cx(
+            "flex h-6 shrink-0 items-center justify-center rounded-lg border border-border-button-default px-2 transition-colors duration-150 ease",
+            searchOpen
+              ? "bg-background-tertiary-default text-text-primary"
+              : "text-text-tertiary hover:text-text-primary",
+          )}
+        >
+          <Search className="size-3.5" aria-hidden />
+        </button>
+      )}
       {isMarkdown && (
         <div className="flex shrink-0 items-center rounded-lg border border-border-button-default">
           <button

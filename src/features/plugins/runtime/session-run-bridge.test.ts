@@ -110,13 +110,32 @@ describe("plugin session-run bridge", () => {
     unsubscribe();
   });
 
-  it("interrupts through the chat store with the session identity", async () => {
-    await interruptPluginChatRun("p", { engine: "pi", workspacePath: "/w", sessionId: "sess-1" });
-    expect(interruptMock).toHaveBeenCalledWith({ engine: "pi", sessionId: "sess-1", workspacePath: "/w" });
+  it("interrupts only runs the plugin started", async () => {
+    sendMock.mockImplementation(async (_prompt, _images, options) => {
+      options.onStarted({ runId: "run-owned", sessionId: "sess-owned" });
+    });
+    await startPluginChatRun("p", { engine: "pi", prompt: "x", workspacePath: "/w" });
+
+    await interruptPluginChatRun("p", { engine: "pi", workspacePath: "/w", sessionId: "sess-owned" });
+    expect(interruptMock).toHaveBeenCalledWith({ engine: "pi", sessionId: "sess-owned", workspacePath: "/w" });
+
+    // An unowned session (the user's turn, or a sibling plugin's) never reaches
+    // the store: stopping it would be outside this plugin's grant.
+    interruptMock.mockClear();
+    await expect(
+      interruptPluginChatRun("p", { engine: "pi", workspacePath: "/w", sessionId: "sess-user" }),
+    ).rejects.toThrow(/may only stop a run started by this plugin/);
+    expect(interruptMock).not.toHaveBeenCalled();
+
+    // The native id may not be known yet: a null identity stops the plugin's
+    // own live run in that engine+workspace scope.
     await interruptPluginChatRun("p", { engine: "pi", workspacePath: "/w" });
-    expect(interruptMock).toHaveBeenLastCalledWith({ engine: "pi", sessionId: null, workspacePath: "/w" });
+    expect(interruptMock).toHaveBeenCalledWith({ engine: "pi", sessionId: null, workspacePath: "/w" });
+
     await expect(interruptPluginChatRun("p", { engine: "", workspacePath: "" })).rejects.toThrow(
       /engine and workspacePath/,
     );
+    // Settle the owned run so its record cannot leak into later tests.
+    emitEngineEvents?.([engineEvent("run-owned", "done", { sessionId: "sess-owned" })]);
   });
 });

@@ -40,6 +40,11 @@ struct TurnView {
     part_types: HashMap<(String, String), String>,
     /// Usage from the latest finished assistant message (Done snapshot).
     last_usage: Option<Value>,
+    /// `"provider/model"` → effective context window, read once per turn from
+    /// the server's merged config. opencode's usage payload carries only token
+    /// counts, so the window has to be attached from here or the gauge falls
+    /// back to its assumed 200k.
+    context_windows: HashMap<String, u64>,
     turn_ended: bool,
     saw_content: bool,
 }
@@ -136,6 +141,12 @@ async fn turn_inner(
     let origin = opencode_server::ensure_server(server, bin, probe_port).await?;
     let directory = req.workspace.to_string_lossy().to_string();
 
+    // The context gauge needs the model's window; opencode's usage payload
+    // never carries one, so read the server's merged config once per turn and
+    // attach it on each usage event (a probe failure just keeps the gauge's
+    // own fallback — never fails the turn).
+    view.context_windows = load_context_windows(&origin, &directory).await;
+
     // Session continuity: resume the stored ses_ id, else create one. The
     // question tool only exists server-side, so the session must live on the
     // server even though the transcript renders here.
@@ -198,6 +209,78 @@ async fn turn_inner(
             }
         }
     }
+}
+
+/// Effective model context windows from the server's merged config:
+/// `provider.<pid>.models.<mid>.limit.context` → `"pid/mid"`. Best effort —
+/// a missing/unreachable config just yields an empty map, and the gauge keeps
+/// its own fallback.
+async fn load_context_windows(origin: &str, directory: &str) -> HashMap<String, u64> {
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    else {
+        return HashMap::new();
+    };
+    let Ok(response) = client
+        .get(format!("{origin}/config"))
+        .query(&[("directory", directory)])
+        .send()
+        .await
+    else {
+        return HashMap::new();
+    };
+    if !response.status().is_success() {
+        return HashMap::new();
+    }
+    match response.json::<Value>().await {
+        Ok(config) => parse_context_windows(&config),
+        Err(_) => HashMap::new(),
+    }
+}
+
+/// Pull `provider.<pid>.models.<mid>.limit.context` into a `"pid/mid"` map.
+fn parse_context_windows(config: &Value) -> HashMap<String, u64> {
+    let mut windows = HashMap::new();
+    let Some(providers) = config.get("provider").and_then(Value::as_object) else {
+        return windows;
+    };
+    for (provider_id, provider) in providers {
+        let Some(models) = provider.get("models").and_then(Value::as_object) else {
+            continue;
+        };
+        for (model_id, model) in models {
+            if let Some(context) = model.pointer("/limit/context").and_then(Value::as_u64) {
+                windows.insert(format!("{provider_id}/{model_id}"), context);
+            }
+        }
+    }
+    windows
+}
+
+/// Attach the model's window to a usage payload when opencode didn't report
+/// one, keyed as `model_context_window` — the field the rest of the app reads.
+/// The provider/model come off the assistant message, so resumed sessions and
+/// model switches both resolve correctly.
+fn attach_context_window(
+    mut usage: Value,
+    info: &Value,
+    windows: &HashMap<String, u64>,
+) -> Value {
+    if usage.get("model_context_window").is_some() {
+        return usage;
+    }
+    let provider = info.get("providerID").and_then(Value::as_str).unwrap_or("");
+    let model = info.get("modelID").and_then(Value::as_str).unwrap_or("");
+    if provider.is_empty() || model.is_empty() {
+        return usage;
+    }
+    if let Some(window) = windows.get(&format!("{provider}/{model}")) {
+        if let Some(object) = usage.as_object_mut() {
+            object.insert("model_context_window".to_string(), Value::from(*window));
+        }
+    }
+    usage
 }
 
 async fn create_session(origin: &str, directory: &str, prompt: &str) -> Result<String, String> {
@@ -408,8 +491,9 @@ async fn handle_server_event(
             }
             // Finished assistant messages carry the authoritative token usage.
             if let Some(tokens) = info.get("tokens").filter(|t| !t.is_null()) {
-                view.last_usage = Some(tokens.clone());
-                core.dispatch_event(state, EngineEvent::Usage(tokens.clone()));
+                let usage = attach_context_window(tokens.clone(), &info, &view.context_windows);
+                view.last_usage = Some(usage.clone());
+                core.dispatch_event(state, EngineEvent::Usage(usage));
             }
             // A model/API error embedded in the assistant message fails the
             // turn when nothing else recovers it.
@@ -845,6 +929,7 @@ mod tests {
             session_id: None,
             workspace: std::path::PathBuf::from("/tmp"),
             prompt: "测试提问".to_string(),
+            prompt_contributions: Vec::new(),
             native_compact: false,
             images: Vec::new(),
             model: None,
@@ -960,6 +1045,55 @@ mod tests {
         let reply_body = reply_seen.try_recv().expect("mock saw no reply POST");
         let reply_json: Value = serde_json::from_str(&reply_body).expect("reply body json");
         assert_eq!(reply_json, json!({ "answers": [["prod"]] }));
+    }
+
+    #[test]
+    fn parses_context_windows_from_merged_config() {
+        let config = json!({
+            "provider": {
+                "qf": { "models": {
+                    "deepseek-v4.1-flash": {
+                        "limit": { "context": 1_048_576, "output": 393_216 }
+                    },
+                    "no-limit": {}
+                }},
+                "opencode": { "models": {
+                    "big-pickle": { "limit": { "context": 200_000 } }
+                }}
+            }
+        });
+        let windows = parse_context_windows(&config);
+        assert_eq!(windows.get("qf/deepseek-v4.1-flash"), Some(&1_048_576));
+        assert_eq!(windows.get("opencode/big-pickle"), Some(&200_000));
+        assert_eq!(windows.get("qf/no-limit"), None);
+        assert!(parse_context_windows(&json!({})).is_empty());
+        // The mock server's unmocked reply must not match or panic.
+        assert!(parse_context_windows(&json!({ "error": "unmocked" })).is_empty());
+    }
+
+    #[test]
+    fn attaches_the_window_only_when_usage_omits_it() {
+        let mut windows = HashMap::new();
+        windows.insert("qf/deepseek-v4.1-flash".to_string(), 1_048_576u64);
+        let info = json!({ "providerID": "qf", "modelID": "deepseek-v4.1-flash" });
+
+        let usage =
+            attach_context_window(json!({ "input": 12018, "output": 50 }), &info, &windows);
+        assert_eq!(usage["model_context_window"], 1_048_576);
+
+        // An engine-reported window wins; an unknown model stays untouched.
+        let reported = attach_context_window(
+            json!({ "input": 1, "model_context_window": 200_000 }),
+            &info,
+            &windows,
+        );
+        assert_eq!(reported["model_context_window"], 200_000);
+        let unknown = attach_context_window(
+            json!({ "input": 1 }),
+            &json!({ "providerID": "other", "modelID": "x" }),
+            &windows,
+        );
+        assert!(unknown.get("model_context_window").is_none());
     }
 
     #[test]

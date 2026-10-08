@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import Plus from "lucide-react/dist/esm/icons/plus";
 import Search from "lucide-react/dist/esm/icons/search";
@@ -88,18 +88,6 @@ export function ChangesPanelHeader({
     );
   };
 
-  // Stale filter text must not survive into the next open.
-  useEffect(() => {
-    if (!branchOpen) setBranchQuery("");
-  }, [branchOpen]);
-
-  const filteredBranches = useMemo(() => {
-    const q = branchQuery.trim().toLowerCase();
-    return (branches ?? []).filter(
-      (b) => q.length === 0 || b.name.toLowerCase().includes(q),
-    );
-  }, [branches, branchQuery]);
-
   return (
     <div className="flex flex-col gap-2 border-b border-separator-border px-3 py-2.5">
       <div className="flex items-center gap-1.5">
@@ -117,220 +105,352 @@ export function ChangesPanelHeader({
             ↑{ahead} ↓{behind}
           </span>
         )}
-        <div className="ml-auto flex items-center gap-1">
-          {onToggleViewMode && (
-            <IconButton
-              icon={viewMode === "tree" ? List : FolderTree}
-              size="small"
-              aria-label={viewMode === "tree" ? t("git.viewAsList") : t("git.viewAsTree")}
-              title={viewMode === "tree" ? t("git.viewAsList") : t("git.viewAsTree")}
-              onClick={onToggleViewMode}
-            />
-          )}
-          <IconButton
-            icon={RefreshCw}
-            size="small"
-            aria-label={t("common.refresh")}
-            title={t("common.refresh")}
-            disabled={pending.refresh === true}
-            onClick={handleRefresh}
-          >
-            <ActionFeedbackIcon
-              icon={RefreshCw}
-              feedback={refreshAction.feedback}
-              spin
-            />
-          </IconButton>
-          <IconButton
-            icon={CloudDownload}
-            size="small"
-            aria-label={t("git.pull")}
-            title={t("git.pull")}
-            disabled={notRepo || pending.pull === true}
-            onClick={() =>
-              run("pull", () =>
-                pullAction.start(() => useGitStore.getState().pull(workspacePath)),
-              )
-            }
-          >
-            <ActionFeedbackIcon icon={CloudDownload} feedback={pullAction.feedback} />
-          </IconButton>
-          <IconButton
-            icon={CloudUpload}
-            size="small"
-            aria-label={t("git.push")}
-            title={t("git.push")}
-            disabled={notRepo || pending.push === true}
-            onClick={() =>
-              run("push", () =>
-                pushAction.start(() => useGitStore.getState().push(workspacePath)),
-              )
-            }
-          >
-            <ActionFeedbackIcon icon={CloudUpload} feedback={pushAction.feedback} />
-          </IconButton>
-        </div>
+        <HeaderActions
+          notRepo={notRepo}
+          pending={pending}
+          viewMode={viewMode}
+          onToggleViewMode={onToggleViewMode}
+          refreshFeedback={refreshAction.feedback}
+          pullFeedback={pullAction.feedback}
+          pushFeedback={pushAction.feedback}
+          onRefresh={handleRefresh}
+          onPull={() =>
+            run("pull", () =>
+              pullAction.start(() => useGitStore.getState().pull(workspacePath)),
+            )
+          }
+          onPush={() =>
+            run("push", () =>
+              pushAction.start(() => useGitStore.getState().push(workspacePath)),
+            )
+          }
+        />
       </div>
       {!notRepo && (
-        <div className="flex items-center gap-1">
-          <Dropdown
-            isOpen={branchOpen}
-            onOpenChange={(open) => {
-              setBranchOpen(open);
-              // The cached list goes stale when branches change outside the
-              // app (CLI checkout/switch); reload on every open.
-              if (open) void useGitStore.getState().loadBranches(workspacePath);
-            }}
-          >
-            <DropdownTrigger
-              className={cx(
-                "flex h-8 min-w-0 flex-1 items-center gap-1.5 rounded-lg border border-border-button-default",
-                "px-2 text-body-medium text-text-primary shadow-xs",
-                "hover:bg-background-secondary-hover",
-              )}
-            >
-              <GitBranch
-                aria-hidden
-                className="size-4 shrink-0 text-foreground-icon-secondary"
-              />
-              <span className="truncate">{branch ?? "…"}</span>
-              <ChevronDown
-                aria-hidden
-                className="ml-auto size-4 shrink-0 text-foreground-icon-tertiary"
-              />
-            </DropdownTrigger>
-            <DropdownPopover aria-label={t("git.branch")} placement="bottom start" className="max-h-80!">
-              {/* Single scroller: the popover itself, capped at 320px
-                  (react-aria's inline viewport clamp would otherwise let it
-                  grow to nearly full-window height, so the cap needs the
-                  important modifier to win). Search and the new-branch footer
-                  pin via sticky; the rows scroll between them. An inner
-                  max-h scroll div nested badly here — in short windows the
-                  clamped popover clipped the inner list and its scrollbar,
-                  leaving the lower branches unreachable. */}
-              <div className="sticky -top-2.5 z-10 -mx-2.5 -mt-2.5 bg-background-primary-default px-2.5 pt-2.5 pb-1">
-                <div className="flex h-8 items-center gap-1.5 rounded-lg border border-border-button-default px-2">
-                  <Search
-                    aria-hidden
-                    className="size-4 shrink-0 text-foreground-icon-secondary"
-                  />
-                  <input
-                    autoFocus
-                    value={branchQuery}
-                    onChange={(e) => setBranchQuery(e.target.value)}
-                    placeholder={t("git.searchBranches")}
-                    className="min-w-0 flex-1 bg-transparent text-body-medium text-text-primary outline-none placeholder:text-text-placeholder"
-                  />
-                </div>
-              </div>
-              {filteredBranches.map((b) => (
-                <DropdownItem
-                  key={b.name}
-                  selected={b.name === branch}
-                  className="px-2 py-1.5"
-                  onSelect={() => {
-                    setBranchOpen(false);
-                    // "Current" must come from the same source as the trigger
-                    // label (status.branch): the cached list's isCurrent lags
-                    // behind external checkouts and would no-op the click.
-                    if (b.name !== branch) {
-                      run("checkout", () =>
-                        useGitStore.getState().checkout(workspacePath, b.name),
-                      );
-                    }
-                  }}
-                >
-                  <span className="truncate text-body-medium text-text-primary">
-                    {b.name}
-                  </span>
-                  {b.isRemote && (
-                    <span className="ml-auto shrink-0 rounded-md bg-background-secondary-default px-1.5 py-0.5 text-caption-1-regular text-text-tertiary">
-                      {t("git.remoteBranch")}
-                    </span>
-                  )}
-                </DropdownItem>
-              ))}
-              {filteredBranches.length === 0 && (
-                <span className="px-2 py-1.5 text-body-medium text-text-tertiary">
-                  {t("git.noMatchingBranches")}
-                </span>
-              )}
-              <div className="sticky -bottom-2.5 z-10 -mx-2.5 -mb-2.5 bg-background-primary-default px-2.5 pb-2.5">
-                <DropdownDivider />
-                <DropdownItem
-                  className="px-2 py-1.5"
-                  onSelect={() => {
-                    setBranchOpen(false);
-                    setCreatingBranch(true);
-                  }}
-                >
-                  <Plus aria-hidden className="size-4 text-foreground-icon-secondary" />
-                  <span className="text-body-medium text-text-primary">
-                    {t("git.newBranch")}
-                  </span>
-                </DropdownItem>
-              </div>
-            </DropdownPopover>
-          </Dropdown>
-        </div>
+        <BranchPicker
+          workspacePath={workspacePath}
+          branch={branch}
+          branches={branches}
+          run={run}
+          open={branchOpen}
+          onOpenChange={setBranchOpen}
+          query={branchQuery}
+          onQueryChange={setBranchQuery}
+          onCreateBranch={() => {
+            setBranchOpen(false);
+            setCreatingBranch(true);
+          }}
+        />
       )}
       {creatingBranch && (
-        <form
-          className="flex items-center gap-1"
-          onSubmit={(e) => {
-            e.preventDefault();
-            const name = newBranchName.trim();
-            if (name.length === 0 || pending.createBranch === true) return;
+        <NewBranchForm
+          name={newBranchName}
+          busy={pending.createBranch === true}
+          onNameChange={setNewBranchName}
+          onSubmit={(name) =>
             run("createBranch", async () => {
               await useGitStore.getState().createBranch(workspacePath, name);
               setCreatingBranch(false);
               setNewBranchName("");
-            });
+            })
+          }
+          onCancel={() => {
+            setCreatingBranch(false);
+            setNewBranchName("");
           }}
+        />
+      )}
+      {error && <HeaderError message={error} onDismiss={onDismissError} />}
+    </div>
+  );
+}
+
+/** Refresh / pull / push plus the flat–tree toggle, pinned to the right. */
+function HeaderActions({
+  notRepo,
+  pending,
+  viewMode,
+  onToggleViewMode,
+  refreshFeedback,
+  pullFeedback,
+  pushFeedback,
+  onRefresh,
+  onPull,
+  onPush,
+}: {
+  notRepo: boolean;
+  pending: Record<string, true>;
+  viewMode?: "flat" | "tree";
+  onToggleViewMode?: () => void;
+  refreshFeedback: ReturnType<typeof useActionFeedback>["feedback"];
+  pullFeedback: ReturnType<typeof useActionFeedback>["feedback"];
+  pushFeedback: ReturnType<typeof useActionFeedback>["feedback"];
+  onRefresh: () => void;
+  onPull: () => void;
+  onPush: () => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <div className="ml-auto flex items-center gap-1">
+      {onToggleViewMode && (
+        <IconButton
+          icon={viewMode === "tree" ? List : FolderTree}
+          size="small"
+          aria-label={viewMode === "tree" ? t("git.viewAsList") : t("git.viewAsTree")}
+          title={viewMode === "tree" ? t("git.viewAsList") : t("git.viewAsTree")}
+          onClick={onToggleViewMode}
+        />
+      )}
+      <IconButton
+        icon={RefreshCw}
+        size="small"
+        aria-label={t("common.refresh")}
+        title={t("common.refresh")}
+        disabled={pending.refresh === true}
+        onClick={onRefresh}
+      >
+        <ActionFeedbackIcon icon={RefreshCw} feedback={refreshFeedback} spin />
+      </IconButton>
+      <IconButton
+        icon={CloudDownload}
+        size="small"
+        aria-label={t("git.pull")}
+        title={t("git.pull")}
+        disabled={notRepo || pending.pull === true}
+        onClick={onPull}
+      >
+        <ActionFeedbackIcon icon={CloudDownload} feedback={pullFeedback} />
+      </IconButton>
+      <IconButton
+        icon={CloudUpload}
+        size="small"
+        aria-label={t("git.push")}
+        title={t("git.push")}
+        disabled={notRepo || pending.push === true}
+        onClick={onPush}
+      >
+        <ActionFeedbackIcon icon={CloudUpload} feedback={pushFeedback} />
+      </IconButton>
+    </div>
+  );
+}
+
+/** Branch trigger + searchable popover + the "new branch" entry. */
+function BranchPicker({
+  workspacePath,
+  branch,
+  branches,
+  run,
+  open,
+  onOpenChange,
+  query,
+  onQueryChange,
+  onCreateBranch,
+}: {
+  workspacePath: string;
+  branch: string | undefined;
+  branches: BranchInfo[] | undefined;
+  run: (key: string, action: () => Promise<unknown>) => void;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  query: string;
+  onQueryChange: (query: string) => void;
+  onCreateBranch: () => void;
+}) {
+  const { t } = useTranslation();
+  const searchRef = useRef<HTMLInputElement>(null);
+
+  // Stale filter text must not survive into the next open.
+  useEffect(() => {
+    if (!open) onQueryChange("");
+  }, [open, onQueryChange]);
+
+  // Focus the filter as the popover opens (autoFocus would move focus on
+  // load, which the a11y rules reject).
+  useEffect(() => {
+    if (open) searchRef.current?.focus();
+  }, [open]);
+
+  const filteredBranches = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return (branches ?? []).filter(
+      (b) => q.length === 0 || b.name.toLowerCase().includes(q),
+    );
+  }, [branches, query]);
+
+  return (
+    <div className="flex items-center gap-1">
+      <Dropdown
+        isOpen={open}
+        onOpenChange={(next) => {
+          onOpenChange(next);
+          // The cached list goes stale when branches change outside the
+          // app (CLI checkout/switch); reload on every open.
+          if (next) void useGitStore.getState().loadBranches(workspacePath);
+        }}
+      >
+        <DropdownTrigger
+          className={cx(
+            "flex h-8 min-w-0 flex-1 items-center gap-1.5 rounded-lg border border-border-button-default",
+            "px-2 text-body-medium text-text-primary shadow-xs",
+            "hover:bg-background-secondary-hover",
+          )}
         >
-          <input
-            autoFocus
-            value={newBranchName}
-            onChange={(e) => setNewBranchName(e.target.value)}
-            placeholder={t("git.branchNamePlaceholder")}
-            className={cx(
-              "h-8 min-w-0 flex-1 rounded-lg border border-border-button-default px-2",
-              "text-body-medium text-text-primary placeholder:text-text-placeholder",
-              "outline-none focus:border-border-focus-ring",
-            )}
+          <GitBranch
+            aria-hidden
+            className="size-4 shrink-0 text-foreground-icon-secondary"
           />
-          <Button
-            size="small"
-            type="submit"
-            disabled={newBranchName.trim().length === 0 || pending.createBranch === true}
-          >
-            {t("common.confirm")}
-          </Button>
-          <Button
-            size="small"
-            variant="ghost"
-            onClick={() => {
-              setCreatingBranch(false);
-              setNewBranchName("");
-            }}
-          >
-            {t("common.cancel")}
-          </Button>
-        </form>
-      )}
-      {error && (
-        <div role="alert" className="flex items-center gap-2">
-          <p className="min-w-0 flex-1 break-words text-xs text-text-error-primary">{error}</p>
-          <button
-            type="button"
-            aria-label={t("common.close")}
-            onClick={onDismissError}
-            className="shrink-0 cursor-pointer rounded p-0.5 text-text-error-primary hover:bg-background-tertiary-hover"
-          >
-            ×
-          </button>
-        </div>
-      )}
+          <span className="truncate">{branch ?? "…"}</span>
+          <ChevronDown
+            aria-hidden
+            className="ml-auto size-4 shrink-0 text-foreground-icon-tertiary"
+          />
+        </DropdownTrigger>
+        <DropdownPopover aria-label={t("git.branch")} placement="bottom start" className="max-h-80!">
+          {/* Single scroller: the popover itself, capped at 320px
+              (react-aria's inline viewport clamp would otherwise let it
+              grow to nearly full-window height, so the cap needs the
+              important modifier to win). Search and the new-branch footer
+              pin via sticky; the rows scroll between them. An inner
+              max-h scroll div nested badly here — in short windows the
+              clamped popover clipped the inner list and its scrollbar,
+              leaving the lower branches unreachable. */}
+          <div className="sticky -top-2.5 z-10 -mx-2.5 -mt-2.5 bg-background-primary-default px-2.5 pt-2.5 pb-1">
+            <div className="flex h-8 items-center gap-1.5 rounded-lg border border-border-button-default px-2">
+              <Search
+                aria-hidden
+                className="size-4 shrink-0 text-foreground-icon-secondary"
+              />
+              <input
+                ref={searchRef}
+                value={query}
+                onChange={(e) => onQueryChange(e.target.value)}
+                placeholder={t("git.searchBranches")}
+                className="min-w-0 flex-1 bg-transparent text-body-medium text-text-primary outline-none placeholder:text-text-placeholder"
+              />
+            </div>
+          </div>
+          {filteredBranches.map((b) => (
+            <DropdownItem
+              key={b.name}
+              selected={b.name === branch}
+              className="px-2 py-1.5"
+              onSelect={() => {
+                onOpenChange(false);
+                // "Current" must come from the same source as the trigger
+                // label (status.branch): the cached list's isCurrent lags
+                // behind external checkouts and would no-op the click.
+                if (b.name !== branch) {
+                  run("checkout", () =>
+                    useGitStore.getState().checkout(workspacePath, b.name),
+                  );
+                }
+              }}
+            >
+              <span className="truncate text-body-medium text-text-primary">
+                {b.name}
+              </span>
+              {b.isRemote && (
+                <span className="ml-auto shrink-0 rounded-md bg-background-secondary-default px-1.5 py-0.5 text-caption-1-regular text-text-tertiary">
+                  {t("git.remoteBranch")}
+                </span>
+              )}
+            </DropdownItem>
+          ))}
+          {filteredBranches.length === 0 && (
+            <span className="px-2 py-1.5 text-body-medium text-text-tertiary">
+              {t("git.noMatchingBranches")}
+            </span>
+          )}
+          <div className="sticky -bottom-2.5 z-10 -mx-2.5 -mb-2.5 bg-background-primary-default px-2.5 pb-2.5">
+            <DropdownDivider />
+            <DropdownItem className="px-2 py-1.5" onSelect={onCreateBranch}>
+              <Plus aria-hidden className="size-4 text-foreground-icon-secondary" />
+              <span className="text-body-medium text-text-primary">
+                {t("git.newBranch")}
+              </span>
+            </DropdownItem>
+          </div>
+        </DropdownPopover>
+      </Dropdown>
+    </div>
+  );
+}
+
+/** Inline new-branch form under the header. */
+function NewBranchForm({
+  name,
+  busy,
+  onNameChange,
+  onSubmit,
+  onCancel,
+}: {
+  name: string;
+  busy: boolean;
+  onNameChange: (name: string) => void;
+  onSubmit: (name: string) => void;
+  onCancel: () => void;
+}) {
+  const { t } = useTranslation();
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  // Focus the name field as the form appears (autoFocus would move focus on
+  // load, which the a11y rules reject).
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, []);
+
+  return (
+    <form
+      className="flex items-center gap-1"
+      onSubmit={(e) => {
+        e.preventDefault();
+        const trimmed = name.trim();
+        if (trimmed.length === 0 || busy) return;
+        onSubmit(trimmed);
+      }}
+    >
+      <input
+        ref={inputRef}
+        value={name}
+        onChange={(e) => onNameChange(e.target.value)}
+        placeholder={t("git.branchNamePlaceholder")}
+        className={cx(
+          "h-8 min-w-0 flex-1 rounded-lg border border-border-button-default px-2",
+          "text-body-medium text-text-primary placeholder:text-text-placeholder",
+          "outline-none focus:border-border-focus-ring",
+        )}
+      />
+      <Button size="small" type="submit" disabled={name.trim().length === 0 || busy}>
+        {t("common.confirm")}
+      </Button>
+      <Button size="small" variant="ghost" onClick={onCancel}>
+        {t("common.cancel")}
+      </Button>
+    </form>
+  );
+}
+
+/** Inline dismissible error line under the header. */
+function HeaderError({
+  message,
+  onDismiss,
+}: {
+  message: string;
+  onDismiss: () => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <div role="alert" className="flex items-center gap-2">
+      <p className="min-w-0 flex-1 break-words text-xs text-text-error-primary">{message}</p>
+      <button
+        type="button"
+        aria-label={t("common.close")}
+        onClick={onDismiss}
+        className="shrink-0 cursor-pointer rounded p-0.5 text-text-error-primary hover:bg-background-tertiary-hover"
+      >
+        ×
+      </button>
     </div>
   );
 }

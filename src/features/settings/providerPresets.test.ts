@@ -28,6 +28,7 @@ describe("API Route preset configuration", () => {
     expect(config).toContain('model = "gpt-6.1-sol"');
     expect(config).toContain('wire_api = "responses"');
     expect(config).toContain("requires_openai_auth = true");
+    expect(config).not.toContain("disable_response_storage");
     expect(findMatchedPreset(PRESETS.codex!, preset.baseUrl)).toBe(preset);
   });
 });

@@ -17,6 +17,76 @@ import { TabStripContextMenu } from "./TabStripContextMenu";
 
 export type { SessionTabItem };
 
+/** Trailing "+" tab button: click = new session, right-click = the
+ *  session/browser chooser anchor. */
+function NewTabButton({
+  onNew,
+  onNewBrowser,
+  onOpenMenu,
+}: {
+  onNew: () => void;
+  onNewBrowser?: () => void;
+  onOpenMenu: (point: { x: number; y: number }) => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <button
+      type="button"
+      aria-label={t("chat.newChat")}
+      title={t("chat.newChat")}
+      onClick={onNew}
+      onContextMenu={
+        onNewBrowser
+          ? (e) => {
+              e.preventDefault();
+              onOpenMenu({ x: e.clientX, y: e.clientY });
+            }
+          : undefined
+      }
+      className="ml-1 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-foreground-icon-tertiary opacity-0 transition-opacity hover:bg-background-secondary-hover hover:text-foreground-icon-primary focus-visible:opacity-100 group-hover:opacity-100"
+    >
+      <Plus className="size-4" aria-hidden />
+    </button>
+  );
+}
+
+/** New-session / new-browser menu, anchored where the right-click landed. */
+function NewTabMenu({
+  menu,
+  onNew,
+  onNewBrowser,
+  onDismiss,
+}: {
+  menu: { x: number; y: number };
+  onNew: () => void;
+  onNewBrowser: () => void;
+  onDismiss: () => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <ContextMenu
+      x={menu.x}
+      y={menu.y}
+      ariaLabel={t("chat.newChat")}
+      entries={[
+        {
+          id: "new-session",
+          label: t("chat.newSession"),
+          icon: <MessageSquarePlus className="size-4" aria-hidden />,
+          onSelect: onNew,
+        },
+        {
+          id: "new-browser",
+          label: t("chat.newBrowser"),
+          icon: <Globe className="size-4" aria-hidden />,
+          onSelect: onNewBrowser,
+        },
+      ]}
+      onClose={onDismiss}
+    />
+  );
+}
+
 interface SessionTabStripProps {
   tabs: SessionTabItem[];
   activeKey: string | null;
@@ -68,7 +138,6 @@ export function SessionTabStrip({
   trafficLightInset = true,
 }: SessionTabStripProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
-  const { t } = useTranslation();
   // 页签向下拖出页签条 = 拖到对话区分屏（横向仍是排序）。没有分屏 provider 时
   // （独立渲染/测试）保持原行为。
   const splitDrag = useOptionalSplitDrag();
@@ -157,23 +226,11 @@ export function SessionTabStrip({
       ))}
       </div>
       {onNew && (
-        <button
-          type="button"
-          aria-label={t("chat.newChat")}
-          title={t("chat.newChat")}
-          onClick={onNew}
-          onContextMenu={
-            onNewBrowser
-              ? (e) => {
-                  e.preventDefault();
-                  setNewMenu({ x: e.clientX, y: e.clientY });
-                }
-              : undefined
-          }
-          className="ml-1 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-foreground-icon-tertiary opacity-0 transition-opacity hover:bg-background-secondary-hover hover:text-foreground-icon-primary focus-visible:opacity-100 group-hover:opacity-100"
-        >
-          <Plus className="size-4" aria-hidden />
-        </button>
+        <NewTabButton
+          onNew={onNew}
+          onNewBrowser={onNewBrowser}
+          onOpenMenu={setNewMenu}
+        />
       )}
       </div>
       {actions && (
@@ -188,25 +245,11 @@ export function SessionTabStrip({
         onDismiss={() => setMenu(null)}
       />
       {newMenu && onNewBrowser && onNew && (
-        <ContextMenu
-          x={newMenu.x}
-          y={newMenu.y}
-          ariaLabel={t("chat.newChat")}
-          entries={[
-            {
-              id: "new-session",
-              label: t("chat.newSession"),
-              icon: <MessageSquarePlus className="size-4" aria-hidden />,
-              onSelect: onNew,
-            },
-            {
-              id: "new-browser",
-              label: t("chat.newBrowser"),
-              icon: <Globe className="size-4" aria-hidden />,
-              onSelect: onNewBrowser,
-            },
-          ]}
-          onClose={() => setNewMenu(null)}
+        <NewTabMenu
+          menu={newMenu}
+          onNew={onNew}
+          onNewBrowser={onNewBrowser}
+          onDismiss={() => setNewMenu(null)}
         />
       )}
     </div>

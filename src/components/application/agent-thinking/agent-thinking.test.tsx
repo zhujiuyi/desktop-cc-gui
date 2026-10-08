@@ -94,6 +94,28 @@ describe("AgentThinking", () => {
     expect(text.indexOf("↑12.3k")).toBeLessThan(text.indexOf("模型"));
   });
 
+  it("renders the meta slot right after the effort label", () => {
+    act(() => {
+      root.render(
+        <AgentThinking
+          label="响应中"
+          startedAt={Date.now() - 5000}
+          durationFormatter={(d) => `耗时 ${d}`}
+          model="模型 gemini-3.8-flash"
+          effort="推理档位 xhigh"
+          metaExtra={<span data-testid="badge">badge</span>}
+        />,
+      );
+    });
+
+    const badge = container.querySelector('[data-testid="badge"]');
+    expect(badge).not.toBeNull();
+    const text = container.textContent ?? "";
+    expect(text.indexOf("推理档位 xhigh")).toBeLessThan(
+      text.indexOf("badge"),
+    );
+  });
+
   it("omits the usage segment when the engine has not reported yet", () => {
     act(() => {
       root.render(<AgentThinking label="响应中" startedAt={Date.now() - 5000} usage={null} />);

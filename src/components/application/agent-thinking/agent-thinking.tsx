@@ -54,6 +54,9 @@ export interface AgentThinkingProps {
   /** The provider's own reason for the retry ("HTTP 502", "stream
    *  disconnected"), revealed on hover. */
   retryDetail?: string | null;
+  /** Extra meta-row content rendered right after the effort label. A slot
+   *  on purpose: the data and its own hover card belong to feature code. */
+  metaExtra?: ReactNode;
 }
 
 const TONE_COLORS: Record<AgentThinkingTone, string> = {
@@ -339,6 +342,7 @@ type MetaRowProps = Pick<
   | "effort"
   | "retry"
   | "retryDetail"
+  | "metaExtra"
 >;
 
 function MetaRow({
@@ -350,8 +354,9 @@ function MetaRow({
   effort,
   retry,
   retryDetail,
+  metaExtra,
 }: MetaRowProps) {
-  if (!(showTimer || model || effort || usage || retry)) {
+  if (!(showTimer || model || effort || usage || retry || metaExtra)) {
     return null;
   }
   return (
@@ -365,6 +370,7 @@ function MetaRow({
       {usage && <MetaItem><span>{usage}</span></MetaItem>}
       {model && <MetaItem><span>{model}</span></MetaItem>}
       {effort && <MetaItem><span>{effort}</span></MetaItem>}
+      {metaExtra}
       {retry && (
         <MetaItem>
           {/* Progress, not an error: a retry that recovers is invisible
@@ -393,6 +399,7 @@ export function AgentThinking({
   usage,
   retry,
   retryDetail,
+  metaExtra,
 }: AgentThinkingProps) {
   const color = TONE_COLORS[tone ?? VARIANT_TONE[variant]];
   const animated = !retry;
@@ -423,6 +430,7 @@ export function AgentThinking({
         usage={usage}
         retry={retry}
         retryDetail={retryDetail}
+        metaExtra={metaExtra}
       />
     </div>
   );

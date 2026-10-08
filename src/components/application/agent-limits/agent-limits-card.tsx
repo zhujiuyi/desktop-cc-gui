@@ -6,7 +6,10 @@ import ArrowRight from "lucide-react/dist/esm/icons/arrow-right";
 import ChevronRight from "lucide-react/dist/esm/icons/chevron-right";
 import Minimize2 from "lucide-react/dist/esm/icons/minimize-2";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw";
+import Zap from "lucide-react/dist/esm/icons/zap";
+import { Button as AriaButton } from "react-aria-components";
 import { Collapsible } from "@/components/application/collapsible/collapsible";
+import { Tooltip, TooltipContent } from "@/components/base/tooltip/tooltip";
 import {
   ActionFeedbackIcon,
   useRunningFeedback,
@@ -14,6 +17,7 @@ import {
 } from "@/components/base/action-feedback";
 import { cx } from "@/utils/cx";
 import { formatTokens } from "@/utils/format-tokens";
+import { normalizeAutoCompactThreshold } from "@/features/chat/auto-compact-context";
 
 /** Series colours: explicit `color` (+ optional `activeColor`) wins;
  * otherwise the `chart-n` token palette cycles in an order that keeps
@@ -85,7 +89,6 @@ export interface AgentLimitsCardProps {
   };
   /** Plan name shown after "Plan usage limits ·". */
   plan?: string;
-  /** Where the plan arrow points (omit to hide the arrow). */
   planHref?: string;
   limits?: UsageLimit[];
   /** Start with the context breakdown open. */
@@ -104,12 +107,25 @@ export interface AgentLimitsCardProps {
     refreshUsage?: string;
     refreshUsageTooltip?: string;
     refreshing?: string;
+    autoCompactThreshold?: string;
+    autoCompactEnable?: string;
+    autoCompactDisable?: string;
+    /** Tooltip shown while the controls have no session to bind to. */
+    autoCompactNoSession?: string;
   };
   onCompact?: () => void;
   onRefresh?: () => void;
   compacting?: boolean;
   refreshing?: boolean;
   canCompact?: boolean;
+  autoCompact?: {
+    enabled: boolean;
+    threshold: number;
+    /** No active session: render the controls but keep them inert. */
+    disabled?: boolean;
+    onEnabledChange: (enabled: boolean) => void;
+    onThresholdChange: (threshold: number) => void;
+  };
   className?: string;
 }
 
@@ -310,39 +326,132 @@ function CardActionButton({
   feedback?: ActionFeedback;
 }) {
   return (
-    <button
-      type="button"
-      data-testid={testId}
-      disabled={disabled}
-      onClick={onClick}
-      title={tooltip}
-      className={cx(
-        "inline-flex h-6 items-center gap-1.5 rounded-md border border-border-button-default bg-background-primary-default px-2 text-caption-1-medium transition-colors duration-150",
-        disabled
-          ? "cursor-not-allowed opacity-50 text-text-tertiary"
-          : "cursor-pointer text-text-secondary hover:bg-background-secondary-hover hover:text-text-primary active:bg-background-tertiary-default",
-      )}
-    >
-      {feedback ? (
-        <ActionFeedbackIcon
-          icon={Icon}
-          feedback={feedback}
-          spin
-          iconClassName="size-3"
-          runningClassName="text-blue-500"
-        />
-      ) : (
-        <Icon
-          className={cx("size-3 shrink-0", busy && `${busyIconClassName} text-blue-500`)}
-          aria-hidden
-        />
-      )}
-      <span>{busy ? busyLabel : label}</span>
-    </button>
+    <Tooltip>
+      <AriaButton
+        data-testid={testId}
+        // aria-disabled keeps the button hoverable/focusable so its tooltip
+        // still explains what it does while it is unavailable.
+        aria-disabled={disabled || undefined}
+        onPress={() => {
+          if (disabled) return;
+          onClick();
+        }}
+        className={cx(
+          "inline-flex h-6 items-center gap-1.5 rounded-md border border-border-button-default bg-background-primary-default px-2 text-caption-1-medium transition-colors duration-150",
+          disabled
+            ? "cursor-not-allowed opacity-50 text-text-tertiary"
+            : "cursor-pointer text-text-secondary hover:bg-background-secondary-hover hover:text-text-primary active:bg-background-tertiary-default",
+        )}
+      >
+        {feedback ? (
+          <ActionFeedbackIcon
+            icon={Icon}
+            feedback={feedback}
+            spin
+            iconClassName="size-3"
+            runningClassName="text-blue-500"
+          />
+        ) : (
+          <Icon
+            className={cx("size-3 shrink-0", busy && `${busyIconClassName} text-blue-500`)}
+            aria-hidden
+          />
+        )}
+        <span>{busy ? busyLabel : label}</span>
+      </AriaButton>
+      {tooltip && <TooltipContent>{tooltip}</TooltipContent>}
+    </Tooltip>
   );
 }
 
-/** Compact / refresh actions; rendered only when at least one handler exists. */
+function AutoCompactControls({
+  settings,
+  text,
+}: {
+  settings: NonNullable<AgentLimitsCardProps["autoCompact"]>;
+  text: AgentLimitsCardProps["text"];
+}) {
+  const [draft, setDraft] = useState(String(settings.threshold));
+
+  // No threshold-sync effect: the parent keys this component by threshold, so
+  // a change from outside remounts it with the right draft.
+
+  const commitThreshold = (value = draft) => {
+    const next = normalizeAutoCompactThreshold(value, settings.threshold);
+    setDraft(String(next));
+    settings.onThresholdChange(next);
+  };
+
+  const toggleLabel = settings.enabled
+    ? text.autoCompactDisable ?? "关闭自动压缩"
+    : text.autoCompactEnable ?? "开启自动压缩";
+  // No session to bind to: the controls stay visible (the row keeps its shape
+  // from the first launch) but cannot be edited until a chat exists.
+  const disabled = settings.disabled === true;
+  const hint = disabled ? text.autoCompactNoSession ?? toggleLabel : toggleLabel;
+
+  return (
+    <div className="mr-auto flex items-center gap-1.5">
+      <div
+        className={cx(
+          "flex h-6 w-11 items-center rounded-md border border-border-button-default bg-background-primary-default px-1.5",
+          disabled && "cursor-not-allowed opacity-50",
+        )}
+      >
+        <input
+          type="number"
+          min={1}
+          max={100}
+          step={1}
+          inputMode="numeric"
+          disabled={disabled}
+          data-testid="auto-compact-threshold"
+          aria-label={text.autoCompactThreshold ?? "自动压缩阈值"}
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          onBlur={(event) => commitThreshold(event.currentTarget.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              commitThreshold(event.currentTarget.value);
+              event.currentTarget.blur();
+            }
+          }}
+          className="min-w-0 flex-1 bg-transparent text-right text-caption-1-medium tabular-nums text-text-secondary outline-none disabled:cursor-not-allowed"
+        />
+        <span className="pl-0.5 text-caption-1-medium text-text-tertiary">%</span>
+      </div>
+      <Tooltip>
+        <AriaButton
+          data-testid="auto-compact-toggle"
+          // aria-disabled, not isDisabled: a natively disabled button receives
+          // neither hover nor focus, so its tooltip could never be read — and
+          // this hint is exactly what explains the inert state. The press is
+          // guarded instead.
+          aria-disabled={disabled || undefined}
+          aria-label={toggleLabel}
+          aria-pressed={settings.enabled}
+          onPress={() => {
+            if (disabled) return;
+            settings.onEnabledChange(!settings.enabled);
+          }}
+          className={cx(
+            "flex size-6 items-center justify-center rounded-md border border-border-button-default outline-none transition-colors focus-visible:ring-2 focus-visible:ring-border-focus-ring",
+            disabled && "cursor-not-allowed opacity-50",
+            !disabled && "cursor-pointer",
+            settings.enabled
+              ? "bg-background-tertiary-default text-text-primary"
+              : "text-text-tertiary hover:bg-background-secondary-hover hover:text-text-secondary",
+          )}
+        >
+          <Zap className="size-3.5" fill={settings.enabled ? "currentColor" : "none"} aria-hidden />
+        </AriaButton>
+        <TooltipContent>{hint}</TooltipContent>
+      </Tooltip>
+    </div>
+  );
+}
+
+/** Compact / refresh actions and the per-session auto-compaction controls. */
 function ContextActions({
   text,
   onCompact,
@@ -350,6 +459,7 @@ function ContextActions({
   compacting,
   refreshing,
   canCompact,
+  autoCompact,
 }: {
   text: AgentLimitsCardProps["text"];
   onCompact?: () => void;
@@ -357,40 +467,52 @@ function ContextActions({
   compacting: boolean;
   refreshing: boolean;
   canCompact: boolean;
+  autoCompact?: AgentLimitsCardProps["autoCompact"];
 }) {
-  // Refresh mirrors the git panel's refresh: spin while the usage re-fetch
-  // runs, check when it comes back.
   const refreshFeedback = useRunningFeedback(refreshing);
-  if (!onCompact && !onRefresh) return null;
+  if (!onCompact && !onRefresh && !autoCompact) return null;
   return (
-    <div className="mt-2.5 flex items-center justify-end gap-2 border-t border-border-button-default/40 pt-2.5">
-      {onCompact && (
-        <CardActionButton
-          testId="compact-context-btn"
-          disabled={!canCompact || compacting}
-          busy={compacting}
-          onClick={onCompact}
-          tooltip={text.compactContextTooltip ?? text.compactContext}
-          label={text.compactContext ?? "压缩上下文"}
-          busyLabel={text.compacting ?? "压缩中…"}
-          icon={Minimize2}
-          busyIconClassName="animate-pulse"
+    <div className="mt-2.5 flex items-center justify-between gap-2 border-t border-border-button-default/40 pt-2.5">
+      {autoCompact ? (
+        // Keyed by threshold: an external change (settings sync, another
+        // surface) remounts the control instead of syncing state in an effect.
+        <AutoCompactControls
+          key={autoCompact.threshold}
+          settings={autoCompact}
+          text={text}
         />
+      ) : (
+        <span />
       )}
+      <div className="flex items-center gap-2">
+        {onCompact && (
+          <CardActionButton
+            testId="compact-context-btn"
+            disabled={!canCompact || compacting}
+            busy={compacting}
+            onClick={onCompact}
+            tooltip={text.compactContextTooltip ?? text.compactContext}
+            label={text.compactContext ?? "压缩"}
+            busyLabel={text.compacting ?? "压缩中…"}
+            icon={Minimize2}
+            busyIconClassName="animate-pulse"
+          />
+        )}
 
-      {onRefresh && (
-        <CardActionButton
-          testId="refresh-usage-btn"
-          disabled={refreshing}
-          busy={refreshing}
-          onClick={onRefresh}
-          tooltip={text.refreshUsageTooltip ?? text.refreshUsage}
-          label={text.refreshUsage ?? "刷新用量"}
-          busyLabel={text.refreshing ?? "刷新中…"}
-          icon={RefreshCw}
-          feedback={refreshFeedback}
-        />
-      )}
+        {onRefresh && (
+          <CardActionButton
+            testId="refresh-usage-btn"
+            disabled={refreshing}
+            busy={refreshing}
+            onClick={onRefresh}
+            tooltip={text.refreshUsageTooltip ?? text.refreshUsage}
+            label={text.refreshUsage ?? "刷新"}
+            busyLabel={text.refreshing ?? "刷新中…"}
+            icon={RefreshCw}
+            feedback={refreshFeedback}
+          />
+        )}
+      </div>
     </div>
   );
 }
@@ -470,6 +592,7 @@ export function AgentLimitsCard({
   compacting = false,
   refreshing = false,
   canCompact = true,
+  autoCompact,
   className,
 }: AgentLimitsCardProps) {
   const [expanded, setExpanded] = useState(defaultExpanded);
@@ -554,6 +677,7 @@ export function AgentLimitsCard({
         compacting={compacting}
         refreshing={refreshing}
         canCompact={canCompact}
+        autoCompact={autoCompact}
       />
 
       {/* ------------------------------------------------- plan limits */}

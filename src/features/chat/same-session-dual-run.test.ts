@@ -1,11 +1,15 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { collectBeforeTurnContributions, registerTurnHooks } from "@/features/plugins/runtime/hooks";
 import type { EngineEventPayload } from "@/lib/events";
 import { useChatStore } from "./store";
 import {
   droppedContentRuns,
+  bindRunLifecycle,
   handleEngineEvents,
+  registerPendingRunLifecycle,
   settleOrphanedRuns,
   settledRuns,
+  unregisterRunLifecycle,
   type EngineEventDeps,
 } from "./store/engine-events";
 import { sessionKey } from "./store/persistence";
@@ -15,6 +19,7 @@ vi.mock("@/lib/ipc", () => ({
   ipc: {
     rescanSessions: vi.fn(async () => {}),
     usageRecord: vi.fn(async () => {}),
+    recordAcceptedInternalFrame: vi.fn(async () => {}),
     // The echo-back backend: the run id the client asked for is the run id it
     // reports (the real Rust command does the same).
     sendMessage: vi.fn(async (args: { runId: string }) => ({
@@ -40,6 +45,13 @@ const RUN_A = "run-a";
 const RUN_B = "run-b";
 
 let drainSpy: ReturnType<typeof vi.fn>;
+const hookDisposers: Array<() => void> = [];
+
+afterEach(() => {
+  unregisterRunLifecycle(RUN_A);
+  unregisterRunLifecycle(RUN_B);
+  while (hookDisposers.length) hookDisposers.pop()?.();
+});
 
 function deps(): EngineEventDeps {
   return {
@@ -170,7 +182,7 @@ describe("same-session dual run", () => {
     expect(session().currentRunId).toBeNull();
   });
 
-  it("reaps an older run without clearing the newer owner's retry state", () => {
+  it("reaps an older run without clearing the newer owner's retry or compaction state", () => {
     settleRunAOnBackground();
     handleEngineEvents([ev(RUN_B, "delta", 1, "B 正文")], deps());
     handleEngineEvents(
@@ -179,8 +191,12 @@ describe("same-session dual run", () => {
     );
     expect(session().currentRunId).toBe(RUN_B);
     expect(useChatStore.getState().retryingByKey[KEY]).toBe(true);
+    handleEngineEvents([ev(RUN_B, "compaction", 3, { active: true })], deps());
+    const compaction = session().compaction;
+    expect(compaction).not.toBeNull();
 
     settleOrphanedRuns(useChatStore.setState, [[RUN_A, KEY]]);
+    expect(session().compaction).toBe(compaction);
 
     expect(session()).toMatchObject({
       currentRunId: RUN_B,
@@ -196,6 +212,67 @@ describe("same-session dual run", () => {
     handleEngineEvents([ev(RUN_B, "delta", 3, "B 恢复输出")], deps());
     expect(session().retry).toBeNull();
     expect(useChatStore.getState().retryingByKey[KEY]).toBeUndefined();
+  });
+
+  it("keeps old-run launch and response evidence out of the newer turn", () => {
+    settleRunAOnBackground();
+    handleEngineEvents([
+      ev(RUN_B, "launch", 1, { model: "claude-opus-5-5", effort: "high" }),
+      ev(RUN_B, "served", 2, { model: "claude-opus-5-5", effort: "high" }),
+    ], deps());
+    const check = session().responseCheck;
+    expect(check?.requested.model).toBe("claude-opus-5-5");
+    expect(check?.served.model).toBe("claude-opus-5-5");
+    handleEngineEvents([
+      ev(RUN_A, "launch", 7, { model: "claude-sonnet-4", effort: "low" }),
+      ev(RUN_A, "served", 8, { model: "claude-sonnet-4", effort: "low" }),
+      ev(RUN_A, "effort", 9, "low"),
+    ], deps());
+    expect(session().responseCheck).toBe(check);
+    expect(session().activeEffort).toBe("high");
+    expect(session().currentRunId).toBe(RUN_B);
+  });
+
+  it("captures the old run's internal frame and ends its plugin lifecycle only at terminal done", async () => {
+    const afterTurn = vi.fn();
+    const internalMessage = vi.fn();
+    hookDisposers.push(registerTurnHooks("test.dual-capture", {
+      beforeTurn: () => ({ internalMessageCapture: { channel: "facts", nonce: "dual", maxBytes: 1024 } }),
+      afterTurn,
+      onInternalMessage: internalMessage,
+    }));
+    const workspace = { id: "dual-workspace", path: WS };
+    const collected = await collectBeforeTurnContributions({
+      runId: RUN_A, turnId: RUN_A, engine: "claude", sessionId: "s-1", workspace,
+      occurredAt: "2026-10-08T00:00:00Z",
+    });
+    const settleLaunch = registerPendingRunLifecycle("pending-a", {
+      turnId: RUN_A, engine: "claude", sessionId: "s-1", workspace,
+      captures: collected.internalMessageCaptures,
+    });
+    bindRunLifecycle("pending-a", RUN_A, "s-1");
+    settleLaunch();
+    settleRunAOnBackground();
+    expect(afterTurn).not.toHaveBeenCalled();
+
+    handleEngineEvents([ev(RUN_B, "delta", 1, "B 正文")], deps());
+    handleEngineEvents([
+      ev(RUN_A, "delta", 7, '<CCGUI_INTERNAL_dual>{"kept":true}</CCGUI_INTERNAL_dual>'),
+    ], deps());
+    await Promise.resolve();
+    expect(internalMessage).toHaveBeenCalledOnce();
+    flushPendingStreams(useChatStore.setState);
+    expect(session().messages.map((m) => m.text).join("\n")).not.toContain("CCGUI_INTERNAL");
+
+    handleEngineEvents([ev(RUN_A, "done", 8, { usage: null, backgroundTasks: 0 })], deps());
+    await Promise.resolve();
+    expect(afterTurn).toHaveBeenCalledOnce();
+    expect(afterTurn.mock.calls[0][0]).toMatchObject({ runId: RUN_A, status: "completed" });
+    expect(session().currentRunId).toBe(RUN_B);
+    expect(session().streaming).toBe(true);
+    handleEngineEvents([ev(RUN_A, "done", 9, { usage: null })], deps());
+    await Promise.resolve();
+    expect(afterTurn).toHaveBeenCalledOnce();
   });
 
   it("backfills the dropped completion turn via a transcript reload when the foreign run settles", () => {

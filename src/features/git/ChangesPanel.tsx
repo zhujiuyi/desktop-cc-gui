@@ -38,169 +38,60 @@ function useVisibleGitValue<Value>(
   return value;
 }
 
-export function ChangesPanel({
-  workspacePath,
-  repoPath,
-  className,
-  visible = true,
-}: {
-  workspacePath: string;
-  /** Pin the panel to this repository instead of following the file tree's
-   *  selection — for callers that render the panel outside the files
-   *  context, where a global selectedPath would silently steer it. */
-  repoPath?: string;
-  className?: string;
-  visible?: boolean;
-}) {
-  const { t } = useTranslation();
-  const selectedPath = useFilesStore((s) => s.selectedPath);
-  const repositories = useFilesStore((s) => s.repositories);
-  const gitWorkspacePath = useMemo(
-    () =>
-      repoPath ??
-      resolveWorkspaceRepository({
-        selectedPath,
-        repositoryRoots: Object.keys(repositories),
-        workspacePath,
-      }),
-    [repositories, selectedPath, workspacePath, repoPath],
-  );
-  const status = useVisibleGitValue(visible, (s) => s.statusByWorkspace[gitWorkspacePath]);
-  const notRepo = useVisibleGitValue(visible, (s) => s.notRepoByWorkspace[gitWorkspacePath]);
-  const refreshError = useVisibleGitValue(visible, (s) => s.errorByWorkspace[gitWorkspacePath]);
-  const branches = useVisibleGitValue(visible, (s) => s.branchesByWorkspace[gitWorkspacePath]);
-  const [scrollElement, setScrollElement] = useState<HTMLDivElement | null>(null);
-  const scrollOffset = useRef(0);
+const VIEW_MODE_KEY = "ccgui-next.git.viewMode";
 
+/** Persisted flat/tree preference. The read lives in the lazy initializer, so
+ *  a disabled localStorage only costs one fallback on first mount. */
+function useGitViewMode() {
   const [viewMode, setViewMode] = useState<"flat" | "tree">(() => {
     try {
-      return (localStorage.getItem("ccgui-next.git.viewMode") as "flat" | "tree") || "tree";
+      return (localStorage.getItem(VIEW_MODE_KEY) as "flat" | "tree") || "tree";
     } catch {
       return "tree";
     }
   });
 
   const toggleViewMode = useCallback(() => {
-    setViewMode((prev) => {
-      const next = prev === "tree" ? "flat" : "tree";
-      try {
-        localStorage.setItem("ccgui-next.git.viewMode", next);
-      } catch {
-        // ignore
-      }
-      return next;
-    });
-  }, []);
+    const next = viewMode === "tree" ? "flat" : "tree";
+    setViewMode(next);
+    try {
+      localStorage.setItem(VIEW_MODE_KEY, next);
+    } catch {
+      // Private mode / quota: the session keeps the choice.
+    }
+  }, [viewMode]);
 
-  useLayoutEffect(() => {
-    if (visible && scrollElement) scrollElement.scrollTop = scrollOffset.current;
-  }, [visible, scrollElement]);
+  return { viewMode, toggleViewMode };
+}
 
-  const [actionError, setActionError] = useState<string | null>(null);
-  const [pending, setPending] = useState<Record<string, true>>({});
-  const [commitMsg, setCommitMsg] = useState("");
-  /** Paths awaiting discard confirmation (one row or a whole group). */
-  const [discardTarget, setDiscardTarget] = useState<string[] | null>(null);
+/** Which files the commit footer's checkbox selection holds. Staged files
+ *  start selected; a status refresh drops vanished paths and adopts files that
+ *  became staged outside the panel (CLI, another window). The refresh adjust
+ *  happens during render so a stale selection never reaches a committed frame. */
+function useChangesSelection(status: GitStatus | undefined) {
+  const stagedPaths = useMemo(() => status?.staged.map((f) => f.path) ?? [], [status]);
+  const [selectedFiles, setSelectedFiles] = useState<Set<string>>(() => new Set(stagedPaths));
+  const [previousStaged, setPreviousStaged] = useState<string[]>(stagedPaths);
 
-  // Selected files for commit
-  const [selectedFiles, setSelectedFiles] = useState<Set<string>>(() => {
-    return new Set((status?.staged ?? []).map((f) => f.path));
-  });
-  const prevStagedRef = useRef<string[]>((status?.staged ?? []).map((f) => f.path));
-
-  useEffect(() => {
-    if (!status) return;
-    const currentStaged = status.staged.map((f) => f.path);
-    const allCurrentPaths = new Set([
-      ...currentStaged,
-      ...status.unstaged.map((f) => f.path),
-      ...status.untracked.map((f) => f.path),
-    ]);
-
+  if (previousStaged !== stagedPaths) {
+    setPreviousStaged(stagedPaths);
     setSelectedFiles((prev) => {
+      const allCurrentPaths = new Set([
+        ...stagedPaths,
+        ...(status?.unstaged ?? []).map((f) => f.path),
+        ...(status?.untracked ?? []).map((f) => f.path),
+      ]);
       const next = new Set<string>();
-      for (const p of prev) {
-        if (allCurrentPaths.has(p)) {
-          next.add(p);
-        }
+      for (const path of prev) {
+        if (allCurrentPaths.has(path)) next.add(path);
       }
-      const prevStagedSet = new Set(prevStagedRef.current);
-      for (const p of currentStaged) {
-        if (!prevStagedSet.has(p)) {
-          next.add(p);
-        }
+      const previousStagedSet = new Set(previousStaged);
+      for (const path of stagedPaths) {
+        if (!previousStagedSet.has(path)) next.add(path);
       }
       return next;
     });
-
-    prevStagedRef.current = currentStaged;
-  }, [status]);
-
-  useEffect(() => {
-    if (!visible) return;
-    void useGitStore.getState().refresh(gitWorkspacePath);
-    void useGitStore.getState().loadBranches(gitWorkspacePath);
-  }, [gitWorkspacePath, visible]);
-
-  /** Runs a mutating action: tracks busy state, surfaces errors inline. */
-  const run = useCallback((key: string, action: () => Promise<unknown>) => {
-    setPending((p) => ({ ...p, [key]: true }));
-    setActionError(null);
-    void action()
-      .catch((err: unknown) => setActionError(errorText(err)))
-      .finally(() => {
-        setPending((p) => {
-          const next = { ...p };
-          delete next[key];
-          return next;
-        });
-      });
-  }, []);
-
-  /** Dismiss the header error: the failed action's error, else the store's
-   *  last refresh failure. */
-  const dismissError = useCallback(() => {
-    setActionError(null);
-    useGitStore.getState().clearError(gitWorkspacePath);
-  }, [gitWorkspacePath]);
-
-  const stage = useCallback(
-    (files: string[]) => {
-      setSelectedFiles((prev) => {
-        const next = new Set(prev);
-        for (const f of files) next.add(f);
-        return next;
-      });
-      run("stage", () => useGitStore.getState().stage(gitWorkspacePath, files));
-    },
-    [run, gitWorkspacePath],
-  );
-
-  const unstage = useCallback(
-    (files: string[]) => {
-      setSelectedFiles((prev) => {
-        const next = new Set(prev);
-        for (const f of files) next.delete(f);
-        return next;
-      });
-      run("unstage", () => useGitStore.getState().unstage(gitWorkspacePath, files));
-    },
-    [run, gitWorkspacePath],
-  );
-
-  const stageOne = useCallback((file: string) => stage([file]), [stage]);
-  const unstageOne = useCallback((file: string) => unstage([file]), [unstage]);
-  const discard = useCallback(
-    (files: string[]) =>
-      run("discard", () => useGitStore.getState().discard(gitWorkspacePath, files)),
-    [run, gitWorkspacePath],
-  );
-  const discardRow = useCallback((file: string) => setDiscardTarget([file]), []);
-  const confirmDiscard = useCallback(() => {
-    if (discardTarget === null) return;
-    discard(discardTarget);
-    setDiscardTarget(null);
-  }, [discard, discardTarget]);
+  }
 
   const toggleSelectFile = useCallback((path: string) => {
     setSelectedFiles((prev) => {
@@ -240,6 +131,21 @@ export function ChangesPanel({
     });
   }, []);
 
+  return { selectedFiles, setSelectedFiles, toggleSelectFile, toggleSelectDir, toggleSelectGroup };
+}
+
+/** Mutations, their busy/error bookkeeping, and the commit-confirmation flow. */
+function useChangesActions(
+  gitWorkspacePath: string,
+  status: GitStatus | undefined,
+  selection: ReturnType<typeof useChangesSelection>,
+) {
+  const { selectedFiles, setSelectedFiles } = selection;
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [pending, setPending] = useState<Record<string, true>>({});
+  const [commitMsg, setCommitMsg] = useState("");
+  /** Paths awaiting discard confirmation (one row or a whole group). */
+  const [discardTarget, setDiscardTarget] = useState<string[] | null>(null);
   /** Commit waiting on confirmation because it would unstage files the user
    *  staged but left unchecked — that reshuffles the index (e.g. hunks
    *  placed with `git add -p`), so it never happens silently. */
@@ -248,6 +154,62 @@ export function ChangesPanel({
     toStage: string[];
     toUnstage: string[];
   } | null>(null);
+
+  /** Runs a mutating action: tracks busy state, surfaces errors inline. */
+  const run = useCallback((key: string, action: () => Promise<unknown>) => {
+    setPending((p) => ({ ...p, [key]: true }));
+    setActionError(null);
+    void action()
+      .catch((err: unknown) => setActionError(errorText(err)))
+      .finally(() => {
+        setPending((p) => {
+          const next = { ...p };
+          delete next[key];
+          return next;
+        });
+      });
+  }, []);
+
+  /** Dismiss the header error: the failed action's error, else the store's
+   *  last refresh failure. */
+  const dismissError = useCallback(() => {
+    setActionError(null);
+    useGitStore.getState().clearError(gitWorkspacePath);
+  }, [gitWorkspacePath]);
+
+  const stage = useCallback(
+    (files: string[]) => {
+      setSelectedFiles((prev) => {
+        const next = new Set(prev);
+        for (const f of files) next.add(f);
+        return next;
+      });
+      run("stage", () => useGitStore.getState().stage(gitWorkspacePath, files));
+    },
+    [run, gitWorkspacePath, setSelectedFiles],
+  );
+
+  const unstage = useCallback(
+    (files: string[]) => {
+      setSelectedFiles((prev) => {
+        const next = new Set(prev);
+        for (const f of files) next.delete(f);
+        return next;
+      });
+      run("unstage", () => useGitStore.getState().unstage(gitWorkspacePath, files));
+    },
+    [run, gitWorkspacePath, setSelectedFiles],
+  );
+
+  const stageOne = useCallback((file: string) => stage([file]), [stage]);
+  const unstageOne = useCallback((file: string) => unstage([file]), [unstage]);
+
+  const discardRow = useCallback((file: string) => setDiscardTarget([file]), []);
+  const confirmDiscard = useCallback(() => {
+    if (discardTarget === null) return;
+    run("discard", () => useGitStore.getState().discard(gitWorkspacePath, discardTarget));
+    setDiscardTarget(null);
+  }, [run, gitWorkspacePath, discardTarget]);
 
   const runCommitPlan = useCallback(
     (plan: { message: string; toStage: string[]; toUnstage: string[] }) => {
@@ -264,6 +226,13 @@ export function ChangesPanel({
     },
     [run, gitWorkspacePath],
   );
+
+  const confirmCommitPlan = useCallback(() => {
+    if (pendingCommitPlan === null) return;
+    const plan = pendingCommitPlan;
+    setPendingCommitPlan(null);
+    runCommitPlan(plan);
+  }, [pendingCommitPlan, runCommitPlan]);
 
   const handleCommitSelected = useCallback(async () => {
     const message = commitMsg.trim();
@@ -299,15 +268,113 @@ export function ChangesPanel({
   }, [commitMsg, selectedFiles, status, runCommitPlan]);
 
   const openStagedDiff = useCallback(
-    (file: string) =>
-      useGitStore.getState().openDiff(gitWorkspacePath, { file, staged: true }),
+    (file: string) => useGitStore.getState().openDiff(gitWorkspacePath, { file, staged: true }),
     [gitWorkspacePath],
   );
   const openUnstagedDiff = useCallback(
-    (file: string) =>
-      useGitStore.getState().openDiff(gitWorkspacePath, { file, staged: false }),
+    (file: string) => useGitStore.getState().openDiff(gitWorkspacePath, { file, staged: false }),
     [gitWorkspacePath],
   );
+
+  return {
+    actionError,
+    pending,
+    commitMsg,
+    setCommitMsg,
+    discardTarget,
+    setDiscardTarget,
+    pendingCommitPlan,
+    setPendingCommitPlan,
+    run,
+    dismissError,
+    stage,
+    unstage,
+    stageOne,
+    unstageOne,
+    discardRow,
+    confirmDiscard,
+    runCommitPlan,
+    confirmCommitPlan,
+    handleCommitSelected,
+    openStagedDiff,
+    openUnstagedDiff,
+  };
+}
+
+export function ChangesPanel({
+  workspacePath,
+  repoPath,
+  className,
+  visible = true,
+}: {
+  workspacePath: string;
+  /** Pin the panel to this repository instead of following the file tree's
+   *  selection — for callers that render the panel outside the files
+   *  context, where a global selectedPath would silently steer it. */
+  repoPath?: string;
+  className?: string;
+  visible?: boolean;
+}) {
+  const { t } = useTranslation();
+  const selectedPath = useFilesStore((s) => s.selectedPath);
+  const repositories = useFilesStore((s) => s.repositories);
+  const gitWorkspacePath = useMemo(
+    () =>
+      repoPath ??
+      resolveWorkspaceRepository({
+        selectedPath,
+        repositoryRoots: Object.keys(repositories),
+        workspacePath,
+      }),
+    [repositories, selectedPath, workspacePath, repoPath],
+  );
+  const status = useVisibleGitValue(visible, (s) => s.statusByWorkspace[gitWorkspacePath]);
+  const notRepo = useVisibleGitValue(visible, (s) => s.notRepoByWorkspace[gitWorkspacePath]);
+  const refreshError = useVisibleGitValue(visible, (s) => s.errorByWorkspace[gitWorkspacePath]);
+  const branches = useVisibleGitValue(visible, (s) => s.branchesByWorkspace[gitWorkspacePath]);
+  const [scrollElement, setScrollElement] = useState<HTMLDivElement | null>(null);
+  const scrollOffset = useRef(0);
+
+  const { viewMode, toggleViewMode } = useGitViewMode();
+  const selection = useChangesSelection(status);
+  const {
+    selectedFiles,
+    toggleSelectFile,
+    toggleSelectDir,
+    toggleSelectGroup,
+  } = selection;
+  const {
+    actionError,
+    pending,
+    commitMsg,
+    setCommitMsg,
+    discardTarget,
+    setDiscardTarget,
+    pendingCommitPlan,
+    setPendingCommitPlan,
+    run,
+    dismissError,
+    stage,
+    unstage,
+    stageOne,
+    unstageOne,
+    discardRow,
+    confirmDiscard,
+    confirmCommitPlan,
+    handleCommitSelected,
+    openStagedDiff,
+    openUnstagedDiff,
+  } = useChangesActions(gitWorkspacePath, status, selection);
+
+  useLayoutEffect(() => {
+    if (visible && scrollElement) scrollElement.scrollTop = scrollOffset.current;
+  }, [visible, scrollElement]);
+
+  useEffect(() => {
+    if (!visible) return;
+    void useGitStore.getState().refresh(gitWorkspacePath);
+    void useGitStore.getState().loadBranches(gitWorkspacePath);
+  }, [gitWorkspacePath, visible]);
 
   const header = visible ? (
     <ChangesPanelHeader
@@ -396,7 +463,43 @@ export function ChangesPanel({
           run={run}
         />
       )}
-      {visible && discardTarget !== null && (
+      <ChangesConfirmDialogs
+        visible={visible}
+        discardTarget={discardTarget}
+        pendingCommitPlan={pendingCommitPlan}
+        onConfirmDiscard={confirmDiscard}
+        onCancelDiscard={() => setDiscardTarget(null)}
+        onConfirmPlan={confirmCommitPlan}
+        onCancelPlan={() => setPendingCommitPlan(null)}
+      />
+    </aside>
+  );
+}
+
+/** Discard and commit-plan confirmations: conditions stay together so the
+ *  panel body's JSX does not grow another two conditional blocks. */
+function ChangesConfirmDialogs({
+  visible,
+  discardTarget,
+  pendingCommitPlan,
+  onConfirmDiscard,
+  onCancelDiscard,
+  onConfirmPlan,
+  onCancelPlan,
+}: {
+  visible: boolean;
+  discardTarget: string[] | null;
+  pendingCommitPlan: { message: string; toStage: string[]; toUnstage: string[] } | null;
+  onConfirmDiscard: () => void;
+  onCancelDiscard: () => void;
+  onConfirmPlan: () => void;
+  onCancelPlan: () => void;
+}) {
+  const { t } = useTranslation();
+  if (!visible) return null;
+  return (
+    <>
+      {discardTarget !== null && (
         <ConfirmDialog
           danger
           message={
@@ -404,24 +507,20 @@ export function ChangesPanel({
               ? t("git.discardConfirm", { path: discardTarget[0] })
               : t("git.discardAllConfirm", { count: discardTarget.length })
           }
-          onConfirm={confirmDiscard}
-          onCancel={() => setDiscardTarget(null)}
+          onConfirm={onConfirmDiscard}
+          onCancel={onCancelDiscard}
         />
       )}
-      {visible && pendingCommitPlan !== null && (
+      {pendingCommitPlan !== null && (
         <ConfirmDialog
           message={t("git.commitUnstageConfirm", {
             count: pendingCommitPlan.toUnstage.length,
           })}
-          onConfirm={() => {
-            const plan = pendingCommitPlan;
-            setPendingCommitPlan(null);
-            runCommitPlan(plan);
-          }}
-          onCancel={() => setPendingCommitPlan(null)}
+          onConfirm={onConfirmPlan}
+          onCancel={onCancelPlan}
         />
       )}
-    </aside>
+    </>
   );
 }
 
@@ -634,6 +733,7 @@ const GroupSection = memo(function GroupSection({
   actionBusy,
   isNew = false,
 }: GroupSectionProps) {
+  const { t } = useTranslation();
   const [open, setOpen] = useState(true);
   const [collapsedDirIds, setCollapsedDirIds] = useState<Set<string>>(new Set());
   const listRef = useRef<HTMLUListElement>(null);
@@ -741,6 +841,7 @@ const GroupSection = memo(function GroupSection({
           className="flex items-center text-foreground-icon-tertiary hover:text-foreground-icon-secondary"
           onClick={() => setOpen((v) => !v)}
           aria-expanded={open}
+          aria-label={open ? t("git.collapseGroup", { title }) : t("git.expandGroup", { title })}
         >
           {open ? (
             <ChevronDown aria-hidden className="size-4" />
